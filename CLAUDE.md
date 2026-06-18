@@ -17,20 +17,19 @@ they can run on Fabric with a reasonably similar outcome. So fidelity to the
 Fabric runtime matters: local Spark should read the same OneLake Delta data and
 behave close enough that conclusions transfer.
 
-**Status: Milestone A + B.1 complete.** The MCP server runs, holds a stateful
-Spark session in a worker subprocess, and exposes `run_code` / `run_sql` /
-`session_info` / `reset_runtime`. OneLake auth is wired end to end and **validated against live OneLake** — a real
-`abfss://` Delta read returned 1.4M rows through the full stack (token endpoint →
-HttpTokenProvider → Spark). When a `[workspace]` is configured the server starts
-the loopback token endpoint and a Fabric-enabled Spark session.
+**Status: Milestones A, B.1, B.2 complete — the core vision is functional.** The
+MCP server holds a stateful Spark session in a worker subprocess and exposes
+`run_code` / `run_sql` / `session_info` / `reset_runtime` plus the Fabric tools
+`list_lakehouses` / `list_tables` / `mount_table` / `mount_lakehouse`. When a
+`[workspace]` is configured it starts the loopback token endpoint, a
+Fabric-enabled Spark session, and REST discovery; lakehouses register as Spark
+databases and their tables mount lazily. **Validated live end to end** against a
+real workspace: discovery (8 lakehouses, 63 tables), mount, and an `abfss://`
+Delta read/query (1.4M rows) through the full stack.
 
 ⚠️ **Address OneLake by GUID, not name.** `abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}`
 works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
-400. B.2's hydration must use the GUIDs from `FabricAPIClient`.
-
-**Not yet built (Milestone B.2):** Fabric discovery (`FabricAPIClient`), workspace name→GUID
-resolution, lakehouse→database registration, and `list_tables` / `mount_table`
-tools — described as *intent* below.
+400. `FabricAPIClient` / `LakehouseInfo` build GUID paths.
 
 ## Commands
 
@@ -81,6 +80,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - `token_server.py` — loopback OneLake token endpoint (DefaultAzureCredential,
   secret-guarded); owned by the server, outlives worker restarts.
 - `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
+- `discovery.py` — `FabricAPIClient` (REST: resolve workspace, list lakehouses /
+  tables, paging) + `LakehouseInfo` (GUID abfss path builder). Runs in the server.
 - `token-provider/` — sbt project for `ch.fs.HttpTokenProvider` (build with
   `sbt package`; output jar referenced via `spark.jars`).
 
