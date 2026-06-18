@@ -14,19 +14,24 @@ import sys
 from .java import resolve_java_home
 
 
-def build_local_spark(
+def build_spark(
     *,
     driver_memory: str = "8g",
     app_name: str = "local-spark-mcp",
     extra_configs: dict[str, str] | None = None,
     java_home: str | None = None,
     log_level: str = "WARN",
+    onelake: dict | None = None,
 ):
-    """Create a local Delta-enabled SparkSession.
+    """Create a Delta-enabled SparkSession.
 
     JAVA_HOME is resolved and set in the process environment *before* the JVM is
     launched. Delta jars are pulled via ``configure_spark_with_delta_pip`` to
     match the installed ``delta-spark`` version (needs network on first run).
+
+    If ``onelake`` (dict of endpoint/secret/jar_path) is given, OneLake ABFS auth
+    is wired through HttpTokenProvider and the hadoop-azure package is added so
+    the session can read ``abfss://...@onelake.dfs.fabric.microsoft.com`` paths.
     """
     os.environ["JAVA_HOME"] = resolve_java_home(java_home)
 
@@ -40,6 +45,14 @@ def build_local_spark(
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
 
+    configs = dict(extra_configs or {})
+    extra_packages: list[str] = []
+    if onelake:
+        from .fabric import HADOOP_AZURE_PACKAGE, onelake_spark_configs
+
+        configs.update(onelake_spark_configs(**onelake))
+        extra_packages.append(HADOOP_AZURE_PACKAGE)
+
     builder = (
         SparkSession.builder.appName(app_name)
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
@@ -50,9 +63,9 @@ def build_local_spark(
         .config("spark.driver.memory", driver_memory)
         .config("spark.sql.sources.default", "delta")
     )
-    for key, value in (extra_configs or {}).items():
+    for key, value in configs.items():
         builder = builder.config(key, value)
 
-    spark = configure_spark_with_delta_pip(builder).getOrCreate()
+    spark = configure_spark_with_delta_pip(builder, extra_packages=extra_packages).getOrCreate()
     spark.sparkContext.setLogLevel(log_level)
     return spark

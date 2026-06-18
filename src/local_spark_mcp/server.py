@@ -8,10 +8,11 @@ blocking worker IPC runs in a thread so the asyncio event loop stays responsive.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import Config, load_config
+from .config import Config, ConfigError, load_config
 from .worker_client import WorkerError, WorkerProcess
 
 INSTRUCTIONS = """\
@@ -27,7 +28,7 @@ reset_runtime wipes all state by restarting the session.
 MAX_SQL_CELL_WIDTH = 60
 
 
-def _engine_kwargs(config: Config) -> dict:
+def _base_engine_kwargs(config: Config) -> dict:
     return {
         "driver_memory": config.spark.driver_memory,
         "extra_configs": config.spark.extra_configs,
@@ -37,32 +38,75 @@ def _engine_kwargs(config: Config) -> dict:
 
 
 class ServerState:
-    """Holds the worker and serializes access to it."""
+    """Owns the worker (and, in Fabric mode, the OneLake token server) and
+    serializes access. The token server outlives worker restarts so its
+    endpoint/secret stay stable."""
 
     def __init__(self, config: Config | None = None):
         self.config = config or load_config()
-        self.worker = WorkerProcess(engine_kwargs=_engine_kwargs(self.config))
         self.lock = asyncio.Lock()
+        self._worker: WorkerProcess | None = None
+        self._token_server = None  # TokenServer | None
+
+    def _fabric_enabled(self) -> bool:
+        return bool(self.config.workspace.name or self.config.workspace.id)
+
+    def _resolve_jar(self) -> str:
+        from .fabric import default_jar_path
+
+        jar = self.config.runtime.token_jar_path or default_jar_path()
+        if not jar or not Path(jar).is_file():
+            raise ConfigError(
+                "OneLake token provider jar not found. Build it "
+                "(cd token-provider && sbt package) or set runtime.token_jar_path "
+                "in local-spark.toml."
+            )
+        return jar
+
+    def _engine_kwargs(self) -> dict:
+        kwargs = _base_engine_kwargs(self.config)
+        if self._fabric_enabled():
+            assert self._token_server is not None  # started in _ensure_started
+            kwargs["onelake"] = {
+                "endpoint": self._token_server.url,
+                "secret": self._token_server.secret,
+                "jar_path": self._resolve_jar(),
+            }
+        return kwargs
 
     async def _ensure_started(self) -> None:
-        if not self.worker.running:
-            await asyncio.to_thread(self.worker.start)
+        if self._fabric_enabled() and self._token_server is None:
+            from .token_server import TokenServer
+
+            # Resolve the jar before starting anything, so a missing jar fails fast.
+            self._resolve_jar()
+            self._token_server = TokenServer()
+            await asyncio.to_thread(self._token_server.start)
+        if self._worker is None:
+            self._worker = WorkerProcess(engine_kwargs=self._engine_kwargs())
+        if not self._worker.running:
+            await asyncio.to_thread(self._worker.start)
 
     async def call(self, method: str, *args):
         """Serialize, lazily start the worker, run the blocking call in a thread."""
         async with self.lock:
             await self._ensure_started()
-            fn = getattr(self.worker, method)
+            fn = getattr(self._worker, method)
             return await asyncio.to_thread(fn, *args)
 
     async def restart(self) -> dict:
         async with self.lock:
-            if self.worker.running:
-                return await asyncio.to_thread(self.worker.restart)
-            return await asyncio.to_thread(self.worker.start)
+            if self._worker is not None:
+                await asyncio.to_thread(self._worker.stop)
+                self._worker = None
+            await self._ensure_started()
+            return self._worker.info  # set by WorkerProcess.start()
 
     def shutdown(self) -> None:
-        self.worker.stop()
+        if self._worker is not None:
+            self._worker.stop()
+        if self._token_server is not None:
+            self._token_server.stop()
 
 
 # ---------- formatting (pure, unit-tested) ----------

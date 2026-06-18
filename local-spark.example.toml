@@ -25,3 +25,9 @@ driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
 [runtime]
 default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPARK_SQL_LIMIT
 # java_home = "/path/to/jdk17"   # pin the JVM (Spark 3.5 wants Java 8/11/17); env: LOCAL_SPARK_JAVA_HOME
+# token_jar_path = "/path/to/httptokenprovider_2.12-0.1.jar"  # override; default = in-repo sbt build
+# env override: LOCAL_SPARK_TOKEN_JAR_PATH
+#
+# OneLake auth is automatic when a [workspace] is set: the server starts a
+# loopback token endpoint and wires the HttpTokenProvider jar into Spark. Build
+# the jar first: `cd token-provider && sbt package` (needs Java 17 + sbt).

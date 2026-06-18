@@ -11,7 +11,7 @@ import decimal
 import traceback as _tb
 from dataclasses import asdict, dataclass, field
 
-from .spark_session import build_local_spark
+from .spark_session import build_spark
 
 # Truncate over-long reprs/values so a single cell can't flood the transport.
 MAX_VALUE_LEN = 4000
@@ -75,13 +75,15 @@ class SparkEngine:
         java_home: str | None = None,
         default_sql_limit: int = 100,
         app_name: str = "local-spark-mcp",
+        onelake: dict | None = None,
     ):
         self.default_sql_limit = default_sql_limit
-        self.spark = build_local_spark(
+        self.spark = build_spark(
             driver_memory=driver_memory,
             extra_configs=extra_configs,
             java_home=java_home,
             app_name=app_name,
+            onelake=onelake,
         )
         self.shell = self._make_shell()
         self._bootstrap_namespace()
@@ -91,7 +93,7 @@ class SparkEngine:
 
         shell = InteractiveShell.instance()
         # Plain (non-ANSI) tracebacks — the transport is text, not a terminal.
-        shell.run_line_magic("colors", "NoColor")
+        shell.run_line_magic("colors", "nocolor")
         return shell
 
     def _bootstrap_namespace(self):

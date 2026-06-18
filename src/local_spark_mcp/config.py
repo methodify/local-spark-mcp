@@ -51,6 +51,7 @@ class RuntimeConfig:
 
     default_sql_limit: int = 100
     java_home: str | None = None
+    token_jar_path: str | None = None  # override for the HttpTokenProvider jar
 
 
 @dataclass
@@ -137,6 +138,7 @@ def _parse_file(path: Path) -> Config:
         runtime=RuntimeConfig(
             default_sql_limit=int(runtime.get("default_sql_limit", 100)),
             java_home=_require_str(runtime, "java_home", "runtime"),
+            token_jar_path=_require_str(runtime, "token_jar_path", "runtime"),
         ),
         source_path=path,
     )
@@ -168,6 +170,9 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (java_home := env.get(f"{ENV_PREFIX}JAVA_HOME")) is not None:
         config.runtime.java_home = java_home
+
+    if (jar := env.get(f"{ENV_PREFIX}TOKEN_JAR_PATH")) is not None:
+        config.runtime.token_jar_path = jar
 
 
 def load_config(path: Path | None = None, *, search_from: Path | None = None) -> Config:
