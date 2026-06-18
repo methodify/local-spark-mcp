@@ -17,9 +17,53 @@ they can run on Fabric with a reasonably similar outcome. So fidelity to the
 Fabric runtime matters: local Spark should read the same OneLake Delta data and
 behave close enough that conclusions transfer.
 
-**Status: greenfield.** As of this writing the repo is essentially empty
-(`main.py` is a stub). The architecture below is *intent*, not yet built. Update
-this file as real structure lands.
+**Status: Milestone A complete** (local-only loop). The MCP server runs, holds a
+stateful local Delta Spark session in a worker subprocess, and exposes
+`run_code` / `run_sql` / `session_info` / `reset_runtime`. Fabric/OneLake
+(Milestone B: token endpoint + JAR + discovery/hydration) is not built yet — the
+sections below describe that as *intent*.
+
+## Commands
+
+```bash
+# Setup (Python 3.12 via uv; pulls pyspark/delta — slow first time)
+uv venv --python 3.12
+uv pip install -e ".[dev]"
+
+# Fast tests (config + formatters; no Spark)
+.venv/bin/python -m pytest -q
+
+# Integration/e2e tests — start a REAL Spark session (~80–100s each), gated:
+LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_worker_integration.py tests/test_server_e2e.py -v
+# Single test: append `::test_name`
+
+# Manual engine smoke (no MCP, no Fabric)
+.venv/bin/python scripts/smoke_engine.py
+
+# Run the server (stdio MCP); reads ./local-spark.toml
+.venv/bin/local-spark-mcp        # or: .venv/bin/python -m local_spark_mcp.server
+```
+
+Register with Claude Code as an MCP server with `command` = the venv's
+`local-spark-mcp` (or `python -m local_spark_mcp.server`) and `cwd` = the project
+holding `local-spark.toml`. Worker stdout/stderr (Spark/JVM logs) go to the
+server's **stderr**; stdout is reserved for the MCP transport.
+
+## Current architecture (as built)
+
+- `config.py` — `local-spark.toml` schema + loader (file discovery, `LOCAL_SPARK_*`
+  env overrides, validation). Workspace is optional until the Fabric layer needs it.
+- `java.py` — resolve a Spark-compatible `JAVA_HOME` (prefers vfox Java 17).
+- `spark_session.py` — local Delta session builder; pins `JAVA_HOME`, drops
+  ambient `SPARK_HOME`, forces `PYSPARK_PYTHON=sys.executable` (hermetic to venv).
+- `engine.py` — `SparkEngine`: IPython `InteractiveShell` + injected `spark`/`sc`/
+  `F`/`T`/`Window`. `run_code` (captured stdout + traceback), `run_sql`
+  (rows + truncation), `info`.
+- `protocol.py` / `worker.py` / `worker_client.py` — length-prefixed JSON over a
+  dedicated localhost socket; worker process holds the engine; `WorkerProcess`
+  spawns/handshakes/proxies and `restart()` = reset.
+- `server.py` — FastMCP stdio server; one serialized worker; lazy startup;
+  blocking IPC offloaded to a thread.
 
 ## Intended tool surface (from the design brief)
 
