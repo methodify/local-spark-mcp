@@ -131,10 +131,15 @@ sections below; this is the summary of record.
 7. **Lakehouse selection — all by default, optional exclude-list.** Every
    lakehouse in the workspace is registered; excludes trim noise. Cheap because
    hydration is lazy (see #8).
-8. **Table hydration — lazy.** At startup, register selected lakehouses as Spark
-   databases only. Tables are enumerated/mounted on demand via tools
-   (`CREATE TABLE ... USING DELTA LOCATION` per table). Keeps startup fast even
-   for a workspace with many lakehouses/tables.
+8. **Table hydration — lazy, with auto-mount.** At startup, register selected
+   lakehouses as Spark databases only. Tables mount on demand
+   (`CREATE TABLE ... USING DELTA LOCATION`), keeping startup fast. `run_sql`
+   **auto-mounts** a referenced `<lakehouse>`.`<table>` on first use (catch
+   not-found → mount if it's a known lakehouse → retry), so the agent just
+   queries by name like the Fabric runtime; `mount_table`/`mount_lakehouse`
+   remain for explicit/bulk mounting. Startup is single-flight + warmed in the
+   background at launch, and tools emit MCP progress during the cold start so the
+   client doesn't time out.
 
 ## The reference implementation — read this first
 
