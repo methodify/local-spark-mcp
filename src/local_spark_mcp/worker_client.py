@@ -109,6 +109,12 @@ class WorkerProcess:
     def run_sql(self, sql: str, limit: int | None = None) -> dict:
         return self._call("run_sql", {"sql": sql, "limit": limit})
 
+    def mount_table(self, lakehouse: str, table: str) -> dict:
+        return self._call("mount_table", {"lakehouse": lakehouse, "table": table})
+
+    def mount_tables(self, lakehouse: str, tables: list[str]) -> dict:
+        return self._call("mount_tables", {"lakehouse": lakehouse, "tables": tables})
+
     def get_info(self) -> dict:
         return self._call("info")
 

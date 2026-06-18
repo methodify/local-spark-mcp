@@ -22,6 +22,11 @@ kernel: variables, imports, and the SparkSession (`spark`) survive between
 run_code calls. `spark`, `sc`, `F` (functions), `T` (types), and `Window` are
 pre-imported. Use run_code to explore/transform and run_sql for quick queries.
 reset_runtime wipes all state by restarting the session.
+
+If a Fabric workspace is configured, its lakehouses are registered as Spark
+databases: use list_lakehouses / list_tables to explore, and mount_table /
+mount_lakehouse to make OneLake Delta tables queryable as `<lakehouse>`.`<table>`
+via run_sql. run_code can also read any table directly by its abfss:// path.
 """
 
 # Max width of a single SQL table cell before it is elided.
@@ -38,15 +43,19 @@ def _base_engine_kwargs(config: Config) -> dict:
 
 
 class ServerState:
-    """Owns the worker (and, in Fabric mode, the OneLake token server) and
-    serializes access. The token server outlives worker restarts so its
-    endpoint/secret stay stable."""
+    """Owns the worker and, in Fabric mode, the OneLake token server + REST
+    discovery. Serializes access. Discovery (cheap REST) is separable from worker
+    startup (slow Spark) so lakehouse/table listing doesn't pay for a session."""
 
     def __init__(self, config: Config | None = None):
         self.config = config or load_config()
         self.lock = asyncio.Lock()
         self._worker: WorkerProcess | None = None
         self._token_server = None  # TokenServer | None
+        self._fabric_client = None  # FabricAPIClient | None
+        self._cred = None
+        self._workspace_id: str | None = None
+        self._lakehouses = None  # list[LakehouseInfo] | None (None = not discovered)
 
     def _fabric_enabled(self) -> bool:
         return bool(self.config.workspace.name or self.config.workspace.id)
@@ -63,6 +72,33 @@ class ServerState:
             )
         return jar
 
+    def _discover(self) -> None:
+        """Resolve the workspace and list its (non-excluded) lakehouses (REST)."""
+        from azure.identity import DefaultAzureCredential
+
+        from .discovery import FabricAPIClient
+
+        if self._cred is None:
+            self._cred = DefaultAzureCredential()
+        if self._fabric_client is None:
+            self._fabric_client = FabricAPIClient(credential=self._cred)
+
+        ws = self.config.require_workspace()
+        self._workspace_id = self._fabric_client.resolve_workspace(name=ws.name, id=ws.id)
+        excluded = {e.lower() for e in self.config.lakehouses.exclude}
+        self._lakehouses = [
+            lh
+            for lh in self._fabric_client.list_lakehouses(self._workspace_id)
+            if lh.name.lower() not in excluded
+        ]
+
+    def _find_lakehouse(self, name: str):
+        for lh in self._lakehouses or []:
+            if lh.name == name:
+                return lh
+        known = sorted(lh.name for lh in (self._lakehouses or []))
+        raise ConfigError(f"Unknown lakehouse {name!r}; available: {known}")
+
     def _engine_kwargs(self) -> dict:
         kwargs = _base_engine_kwargs(self.config)
         if self._fabric_enabled():
@@ -72,16 +108,25 @@ class ServerState:
                 "secret": self._token_server.secret,
                 "jar_path": self._resolve_jar(),
             }
+            kwargs["lakehouses"] = [
+                {"name": lh.name, "id": lh.id, "workspace_id": lh.workspace_id}
+                for lh in (self._lakehouses or [])
+            ]
         return kwargs
 
-    async def _ensure_started(self) -> None:
-        if self._fabric_enabled() and self._token_server is None:
-            from .token_server import TokenServer
+    async def _ensure_discovered(self) -> None:
+        if self._fabric_enabled() and self._lakehouses is None:
+            await asyncio.to_thread(self._discover)
 
-            # Resolve the jar before starting anything, so a missing jar fails fast.
-            self._resolve_jar()
-            self._token_server = TokenServer()
-            await asyncio.to_thread(self._token_server.start)
+    async def _ensure_started(self) -> None:
+        if self._fabric_enabled():
+            self._resolve_jar()  # fail fast on a missing jar
+            await self._ensure_discovered()
+            if self._token_server is None:
+                from .token_server import TokenServer
+
+                self._token_server = TokenServer(credential=self._cred)
+                await asyncio.to_thread(self._token_server.start)
         if self._worker is None:
             self._worker = WorkerProcess(engine_kwargs=self._engine_kwargs())
         if not self._worker.running:
@@ -93,6 +138,29 @@ class ServerState:
             await self._ensure_started()
             fn = getattr(self._worker, method)
             return await asyncio.to_thread(fn, *args)
+
+    async def list_lakehouses(self) -> list:
+        async with self.lock:
+            await self._ensure_discovered()
+            return list(self._lakehouses or [])
+
+    async def list_tables(self, lakehouse: str) -> list[str]:
+        async with self.lock:
+            await self._ensure_discovered()
+            lh = self._find_lakehouse(lakehouse)
+            return await asyncio.to_thread(
+                self._fabric_client.list_tables, self._workspace_id, lh.id
+            )
+
+    async def mount(self, lakehouse: str, tables: list[str] | None) -> dict:
+        async with self.lock:
+            await self._ensure_started()
+            lh = self._find_lakehouse(lakehouse)
+            if tables is None:
+                tables = await asyncio.to_thread(
+                    self._fabric_client.list_tables, self._workspace_id, lh.id
+                )
+            return await asyncio.to_thread(self._worker.mount_tables, lakehouse, tables)
 
     async def restart(self) -> dict:
         async with self.lock:
@@ -173,6 +241,23 @@ def format_info(info: dict) -> str:
             lines.append(f"  {key}: {info[key]}")
     dbs = info.get("databases") or []
     lines.append(f"  databases ({len(dbs)}): {', '.join(dbs) if dbs else '(none)'}")
+    lhs = info.get("lakehouses") or []
+    if lhs:
+        lines.append(f"  fabric lakehouses ({len(lhs)}): {', '.join(lhs)}")
+    return "\n".join(lines)
+
+
+def format_mount(res: dict, *, max_listed: int = 50) -> str:
+    lakehouse = res["lakehouse"]
+    mounted = res.get("mounted", [])
+    failed = res.get("failed", [])
+    shown = ", ".join(mounted[:max_listed]) + (
+        f", … (+{len(mounted) - max_listed} more)" if len(mounted) > max_listed else ""
+    )
+    lines = [f"Mounted {len(mounted)} table(s) in {lakehouse}: {shown or '(none)'}"]
+    if failed:
+        lines.append(f"{len(failed)} failed:")
+        lines += [f"  {f['table']}: {f['error']}" for f in failed[:10]]
     return "\n".join(lines)
 
 
@@ -220,6 +305,64 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         state (variables, imports, registered tables). Use to start clean."""
         info = await state.restart()
         return "Runtime reset — fresh Spark session.\n\n" + format_info(info)
+
+    def _local_only_note() -> str | None:
+        if not state._fabric_enabled():
+            return (
+                "Local-only mode: no Fabric workspace configured "
+                "(set [workspace] in local-spark.toml to enable OneLake)."
+            )
+        return None
+
+    @mcp.tool()
+    async def list_lakehouses() -> str:
+        """List the Fabric lakehouses available in this session. Each is
+        registered as a Spark database; their tables are mounted on demand."""
+        if note := _local_only_note():
+            return note
+        lhs = await state.list_lakehouses()
+        if not lhs:
+            return "No lakehouses found in the workspace (after exclusions)."
+        return "Lakehouses (Spark databases):\n" + "\n".join(f"  {lh.name}" for lh in lhs)
+
+    @mcp.tool()
+    async def list_tables(lakehouse: str) -> str:
+        """List the Delta tables in a Fabric lakehouse. Tables aren't queryable
+        via SQL until mounted (mount_table / mount_lakehouse)."""
+        if note := _local_only_note():
+            return note
+        try:
+            tables = await state.list_tables(lakehouse)
+        except ConfigError as exc:
+            return str(exc)
+        if not tables:
+            return f"{lakehouse}: no tables."
+        return f"{lakehouse} ({len(tables)} tables):\n" + "\n".join(f"  {t}" for t in tables)
+
+    @mcp.tool()
+    async def mount_table(lakehouse: str, table: str) -> str:
+        """Register one OneLake Delta table as `<lakehouse>`.`<table>` so it's
+        queryable via run_sql. (run_code can also read any table directly by its
+        abfss:// path without mounting.)"""
+        if note := _local_only_note():
+            return note
+        try:
+            res = await state.mount(lakehouse, [table])
+        except ConfigError as exc:
+            return str(exc)
+        return format_mount(res)
+
+    @mcp.tool()
+    async def mount_lakehouse(lakehouse: str) -> str:
+        """Mount ALL tables in a lakehouse as `<lakehouse>`.`<table>`. Convenient,
+        but can register many tables at once."""
+        if note := _local_only_note():
+            return note
+        try:
+            res = await state.mount(lakehouse, None)
+        except ConfigError as exc:
+            return str(exc)
+        return format_mount(res)
 
     return mcp
 

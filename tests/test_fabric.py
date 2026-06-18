@@ -3,8 +3,15 @@ from pathlib import Path
 import pytest
 
 from local_spark_mcp import fabric
-from local_spark_mcp.config import Config, ConfigError, RuntimeConfig, WorkspaceConfig
-from local_spark_mcp.server import ServerState
+from local_spark_mcp.config import (
+    Config,
+    ConfigError,
+    LakehouseConfig,
+    RuntimeConfig,
+    WorkspaceConfig,
+)
+from local_spark_mcp.discovery import LakehouseInfo
+from local_spark_mcp.server import ServerState, format_mount
 
 
 def test_onelake_configs_shape():
@@ -55,3 +62,73 @@ def test_resolve_jar_uses_override_and_validates(tmp_path):
         )
     )
     assert ok._resolve_jar() == str(jar)
+
+
+# ---- discovery wiring (no Spark, mocked Fabric client) ----
+
+class _FakeClient:
+    def __init__(self, lakehouses, tables=None):
+        self._lhs = lakehouses
+        self._tables = tables or {}
+    def resolve_workspace(self, name=None, id=None):
+        return id or f"resolved-{name}"
+    def list_lakehouses(self, ws):
+        return [LakehouseInfo(n, f"id-{n}", ws) for n in self._lhs]
+    def list_tables(self, ws, lh):
+        return self._tables.get(lh, [])
+
+
+def _fabric_state(exclude=None, client=None):
+    cfg = Config(
+        workspace=WorkspaceConfig(name="Data Warehouse"),
+        lakehouses=LakehouseConfig(exclude=exclude or []),
+    )
+    state = ServerState(config=cfg)
+    state._cred = object()
+    state._fabric_client = client
+    return state
+
+
+def test_discover_applies_exclude():
+    state = _fabric_state(exclude=["silver"], client=_FakeClient(["customer", "silver", "gold"]))
+    state._discover()
+    assert state._workspace_id == "resolved-Data Warehouse"
+    assert [lh.name for lh in state._lakehouses] == ["customer", "gold"]
+
+
+def test_engine_kwargs_include_lakehouses_in_fabric_mode(tmp_path):
+    jar = tmp_path / "p.jar"
+    jar.write_text("")
+    state = _fabric_state(client=_FakeClient(["customer"]))
+    state.config.runtime.token_jar_path = str(jar)
+    state._discover()
+
+    class _TS:
+        url = "http://127.0.0.1:9/token"
+        secret = "s"
+
+    state._token_server = _TS()
+    kw = state._engine_kwargs()
+    assert kw["onelake"]["jar_path"] == str(jar)
+    assert kw["lakehouses"] == [{"name": "customer", "id": "id-customer", "workspace_id": "resolved-Data Warehouse"}]
+
+
+def test_find_lakehouse_unknown_raises():
+    state = _fabric_state(client=_FakeClient(["customer"]))
+    state._discover()
+    state._find_lakehouse("customer")  # ok
+    with pytest.raises(ConfigError, match="Unknown lakehouse"):
+        state._find_lakehouse("nope")
+
+
+def test_format_mount_with_failures():
+    res = {"lakehouse": "customer", "mounted": ["a", "b"], "failed": [{"table": "c", "error": "boom"}]}
+    out = format_mount(res)
+    assert "Mounted 2 table(s) in customer: a, b" in out
+    assert "1 failed" in out and "c: boom" in out
+
+
+def test_format_mount_caps_long_list():
+    res = {"lakehouse": "lh", "mounted": [f"t{i}" for i in range(60)], "failed": []}
+    out = format_mount(res, max_listed=50)
+    assert "+10 more" in out

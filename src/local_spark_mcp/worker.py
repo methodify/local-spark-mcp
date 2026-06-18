@@ -34,6 +34,10 @@ def _handle(engine, method: str, params: dict):
         return engine.run_code(params["code"]).to_dict(), engine
     if method == "run_sql":
         return engine.run_sql(params["sql"], params.get("limit")).to_dict(), engine
+    if method == "mount_table":
+        return engine.mount_table(params["lakehouse"], params["table"]), engine
+    if method == "mount_tables":
+        return engine.mount_tables(params["lakehouse"], params["tables"]), engine
     if method == "info":
         return engine.info(), engine
     raise ValueError(f"unknown method: {method!r}")

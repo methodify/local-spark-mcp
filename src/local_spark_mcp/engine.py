@@ -76,6 +76,7 @@ class SparkEngine:
         default_sql_limit: int = 100,
         app_name: str = "local-spark-mcp",
         onelake: dict | None = None,
+        lakehouses: list[dict] | None = None,
     ):
         self.default_sql_limit = default_sql_limit
         self.spark = build_spark(
@@ -87,6 +88,7 @@ class SparkEngine:
         )
         self.shell = self._make_shell()
         self._bootstrap_namespace()
+        self._register_lakehouses(lakehouses or [])
 
     def _make_shell(self):
         from IPython.core.interactiveshell import InteractiveShell
@@ -111,6 +113,47 @@ class SparkEngine:
                 "Window": Window,
             }
         )
+
+    @staticmethod
+    def _q(identifier: str) -> str:
+        """Backtick-quote a Spark SQL identifier."""
+        return "`" + identifier.replace("`", "``") + "`"
+
+    def _register_lakehouses(self, lakehouses: list[dict]) -> None:
+        """Register each (non-excluded) lakehouse as a Spark database. Tables are
+        NOT mounted here — that's lazy, via mount_table/mount_tables."""
+        from .discovery import LakehouseInfo
+
+        self.lakehouses: dict[str, LakehouseInfo] = {}
+        for lh in lakehouses:
+            info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
+            self.lakehouses[info.name] = info
+            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(info.name)}")
+
+    def mount_table(self, lakehouse: str, table: str) -> dict:
+        """Register a single OneLake Delta table as <lakehouse>.<table>."""
+        info = self.lakehouses.get(lakehouse)
+        if info is None:
+            raise ValueError(
+                f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}"
+            )
+        path = info.table_path(table)
+        self.spark.sql(
+            f"CREATE TABLE IF NOT EXISTS {self._q(lakehouse)}.{self._q(table)} "
+            f"USING DELTA LOCATION '{path}'"
+        )
+        return {"lakehouse": lakehouse, "table": table, "path": path}
+
+    def mount_tables(self, lakehouse: str, tables: list[str]) -> dict:
+        """Register several tables; per-table errors are captured, not fatal."""
+        mounted, failed = [], []
+        for table in tables:
+            try:
+                self.mount_table(lakehouse, table)
+                mounted.append(table)
+            except Exception as exc:  # keep going; report per-table
+                failed.append({"table": table, "error": f"{type(exc).__name__}: {exc}"})
+        return {"lakehouse": lakehouse, "mounted": mounted, "failed": failed}
 
     def run_code(self, code: str) -> ExecResult:
         """Run a cell of Python against the persistent namespace."""
@@ -182,6 +225,7 @@ class SparkEngine:
             "master": sc.master,
             "current_database": catalog.currentDatabase(),
             "databases": databases,
+            "lakehouses": sorted(getattr(self, "lakehouses", {})),
             "execution_count": self.shell.execution_count,
             "default_sql_limit": self.default_sql_limit,
         }
