@@ -17,11 +17,16 @@ they can run on Fabric with a reasonably similar outcome. So fidelity to the
 Fabric runtime matters: local Spark should read the same OneLake Delta data and
 behave close enough that conclusions transfer.
 
-**Status: Milestone A complete** (local-only loop). The MCP server runs, holds a
-stateful local Delta Spark session in a worker subprocess, and exposes
-`run_code` / `run_sql` / `session_info` / `reset_runtime`. Fabric/OneLake
-(Milestone B: token endpoint + JAR + discovery/hydration) is not built yet — the
-sections below describe that as *intent*.
+**Status: Milestone A + B.1 complete.** The MCP server runs, holds a stateful
+Spark session in a worker subprocess, and exposes `run_code` / `run_sql` /
+`session_info` / `reset_runtime`. OneLake auth is wired end to end: when a
+`[workspace]` is configured the server starts the loopback token endpoint and a
+Fabric-enabled Spark session that can read `abfss://` paths (provider loading +
+token fetch validated through Hadoop without Azure; the live `abfss://` read
+against a real workspace is the one remaining unverified step). **Not yet built
+(Milestone B.2):** Fabric discovery (`FabricAPIClient`), workspace name→GUID
+resolution, lakehouse→database registration, and `list_tables` / `mount_table`
+tools — described as *intent* below.
 
 ## Commands
 
@@ -30,11 +35,16 @@ sections below describe that as *intent*.
 uv venv --python 3.12
 uv pip install -e ".[dev]"
 
-# Fast tests (config + formatters; no Spark)
+# Build the OneLake token-provider jar (needs Java 17 + sbt; required for Fabric mode)
+cd token-provider && JAVA_HOME=<jdk17> sbt package && cd ..
+
+# Fast tests (config + formatters + token server; no Spark)
 .venv/bin/python -m pytest -q
 
 # Integration/e2e tests — start a REAL Spark session (~80–100s each), gated:
-LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_worker_integration.py tests/test_server_e2e.py -v
+LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest -m '' tests/test_worker_integration.py tests/test_server_e2e.py tests/test_fabric_session_integration.py -v
+# JVM token-provider tests (needs built jar + Java):
+LOCAL_SPARK_RUN_JVM=1 .venv/bin/python -m pytest tests/test_token_provider_jvm.py -v
 # Single test: append `::test_name`
 
 # Manual engine smoke (no MCP, no Fabric)
@@ -63,7 +73,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
   dedicated localhost socket; worker process holds the engine; `WorkerProcess`
   spawns/handshakes/proxies and `restart()` = reset.
 - `server.py` — FastMCP stdio server; one serialized worker; lazy startup;
-  blocking IPC offloaded to a thread.
+  blocking IPC offloaded to a thread; Fabric mode auto-enabled by `[workspace]`.
+- `token_server.py` — loopback OneLake token endpoint (DefaultAzureCredential,
+  secret-guarded); owned by the server, outlives worker restarts.
+- `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
+- `token-provider/` — sbt project for `ch.fs.HttpTokenProvider` (build with
+  `sbt package`; output jar referenced via `spark.jars`).
 
 ## Intended tool surface (from the design brief)
 
