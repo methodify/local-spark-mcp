@@ -8,9 +8,10 @@ blocking worker IPC runs in a thread so the asyncio event loop stays responsive.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from .config import Config, ConfigError, load_config
 from .worker_client import WorkerError, WorkerProcess
@@ -25,11 +26,12 @@ reset_runtime wipes all state by restarting the session.
 
 When a Fabric workspace is configured, its lakehouses appear as Spark databases
 and their Delta tables as `<lakehouse>`.`<table>` — the same catalog shape as the
-Fabric runtime. Explore with list_lakehouses / list_tables, mount tables on
-demand with mount_table / mount_lakehouse, then reference them by name via
-run_sql (or spark.sql / spark.table in run_code). Work entirely through named
-tables and databases, exactly as you would in a Fabric notebook, so the code you
-arrive at transfers to Fabric with a similar outcome.
+Fabric runtime. Just query tables by name with run_sql; a referenced table is
+auto-mounted on first use and stays available for the rest of the session (so
+run_code can use it afterward too). list_lakehouses / list_tables help you
+explore; mount_lakehouse bulk-mounts a whole lakehouse if you want everything up
+front. Work entirely through named tables and databases, exactly as in a Fabric
+notebook, so the code you arrive at transfers to Fabric with a similar outcome.
 """
 
 # Max width of a single SQL table cell before it is elided.
@@ -52,7 +54,9 @@ class ServerState:
 
     def __init__(self, config: Config | None = None):
         self.config = config or load_config()
-        self.lock = asyncio.Lock()
+        self.lock = asyncio.Lock()  # serializes worker operations
+        self._start_task: asyncio.Task | None = None  # single-flight startup
+        self._discover_lock = asyncio.Lock()
         self._worker: WorkerProcess | None = None
         self._token_server = None  # TokenServer | None
         self._fabric_client = None  # FabricAPIClient | None
@@ -118,10 +122,14 @@ class ServerState:
         return kwargs
 
     async def _ensure_discovered(self) -> None:
-        if self._fabric_enabled() and self._lakehouses is None:
-            await asyncio.to_thread(self._discover)
+        if not self._fabric_enabled() or self._lakehouses is not None:
+            return
+        async with self._discover_lock:
+            if self._lakehouses is None:
+                await asyncio.to_thread(self._discover)
 
-    async def _ensure_started(self) -> None:
+    async def _do_start(self) -> None:
+        """The actual (slow) startup: discovery + token server + Spark worker."""
         if self._fabric_enabled():
             self._resolve_jar()  # fail fast on a missing jar
             await self._ensure_discovered()
@@ -130,34 +138,60 @@ class ServerState:
 
                 self._token_server = TokenServer(credential=self._cred)
                 await asyncio.to_thread(self._token_server.start)
-        if self._worker is None:
-            self._worker = WorkerProcess(engine_kwargs=self._engine_kwargs())
-        if not self._worker.running:
-            await asyncio.to_thread(self._worker.start)
+        if self._worker is not None:
+            await asyncio.to_thread(self._worker.stop)  # drop any half-started worker
+        self._worker = WorkerProcess(engine_kwargs=self._engine_kwargs())
+        await asyncio.to_thread(self._worker.start)
 
-    async def call(self, method: str, *args):
-        """Serialize, lazily start the worker, run the blocking call in a thread."""
+    async def ensure_ready(self, on_wait=None) -> None:
+        """Bring the worker up (once), awaiting an in-flight start if another
+        caller already triggered it. Calls ``on_wait`` (~every 2s) while waiting,
+        so tools can emit MCP progress and keep the client from timing out on the
+        slow cold start. Gate on ``ready`` (not ``running``): the subprocess is
+        ``running`` the instant it spawns, but isn't usable until the IPC
+        connection + Spark init complete."""
+        if self._worker is not None and self._worker.ready:
+            return
+        if self._start_task is None or self._start_task.done():
+            self._start_task = asyncio.ensure_future(self._do_start())
+        task = self._start_task
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=2.0)
+            if not done and on_wait is not None:
+                await on_wait()
+        exc = task.exception()
+        if exc is not None:
+            self._start_task = None  # allow a retry on the next call
+            raise exc
+
+    async def warmup(self) -> None:
+        """Begin startup in the background at server launch so the cold start
+        overlaps the agent's initial latency. Errors are swallowed here and
+        re-surfaced on the first real tool call."""
+        try:
+            await self.ensure_ready()
+        except Exception:
+            pass
+
+    async def call(self, method: str, *args, on_wait=None):
+        await self.ensure_ready(on_wait=on_wait)
         async with self.lock:
-            await self._ensure_started()
-            fn = getattr(self._worker, method)
-            return await asyncio.to_thread(fn, *args)
+            return await asyncio.to_thread(getattr(self._worker, method), *args)
 
     async def list_lakehouses(self) -> list:
-        async with self.lock:
-            await self._ensure_discovered()
-            return list(self._lakehouses or [])
+        await self._ensure_discovered()
+        return list(self._lakehouses or [])
 
     async def list_tables(self, lakehouse: str) -> list[str]:
-        async with self.lock:
-            await self._ensure_discovered()
-            lh = self._find_lakehouse(lakehouse)
-            return await asyncio.to_thread(
-                self._fabric_client.list_tables, self._workspace_id, lh.id
-            )
+        await self._ensure_discovered()
+        lh = self._find_lakehouse(lakehouse)
+        return await asyncio.to_thread(
+            self._fabric_client.list_tables, self._workspace_id, lh.id
+        )
 
-    async def mount(self, lakehouse: str, tables: list[str] | None) -> dict:
+    async def mount(self, lakehouse: str, tables: list[str] | None, on_wait=None) -> dict:
+        await self.ensure_ready(on_wait=on_wait)
         async with self.lock:
-            await self._ensure_started()
             lh = self._find_lakehouse(lakehouse)
             if tables is None:
                 tables = await asyncio.to_thread(
@@ -165,13 +199,14 @@ class ServerState:
                 )
             return await asyncio.to_thread(self._worker.mount_tables, lakehouse, tables)
 
-    async def restart(self) -> dict:
+    async def restart(self, on_wait=None) -> dict:
         async with self.lock:
             if self._worker is not None:
                 await asyncio.to_thread(self._worker.stop)
                 self._worker = None
-            await self._ensure_started()
-            return self._worker.info  # set by WorkerProcess.start()
+            self._start_task = None
+        await self.ensure_ready(on_wait=on_wait)
+        return self._worker.info  # set by WorkerProcess.start()
 
     def shutdown(self) -> None:
         if self._worker is not None:
@@ -266,35 +301,66 @@ def format_mount(res: dict, *, max_listed: int = 50) -> str:
 
 # ---------- server / tools ----------
 
+def _pinger(ctx: Context):
+    """Build an on_wait callback that emits MCP progress while the worker starts,
+    keeping the client from timing out on the (slow) Spark cold start."""
+    counter = {"n": 0}
+
+    async def ping():
+        counter["n"] += 1
+        try:
+            await ctx.report_progress(
+                progress=counter["n"],
+                total=None,
+                message="starting local Spark session (first call warms the JVM)…",
+            )
+        except Exception:
+            pass  # no progress token / client doesn't support it — ignore
+
+    return ping
+
+
 def build_server(state: ServerState | None = None) -> FastMCP:
     state = state or ServerState()
-    mcp = FastMCP("local-spark", instructions=INSTRUCTIONS)
+
+    @asynccontextmanager
+    async def lifespan(_server: FastMCP):
+        # Warm Spark in the background so the cold start overlaps the agent's
+        # initial latency instead of being paid entirely by the first tool call.
+        warm = asyncio.create_task(state.warmup())
+        try:
+            yield
+        finally:
+            warm.cancel()
+            state.shutdown()
+
+    mcp = FastMCP("local-spark", instructions=INSTRUCTIONS, lifespan=lifespan)
 
     @mcp.tool()
-    async def run_code(code: str) -> str:
+    async def run_code(code: str, ctx: Context) -> str:
         """Run a cell of Python/PySpark against the persistent session. State persists across calls; `spark`, `sc`, `F`, `T`, `Window` are pre-imported. Returns captured stdout and the last-expression echo, or the traceback if the cell raised."""
-        res = await state.call("run_code", code)
+        res = await state.call("run_code", code, on_wait=_pinger(ctx))
         return format_exec_result(res)
 
     @mcp.tool()
-    async def run_sql(sql: str, limit: int | None = None) -> str:
-        """Run a Spark SQL statement and return rows as a text table. `limit` caps returned rows (default from config, ~100) and the result flags truncation. Reference mounted Fabric tables by name (`lakehouse`.`table`), or any table/view registered in the session."""
+    async def run_sql(sql: str, ctx: Context, limit: int | None = None) -> str:
+        """Run a Spark SQL statement and return rows as a text table. Reference Fabric tables by name (`lakehouse`.`table`) — they auto-mount on first use and stay available for the session. `limit` caps returned rows (default from config, ~100) and the result flags truncation."""
         try:
-            res = await state.call("run_sql", sql, limit)
+            res = await state.call("run_sql", sql, limit, on_wait=_pinger(ctx))
         except WorkerError as exc:
             return f"SQL error: {exc}"
         return format_sql_result(res)
 
     @mcp.tool()
-    async def session_info() -> str:
+    async def session_info(ctx: Context) -> str:
         """Show the live Spark session: version, master, current database, the catalog databases, and any Fabric lakehouses registered this session."""
-        info = await state.call("get_info")
+        info = await state.call("get_info", on_wait=_pinger(ctx))
         return format_info(info)
 
     @mcp.tool()
-    async def reset_runtime() -> str:
+    async def reset_runtime(ctx: Context) -> str:
         """Reset the runtime: restart the Spark session and wipe all state — variables, imports, and mounted tables. Use to start from a clean slate."""
-        info = await state.restart()
+        info = await state.restart(on_wait=_pinger(ctx))
         return "Runtime reset — fresh Spark session.\n\n" + format_info(info)
 
     def _local_only_note() -> str | None:
@@ -329,23 +395,23 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         return f"{lakehouse} ({len(tables)} tables):\n" + "\n".join(f"  {t}" for t in tables)
 
     @mcp.tool()
-    async def mount_table(lakehouse: str, table: str) -> str:
-        """Register one Fabric Delta table as `<lakehouse>`.`<table>` so it's queryable by name via run_sql (and spark.sql / spark.table in run_code)."""
+    async def mount_table(lakehouse: str, table: str, ctx: Context) -> str:
+        """Explicitly register one Fabric Delta table as `<lakehouse>`.`<table>`. Usually unnecessary — run_sql auto-mounts referenced tables — but useful to pre-register a table for use in run_code."""
         if note := _local_only_note():
             return note
         try:
-            res = await state.mount(lakehouse, [table])
+            res = await state.mount(lakehouse, [table], on_wait=_pinger(ctx))
         except ConfigError as exc:
             return str(exc)
         return format_mount(res)
 
     @mcp.tool()
-    async def mount_lakehouse(lakehouse: str) -> str:
+    async def mount_lakehouse(lakehouse: str, ctx: Context) -> str:
         """Mount ALL tables in a lakehouse as `<lakehouse>`.`<table>`. Convenient, but can register many tables at once."""
         if note := _local_only_note():
             return note
         try:
-            res = await state.mount(lakehouse, None)
+            res = await state.mount(lakehouse, None, on_wait=_pinger(ctx))
         except ConfigError as exc:
             return str(exc)
         return format_mount(res)

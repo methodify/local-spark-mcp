@@ -35,3 +35,6 @@ local-spark.local.toml
 
 # Windows zone identifier cruft
 *:Zone.Identifier
+
+/local-spark.toml
+/.mcp.json

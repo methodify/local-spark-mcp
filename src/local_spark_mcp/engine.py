@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import re
 import traceback as _tb
 from dataclasses import asdict, dataclass, field
 
@@ -125,24 +126,38 @@ class SparkEngine:
         from .discovery import LakehouseInfo
 
         self.lakehouses: dict[str, LakehouseInfo] = {}
+        self._mounted: dict[str, set] = {}  # lakehouse name -> mounted table names
         for lh in lakehouses:
             info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
             self.lakehouses[info.name] = info
             self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(info.name)}")
 
+    def _resolve_lakehouse(self, name: str):
+        """Look up a lakehouse by name (case-insensitively, since Spark
+        normalizes catalog identifiers)."""
+        info = self.lakehouses.get(name)
+        if info is not None:
+            return info
+        lowered = name.lower()
+        for known, lh in self.lakehouses.items():
+            if known.lower() == lowered:
+                return lh
+        return None
+
     def mount_table(self, lakehouse: str, table: str) -> dict:
         """Register a single OneLake Delta table as <lakehouse>.<table>."""
-        info = self.lakehouses.get(lakehouse)
+        info = self._resolve_lakehouse(lakehouse)
         if info is None:
             raise ValueError(
                 f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}"
             )
         path = info.table_path(table)
         self.spark.sql(
-            f"CREATE TABLE IF NOT EXISTS {self._q(lakehouse)}.{self._q(table)} "
+            f"CREATE TABLE IF NOT EXISTS {self._q(info.name)}.{self._q(table)} "
             f"USING DELTA LOCATION '{path}'"
         )
-        return {"lakehouse": lakehouse, "table": table, "path": path}
+        self._mounted.setdefault(info.name, set()).add(table)
+        return {"lakehouse": info.name, "table": table, "path": path}
 
     def mount_tables(self, lakehouse: str, tables: list[str]) -> dict:
         """Register several tables; per-table errors are captured, not fatal."""
@@ -191,11 +206,42 @@ class SparkEngine:
             execution_count=self.shell.execution_count,
         )
 
+    # "[TABLE_OR_VIEW_NOT_FOUND] ... `db`.`table` cannot be found"
+    _MISSING_TABLE_RE = re.compile(r"`([^`]+)`\.`([^`]+)`")
+
+    def _automount_missing(self, exc) -> bool:
+        """If ``exc`` is a table-not-found for a known Fabric lakehouse table,
+        mount it and return True (so the caller can retry). Mirrors the Fabric
+        runtime, where a lakehouse's tables are queryable by name without an
+        explicit mount step."""
+        message = str(exc)
+        if "TABLE_OR_VIEW_NOT_FOUND" not in message and "cannot be found" not in message:
+            return False
+        for db, table in self._MISSING_TABLE_RE.findall(message):
+            info = self._resolve_lakehouse(db)
+            if info is not None and table not in self._mounted.get(info.name, set()):
+                self.mount_table(info.name, table)  # records into self._mounted
+                return True
+        return False
+
+    def _sql_with_automount(self, sql: str):
+        """spark.sql, transparently mounting referenced Fabric tables on first
+        use. Each iteration mounts one newly-referenced table; the per-table
+        guard prevents loops if a mount doesn't resolve the reference."""
+        from pyspark.errors import AnalysisException
+
+        while True:
+            try:
+                return self.spark.sql(sql)
+            except AnalysisException as exc:
+                if not self._automount_missing(exc):
+                    raise
+
     def run_sql(self, sql: str, limit: int | None = None) -> SqlResult:
         """Run a SQL statement and return up to ``limit`` rows."""
         if limit is None:
             limit = self.default_sql_limit
-        df = self.spark.sql(sql)
+        df = self._sql_with_automount(sql)
         columns = list(df.columns)
         # Pull one extra row to detect truncation without a full count.
         collected = df.limit(limit + 1).collect()

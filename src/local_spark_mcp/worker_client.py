@@ -48,6 +48,13 @@ class WorkerProcess:
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def ready(self) -> bool:
+        """Fully started: process up AND the IPC connection + init handshake are
+        complete. ``running`` becomes true the instant the subprocess spawns,
+        well before the socket/init is usable — callers must gate on ``ready``."""
+        return self.running and self._conn is not None and self.info is not None
+
     def start(self) -> dict:
         """Spawn the worker, wait for connect, run the init handshake.
 
