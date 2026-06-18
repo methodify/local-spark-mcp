@@ -1,6 +1,6 @@
 [project]
 name = "local-spark-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server giving an agent a stateful local Spark session for prototyping PySpark notebooks targeting Microsoft Fabric"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"  # pyspark 3.5.0 is validated on 3.12; avoid 3.13
