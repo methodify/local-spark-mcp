@@ -10,7 +10,11 @@ from __future__ import annotations
 import glob
 from pathlib import Path
 
-# Spark 3.5.0 bundles Hadoop 3.3.4 — match hadoop-azure to avoid classpath skew.
+# Spark 3.5.0 bundles Hadoop 3.3.4; match hadoop-azure to it (3.3.6 collides with
+# the bundled hadoop-common). Validated against live OneLake — works with
+# GUID-based abfss paths. NOTE: name-based paths ("<lakehouse>.Lakehouse/...")
+# make OneLake return HTTP 400, so always address by workspace/lakehouse GUID:
+#   abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}
 HADOOP_AZURE_PACKAGE = "org.apache.hadoop:hadoop-azure:3.3.4"
 PROVIDER_CLASS = "ch.fs.HttpTokenProvider"
 _JAR_GLOB = "token-provider/target/scala-2.12/*.jar"

@@ -19,12 +19,16 @@ behave close enough that conclusions transfer.
 
 **Status: Milestone A + B.1 complete.** The MCP server runs, holds a stateful
 Spark session in a worker subprocess, and exposes `run_code` / `run_sql` /
-`session_info` / `reset_runtime`. OneLake auth is wired end to end: when a
-`[workspace]` is configured the server starts the loopback token endpoint and a
-Fabric-enabled Spark session that can read `abfss://` paths (provider loading +
-token fetch validated through Hadoop without Azure; the live `abfss://` read
-against a real workspace is the one remaining unverified step). **Not yet built
-(Milestone B.2):** Fabric discovery (`FabricAPIClient`), workspace name→GUID
+`session_info` / `reset_runtime`. OneLake auth is wired end to end and **validated against live OneLake** — a real
+`abfss://` Delta read returned 1.4M rows through the full stack (token endpoint →
+HttpTokenProvider → Spark). When a `[workspace]` is configured the server starts
+the loopback token endpoint and a Fabric-enabled Spark session.
+
+⚠️ **Address OneLake by GUID, not name.** `abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}`
+works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
+400. B.2's hydration must use the GUIDs from `FabricAPIClient`.
+
+**Not yet built (Milestone B.2):** Fabric discovery (`FabricAPIClient`), workspace name→GUID
 resolution, lakehouse→database registration, and `list_tables` / `mount_table`
 tools — described as *intent* below.
 
