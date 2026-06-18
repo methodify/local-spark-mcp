@@ -28,6 +28,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/local_spark_mcp"]
+# Ship the prebuilt token-provider jar so `uvx`/pip installs from GitHub work
+# without sbt (Fabric/OneLake mode needs it). Rebuild via scripts/build_jar.sh.
+artifacts = ["src/local_spark_mcp/jars/*.jar"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

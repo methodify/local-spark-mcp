@@ -38,8 +38,11 @@ works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
 uv venv --python 3.12
 uv pip install -e ".[dev]"
 
-# Build the OneLake token-provider jar (needs Java 17 + sbt; required for Fabric mode)
-cd token-provider && JAVA_HOME=<jdk17> sbt package && cd ..
+# Build the OneLake token-provider jar AND bundle it into the package
+# (needs Java 17 + sbt). The bundled jar (src/local_spark_mcp/jars/*.jar) ships in
+# the wheel so `uvx`/pip installs from GitHub work without sbt — re-run and commit
+# this whenever HttpTokenProvider.scala changes.
+JAVA_HOME=<jdk17> scripts/build_jar.sh
 
 # Fast tests (config + formatters + token server; no Spark)
 .venv/bin/python -m pytest -q
@@ -82,8 +85,11 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
 - `discovery.py` — `FabricAPIClient` (REST: resolve workspace, list lakehouses /
   tables, paging) + `LakehouseInfo` (GUID abfss path builder). Runs in the server.
-- `token-provider/` — sbt project for `ch.fs.HttpTokenProvider` (build with
-  `sbt package`; output jar referenced via `spark.jars`).
+- `token-provider/` — sbt project for `ch.fs.HttpTokenProvider`. Its built jar is
+  bundled into `src/local_spark_mcp/jars/` (committed, shipped in the wheel) so
+  `uvx`/pip installs work without sbt. `default_jar_path()` prefers a fresh
+  in-repo build, else the bundled jar. Rebuild + re-bundle via
+  `scripts/build_jar.sh`.
 
 ## Intended tool surface (from the design brief)
 

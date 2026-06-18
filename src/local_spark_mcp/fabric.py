@@ -25,10 +25,23 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _packaged_jar_dir() -> Path:
+    # jar shipped inside the installed package (wheel / uvx-from-GitHub)
+    return Path(__file__).resolve().parent / "jars"
+
+
 def default_jar_path() -> str | None:
-    """The token-provider jar from an in-repo `sbt package`, if present."""
-    matches = sorted(glob.glob(str(repo_root() / _JAR_GLOB)))
-    return matches[-1] if matches else None
+    """Locate the HttpTokenProvider jar.
+
+    Prefer a fresh in-repo `sbt package` build (dev/editable installs), then fall
+    back to the jar bundled inside the installed package (so `uvx`/pip installs
+    from GitHub work without sbt). Returns None if neither is present.
+    """
+    dev = sorted(glob.glob(str(repo_root() / _JAR_GLOB)))
+    if dev:
+        return dev[-1]
+    packaged = sorted(glob.glob(str(_packaged_jar_dir() / "*.jar")))
+    return packaged[-1] if packaged else None
 
 
 def onelake_spark_configs(*, endpoint: str, secret: str, jar_path: str) -> dict[str, str]:
