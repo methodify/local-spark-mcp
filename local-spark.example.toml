@@ -1,0 +1,27 @@
+# local-spark-mcp configuration.
+# Copy to `local-spark.toml` in your project working directory and edit.
+# Every setting can be overridden by a LOCAL_SPARK_* environment variable.
+# Nothing here is secret — auth is ambient via `az login` / DefaultAzureCredential.
+
+[workspace]
+# Set EXACTLY ONE of name or id. A name is resolved to its GUID via the Fabric
+# REST API at startup.
+name = "My Fabric Workspace"
+# id = "48b1a818-0000-0000-0000-000000000000"
+# env overrides: LOCAL_SPARK_WORKSPACE_NAME / LOCAL_SPARK_WORKSPACE_ID
+
+[lakehouses]
+# All lakehouses in the workspace are registered as Spark databases by default
+# (cheap — table hydration is lazy). List names here to exclude noisy ones.
+exclude = []
+# env override: LOCAL_SPARK_LAKEHOUSE_EXCLUDE="Staging,Sandbox"
+
+[spark]
+driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
+# Arbitrary extra Spark configs (string -> string).
+[spark.extra_configs]
+# "spark.sql.shuffle.partitions" = "8"
+
+[runtime]
+default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPARK_SQL_LIMIT
+# java_home = "/path/to/jdk17"   # pin the JVM (Spark 3.5 wants Java 8/11/17); env: LOCAL_SPARK_JAVA_HOME
