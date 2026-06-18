@@ -16,17 +16,20 @@ from .config import Config, ConfigError, load_config
 from .worker_client import WorkerError, WorkerProcess
 
 INSTRUCTIONS = """\
-A stateful local Apache Spark session for prototyping PySpark that will later run
-on Microsoft Fabric. State persists across calls like cells in one notebook
-kernel: variables, imports, and the SparkSession (`spark`) survive between
-run_code calls. `spark`, `sc`, `F` (functions), `T` (types), and `Window` are
-pre-imported. Use run_code to explore/transform and run_sql for quick queries.
+A stateful local Apache Spark session for prototyping PySpark that will run on
+Microsoft Fabric. State persists across calls like cells in one notebook kernel:
+variables, imports, and the SparkSession (`spark`) survive between run_code
+calls. `spark`, `sc`, `F` (functions), `T` (types), and `Window` are pre-imported.
+Use run_code to explore and transform; use run_sql for quick queries.
 reset_runtime wipes all state by restarting the session.
 
-If a Fabric workspace is configured, its lakehouses are registered as Spark
-databases: use list_lakehouses / list_tables to explore, and mount_table /
-mount_lakehouse to make OneLake Delta tables queryable as `<lakehouse>`.`<table>`
-via run_sql. run_code can also read any table directly by its abfss:// path.
+When a Fabric workspace is configured, its lakehouses appear as Spark databases
+and their Delta tables as `<lakehouse>`.`<table>` — the same catalog shape as the
+Fabric runtime. Explore with list_lakehouses / list_tables, mount tables on
+demand with mount_table / mount_lakehouse, then reference them by name via
+run_sql (or spark.sql / spark.table in run_code). Work entirely through named
+tables and databases, exactly as you would in a Fabric notebook, so the code you
+arrive at transfers to Fabric with a similar outcome.
 """
 
 # Max width of a single SQL table cell before it is elided.
@@ -269,23 +272,13 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def run_code(code: str) -> str:
-        """Run a cell of Python/PySpark against the persistent session.
-
-        State persists across calls. `spark`, `sc`, `F`, `T`, `Window` are
-        available. Returns captured stdout plus the last-expression echo, or the
-        traceback if the cell raised.
-        """
+        """Run a cell of Python/PySpark against the persistent session. State persists across calls; `spark`, `sc`, `F`, `T`, `Window` are pre-imported. Returns captured stdout and the last-expression echo, or the traceback if the cell raised."""
         res = await state.call("run_code", code)
         return format_exec_result(res)
 
     @mcp.tool()
     async def run_sql(sql: str, limit: int | None = None) -> str:
-        """Run a Spark SQL statement and return rows as a text table.
-
-        `limit` caps returned rows (default from config, ~100); the result notes
-        when output was truncated. Tables created/registered in the session are
-        queryable here.
-        """
+        """Run a Spark SQL statement and return rows as a text table. `limit` caps returned rows (default from config, ~100) and the result flags truncation. Reference mounted Fabric tables by name (`lakehouse`.`table`), or any table/view registered in the session."""
         try:
             res = await state.call("run_sql", sql, limit)
         except WorkerError as exc:
@@ -294,15 +287,13 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def session_info() -> str:
-        """Show the live Spark session: version, master, current database, and
-        the databases registered in the catalog."""
+        """Show the live Spark session: version, master, current database, the catalog databases, and any Fabric lakehouses registered this session."""
         info = await state.call("get_info")
         return format_info(info)
 
     @mcp.tool()
     async def reset_runtime() -> str:
-        """Reset the runtime: restart the Spark session and wipe all Python
-        state (variables, imports, registered tables). Use to start clean."""
+        """Reset the runtime: restart the Spark session and wipe all state — variables, imports, and mounted tables. Use to start from a clean slate."""
         info = await state.restart()
         return "Runtime reset — fresh Spark session.\n\n" + format_info(info)
 
@@ -316,8 +307,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def list_lakehouses() -> str:
-        """List the Fabric lakehouses available in this session. Each is
-        registered as a Spark database; their tables are mounted on demand."""
+        """List the Fabric lakehouses available in this session. Each is registered as a Spark database; its tables are mounted on demand."""
         if note := _local_only_note():
             return note
         lhs = await state.list_lakehouses()
@@ -327,8 +317,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def list_tables(lakehouse: str) -> str:
-        """List the Delta tables in a Fabric lakehouse. Tables aren't queryable
-        via SQL until mounted (mount_table / mount_lakehouse)."""
+        """List the Delta tables in a Fabric lakehouse. Tables are not queryable via SQL until you mount them with mount_table or mount_lakehouse."""
         if note := _local_only_note():
             return note
         try:
@@ -341,9 +330,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def mount_table(lakehouse: str, table: str) -> str:
-        """Register one OneLake Delta table as `<lakehouse>`.`<table>` so it's
-        queryable via run_sql. (run_code can also read any table directly by its
-        abfss:// path without mounting.)"""
+        """Register one Fabric Delta table as `<lakehouse>`.`<table>` so it's queryable by name via run_sql (and spark.sql / spark.table in run_code)."""
         if note := _local_only_note():
             return note
         try:
@@ -354,8 +341,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def mount_lakehouse(lakehouse: str) -> str:
-        """Mount ALL tables in a lakehouse as `<lakehouse>`.`<table>`. Convenient,
-        but can register many tables at once."""
+        """Mount ALL tables in a lakehouse as `<lakehouse>`.`<table>`. Convenient, but can register many tables at once."""
         if note := _local_only_note():
             return note
         try:
