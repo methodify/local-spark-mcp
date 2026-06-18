@@ -110,6 +110,39 @@ def test_env_override_scalars(tmp_path, monkeypatch):
     assert cfg.lakehouses.exclude == ["A", "B", "C"]
 
 
+def test_warm_on_start_defaults_false(tmp_path):
+    cfg = load_config(write_config(tmp_path, '[workspace]\nid = "x"\n'))
+    assert cfg.runtime.warm_on_start is False
+
+
+def test_warm_on_start_from_file(tmp_path):
+    cfg = load_config(
+        write_config(tmp_path, '[workspace]\nid = "x"\n[runtime]\nwarm_on_start = true\n')
+    )
+    assert cfg.runtime.warm_on_start is True
+
+
+def test_warm_on_start_wrong_type(tmp_path):
+    path = write_config(tmp_path, '[workspace]\nid = "x"\n[runtime]\nwarm_on_start = "yes"\n')
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_warm_on_start_env_override(tmp_path, monkeypatch):
+    path = write_config(tmp_path, '[workspace]\nid = "x"\n')
+    monkeypatch.setenv("LOCAL_SPARK_WARM_ON_START", "1")
+    assert load_config(path).runtime.warm_on_start is True
+    monkeypatch.setenv("LOCAL_SPARK_WARM_ON_START", "off")
+    assert load_config(path).runtime.warm_on_start is False
+
+
+def test_warm_on_start_env_invalid(tmp_path, monkeypatch):
+    path = write_config(tmp_path, '[workspace]\nid = "x"\n')
+    monkeypatch.setenv("LOCAL_SPARK_WARM_ON_START", "maybe")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_bad_sql_limit_env(tmp_path, monkeypatch):
     path = write_config(tmp_path, '[workspace]\nid = "x"\n')
     monkeypatch.setenv("LOCAL_SPARK_SQL_LIMIT", "not-a-number")

@@ -52,6 +52,7 @@ class RuntimeConfig:
     default_sql_limit: int = 100
     java_home: str | None = None
     token_jar_path: str | None = None  # override for the HttpTokenProvider jar
+    warm_on_start: bool = False  # eagerly start Spark at launch (default: lazy)
 
 
 @dataclass
@@ -96,6 +97,19 @@ def find_config_file(start: Path | None = None) -> Path | None:
     return None
 
 
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off", ""}
+
+
+def _parse_bool(value: str, context: str) -> bool:
+    v = value.strip().lower()
+    if v in _TRUE:
+        return True
+    if v in _FALSE:
+        return False
+    raise ConfigError(f"{context} must be a boolean (got {value!r}).")
+
+
 def _require_str(table: dict, key: str, context: str) -> str | None:
     value = table.get(key)
     if value is not None and not isinstance(value, str):
@@ -125,6 +139,10 @@ def _parse_file(path: Path) -> Config:
     ):
         raise ConfigError("spark.extra_configs must be a table of string->string.")
 
+    warm_on_start = runtime.get("warm_on_start", False)
+    if not isinstance(warm_on_start, bool):
+        raise ConfigError("runtime.warm_on_start must be a boolean (true/false).")
+
     config = Config(
         workspace=WorkspaceConfig(
             name=_require_str(ws, "name", "workspace"),
@@ -139,6 +157,7 @@ def _parse_file(path: Path) -> Config:
             default_sql_limit=int(runtime.get("default_sql_limit", 100)),
             java_home=_require_str(runtime, "java_home", "runtime"),
             token_jar_path=_require_str(runtime, "token_jar_path", "runtime"),
+            warm_on_start=warm_on_start,
         ),
         source_path=path,
     )
@@ -173,6 +192,9 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (jar := env.get(f"{ENV_PREFIX}TOKEN_JAR_PATH")) is not None:
         config.runtime.token_jar_path = jar
+
+    if (warm := env.get(f"{ENV_PREFIX}WARM_ON_START")) is not None:
+        config.runtime.warm_on_start = _parse_bool(warm, f"{ENV_PREFIX}WARM_ON_START")
 
 
 def load_config(path: Path | None = None, *, search_from: Path | None = None) -> Config:

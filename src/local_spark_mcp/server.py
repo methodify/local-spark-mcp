@@ -347,13 +347,20 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @asynccontextmanager
     async def lifespan(_server: FastMCP):
-        # Warm Spark in the background so the cold start overlaps the agent's
-        # initial latency instead of being paid entirely by the first tool call.
-        warm = asyncio.create_task(state.warmup())
+        # Lazy by default: the worker starts on the first tool call that needs it
+        # (the cold start is covered by progress heartbeats, so no client timeout).
+        # This avoids warming a heavy JVM in every agent of a swarm when only one
+        # will use it. Opt into eager warmup with runtime.warm_on_start = true.
+        warm = (
+            asyncio.create_task(state.warmup())
+            if state.config.runtime.warm_on_start
+            else None
+        )
         try:
             yield
         finally:
-            warm.cancel()
+            if warm is not None:
+                warm.cancel()
             state.shutdown()
 
     mcp = FastMCP("local-spark", instructions=INSTRUCTIONS, lifespan=lifespan)

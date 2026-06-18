@@ -137,9 +137,12 @@ sections below; this is the summary of record.
    **auto-mounts** a referenced `<lakehouse>`.`<table>` on first use (catch
    not-found → mount if it's a known lakehouse → retry), so the agent just
    queries by name like the Fabric runtime; `mount_table`/`mount_lakehouse`
-   remain for explicit/bulk mounting. Startup is single-flight + warmed in the
-   background at launch, and tools emit MCP progress during the cold start so the
-   client doesn't time out.
+   remain for explicit/bulk mounting. Worker startup is **lazy by default**
+   (first tool call that needs it), single-flight, and the cold start is covered
+   by MCP progress heartbeats emitted throughout every long op — so no client
+   timeout, just first-call lag on whichever agent uses it. Lazy keeps a swarm of
+   agents from each warming a JVM; opt into eager warm-at-launch with
+   `runtime.warm_on_start = true` (env `LOCAL_SPARK_WARM_ON_START`).
 
 ## The reference implementation — read this first
 

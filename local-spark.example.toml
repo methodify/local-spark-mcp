@@ -24,6 +24,11 @@ driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
 
 [runtime]
 default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPARK_SQL_LIMIT
+# warm_on_start = false   # default: lazy — Spark starts on first use (cold start
+#                         # is covered by progress heartbeats, so no client timeout).
+#                         # Set true to eagerly warm the JVM at launch. Leave false
+#                         # when running several agents so each doesn't warm a JVM.
+#                         # env: LOCAL_SPARK_WARM_ON_START
 # java_home = "/path/to/jdk17"   # pin the JVM (Spark 3.5 wants Java 8/11/17); env: LOCAL_SPARK_JAVA_HOME
 # token_jar_path = "/path/to/httptokenprovider_2.12-0.1.jar"  # override; default = in-repo sbt build
 # env override: LOCAL_SPARK_TOKEN_JAR_PATH

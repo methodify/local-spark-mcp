@@ -59,6 +59,49 @@ def test_concurrent_caller_waits_for_ready(monkeypatch):
     state.shutdown()
 
 
+def test_lazy_by_default_no_warmup_at_launch(monkeypatch):
+    """With warm_on_start unset (default), the lifespan must NOT start the worker;
+    it stays lazy until the first tool call."""
+    started = {"n": 0}
+
+    class CountingWorker(FakeWorker):
+        def start(self):
+            started["n"] += 1
+            return super().start()
+
+    monkeypatch.setattr(server_mod, "WorkerProcess", CountingWorker)
+    mcp = server_mod.build_server(server_mod.ServerState(config=Config()))
+
+    async def scenario():
+        async with mcp._mcp_server.lifespan(mcp._mcp_server):  # enter/exit lifespan
+            await asyncio.sleep(0.1)  # give any (unwanted) warmup task a chance to run
+
+    asyncio.run(scenario())
+    assert started["n"] == 0  # nothing warmed at launch
+
+
+def test_warm_on_start_triggers_launch_warmup(monkeypatch):
+    from local_spark_mcp.config import Config as Cfg, RuntimeConfig
+
+    started = {"n": 0}
+
+    class CountingWorker(FakeWorker):
+        def start(self):
+            started["n"] += 1
+            return super().start()
+
+    monkeypatch.setattr(server_mod, "WorkerProcess", CountingWorker)
+    cfg = Cfg(runtime=RuntimeConfig(warm_on_start=True))
+    mcp = server_mod.build_server(server_mod.ServerState(config=cfg))
+
+    async def scenario():
+        async with mcp._mcp_server.lifespan(mcp._mcp_server):
+            await asyncio.sleep(0.5)  # warmup runs FakeWorker.start (~0.3s)
+
+    asyncio.run(scenario())
+    assert started["n"] == 1  # eagerly warmed at launch
+
+
 def test_single_flight_starts_worker_once(monkeypatch):
     starts = {"n": 0}
 
