@@ -47,6 +47,25 @@ def _base_engine_kwargs(config: Config) -> dict:
     }
 
 
+# Heartbeat cadence for long ops. MCP clients reset their request timeout when a
+# progress notification arrives; keep well under any few-second client threshold.
+PROGRESS_INTERVAL = 2.0
+
+
+async def _await_with_progress(awaitable, on_wait, interval: float = PROGRESS_INTERVAL):
+    """Await ``awaitable``, invoking ``on_wait`` (~every ``interval`` s) while it
+    is still pending. Lets a tool emit MCP progress throughout a long worker/REST
+    call — not just during startup — so the client doesn't time out mid-operation
+    (e.g. a run_sql that lazily mounts a table by reading its OneLake Delta log)."""
+    task = asyncio.ensure_future(awaitable)
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=interval)
+        if done:
+            return task.result()
+        if on_wait is not None:
+            await on_wait()
+
+
 class ServerState:
     """Owns the worker and, in Fabric mode, the OneLake token server + REST
     discovery. Serializes access. Discovery (cheap REST) is separable from worker
@@ -121,12 +140,12 @@ class ServerState:
             ]
         return kwargs
 
-    async def _ensure_discovered(self) -> None:
+    async def _ensure_discovered(self, on_wait=None) -> None:
         if not self._fabric_enabled() or self._lakehouses is not None:
             return
         async with self._discover_lock:
             if self._lakehouses is None:
-                await asyncio.to_thread(self._discover)
+                await _await_with_progress(asyncio.to_thread(self._discover), on_wait)
 
     async def _do_start(self) -> None:
         """The actual (slow) startup: discovery + token server + Spark worker."""
@@ -176,17 +195,20 @@ class ServerState:
     async def call(self, method: str, *args, on_wait=None):
         await self.ensure_ready(on_wait=on_wait)
         async with self.lock:
-            return await asyncio.to_thread(getattr(self._worker, method), *args)
+            return await _await_with_progress(
+                asyncio.to_thread(getattr(self._worker, method), *args), on_wait
+            )
 
-    async def list_lakehouses(self) -> list:
-        await self._ensure_discovered()
+    async def list_lakehouses(self, on_wait=None) -> list:
+        await self._ensure_discovered(on_wait=on_wait)
         return list(self._lakehouses or [])
 
-    async def list_tables(self, lakehouse: str) -> list[str]:
-        await self._ensure_discovered()
+    async def list_tables(self, lakehouse: str, on_wait=None) -> list[str]:
+        await self._ensure_discovered(on_wait=on_wait)
         lh = self._find_lakehouse(lakehouse)
-        return await asyncio.to_thread(
-            self._fabric_client.list_tables, self._workspace_id, lh.id
+        return await _await_with_progress(
+            asyncio.to_thread(self._fabric_client.list_tables, self._workspace_id, lh.id),
+            on_wait,
         )
 
     async def mount(self, lakehouse: str, tables: list[str] | None, on_wait=None) -> dict:
@@ -194,10 +216,13 @@ class ServerState:
         async with self.lock:
             lh = self._find_lakehouse(lakehouse)
             if tables is None:
-                tables = await asyncio.to_thread(
-                    self._fabric_client.list_tables, self._workspace_id, lh.id
+                tables = await _await_with_progress(
+                    asyncio.to_thread(self._fabric_client.list_tables, self._workspace_id, lh.id),
+                    on_wait,
                 )
-            return await asyncio.to_thread(self._worker.mount_tables, lakehouse, tables)
+            return await _await_with_progress(
+                asyncio.to_thread(self._worker.mount_tables, lakehouse, tables), on_wait
+            )
 
     async def restart(self, on_wait=None) -> dict:
         async with self.lock:
@@ -301,19 +326,16 @@ def format_mount(res: dict, *, max_listed: int = 50) -> str:
 
 # ---------- server / tools ----------
 
-def _pinger(ctx: Context):
-    """Build an on_wait callback that emits MCP progress while the worker starts,
-    keeping the client from timing out on the (slow) Spark cold start."""
+def _pinger(ctx: Context, label: str = "working"):
+    """Build an on_wait callback that emits MCP progress during a long op so the
+    client resets its request timeout (keepalive). Covers both the Spark cold
+    start and the operation itself (e.g. a query that lazily mounts a table)."""
     counter = {"n": 0}
 
     async def ping():
         counter["n"] += 1
         try:
-            await ctx.report_progress(
-                progress=counter["n"],
-                total=None,
-                message="starting local Spark session (first call warms the JVM)…",
-            )
+            await ctx.report_progress(progress=counter["n"], total=None, message=f"{label}…")
         except Exception:
             pass  # no progress token / client doesn't support it — ignore
 
@@ -339,14 +361,14 @@ def build_server(state: ServerState | None = None) -> FastMCP:
     @mcp.tool()
     async def run_code(code: str, ctx: Context) -> str:
         """Run a cell of Python/PySpark against the persistent session. State persists across calls; `spark`, `sc`, `F`, `T`, `Window` are pre-imported. Returns captured stdout and the last-expression echo, or the traceback if the cell raised."""
-        res = await state.call("run_code", code, on_wait=_pinger(ctx))
+        res = await state.call("run_code", code, on_wait=_pinger(ctx, "running cell"))
         return format_exec_result(res)
 
     @mcp.tool()
     async def run_sql(sql: str, ctx: Context, limit: int | None = None) -> str:
         """Run a Spark SQL statement and return rows as a text table. Reference Fabric tables by name (`lakehouse`.`table`) — they auto-mount on first use and stay available for the session. `limit` caps returned rows (default from config, ~100) and the result flags truncation."""
         try:
-            res = await state.call("run_sql", sql, limit, on_wait=_pinger(ctx))
+            res = await state.call("run_sql", sql, limit, on_wait=_pinger(ctx, "running query"))
         except WorkerError as exc:
             return f"SQL error: {exc}"
         return format_sql_result(res)
@@ -354,13 +376,13 @@ def build_server(state: ServerState | None = None) -> FastMCP:
     @mcp.tool()
     async def session_info(ctx: Context) -> str:
         """Show the live Spark session: version, master, current database, the catalog databases, and any Fabric lakehouses registered this session."""
-        info = await state.call("get_info", on_wait=_pinger(ctx))
+        info = await state.call("get_info", on_wait=_pinger(ctx, "starting session"))
         return format_info(info)
 
     @mcp.tool()
     async def reset_runtime(ctx: Context) -> str:
         """Reset the runtime: restart the Spark session and wipe all state — variables, imports, and mounted tables. Use to start from a clean slate."""
-        info = await state.restart(on_wait=_pinger(ctx))
+        info = await state.restart(on_wait=_pinger(ctx, "resetting runtime"))
         return "Runtime reset — fresh Spark session.\n\n" + format_info(info)
 
     def _local_only_note() -> str | None:
@@ -372,22 +394,22 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         return None
 
     @mcp.tool()
-    async def list_lakehouses() -> str:
+    async def list_lakehouses(ctx: Context) -> str:
         """List the Fabric lakehouses available in this session. Each is registered as a Spark database; its tables are mounted on demand."""
         if note := _local_only_note():
             return note
-        lhs = await state.list_lakehouses()
+        lhs = await state.list_lakehouses(on_wait=_pinger(ctx, "listing lakehouses"))
         if not lhs:
             return "No lakehouses found in the workspace (after exclusions)."
         return "Lakehouses (Spark databases):\n" + "\n".join(f"  {lh.name}" for lh in lhs)
 
     @mcp.tool()
-    async def list_tables(lakehouse: str) -> str:
+    async def list_tables(lakehouse: str, ctx: Context) -> str:
         """List the Delta tables in a Fabric lakehouse. Tables are not queryable via SQL until you mount them with mount_table or mount_lakehouse."""
         if note := _local_only_note():
             return note
         try:
-            tables = await state.list_tables(lakehouse)
+            tables = await state.list_tables(lakehouse, on_wait=_pinger(ctx, "listing tables"))
         except ConfigError as exc:
             return str(exc)
         if not tables:
@@ -400,7 +422,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         if note := _local_only_note():
             return note
         try:
-            res = await state.mount(lakehouse, [table], on_wait=_pinger(ctx))
+            res = await state.mount(lakehouse, [table], on_wait=_pinger(ctx, "mounting table"))
         except ConfigError as exc:
             return str(exc)
         return format_mount(res)
@@ -411,7 +433,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         if note := _local_only_note():
             return note
         try:
-            res = await state.mount(lakehouse, None, on_wait=_pinger(ctx))
+            res = await state.mount(lakehouse, None, on_wait=_pinger(ctx, "mounting lakehouse tables"))
         except ConfigError as exc:
             return str(exc)
         return format_mount(res)
