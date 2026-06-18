@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import traceback as _tb
 from dataclasses import asdict, dataclass, field
 
 from .spark_session import build_local_spark
@@ -24,6 +25,7 @@ class ExecResult:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None  # "ExceptionType: message" when the cell raised
+    traceback: str | None = None  # full formatted traceback when available
     execution_count: int | None = None
 
     def to_dict(self) -> dict:
@@ -116,9 +118,16 @@ class SparkEngine:
             result = self.shell.run_cell(code, store_history=True)
 
         error = None
+        tb = None
         exc = result.error_before_exec or result.error_in_exec
         if exc is not None:
             error = f"{type(exc).__name__}: {exc}"
+            # IPython's captured stderr is unreliable for tracebacks; format from
+            # the exception object directly so the agent always sees the detail.
+            if result.error_in_exec is not None:
+                tb = "".join(
+                    _tb.format_exception(type(exc), exc, exc.__traceback__)
+                )
 
         stdout = cap.stdout
         # Rich display outputs (e.g. displayhook) land in cap.outputs; fold their
@@ -133,6 +142,7 @@ class SparkEngine:
             stdout=_truncate(stdout),
             stderr=_truncate(cap.stderr),
             error=error,
+            traceback=_truncate(tb) if tb else None,
             execution_count=self.shell.execution_count,
         )
 

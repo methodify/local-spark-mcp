@@ -63,14 +63,26 @@ class Config:
 
     def validate(self) -> None:
         ws = self.workspace
-        if bool(ws.name) == bool(ws.id):
+        # name and id are mutually exclusive. A workspace is *optional* here —
+        # local-only operation needs none. The Fabric/discovery layer calls
+        # require_workspace() when it actually needs to connect.
+        if ws.name and ws.id:
             raise ConfigError(
-                "Exactly one of workspace.name or workspace.id must be set "
-                "(set via local-spark.toml or LOCAL_SPARK_WORKSPACE_NAME / "
-                "LOCAL_SPARK_WORKSPACE_ID)."
+                "Set only one of workspace.name or workspace.id, not both."
             )
         if self.runtime.default_sql_limit <= 0:
             raise ConfigError("runtime.default_sql_limit must be a positive integer.")
+
+    def require_workspace(self) -> WorkspaceConfig:
+        """Return the workspace, raising if none is configured (used by the
+        Fabric discovery layer)."""
+        if not (self.workspace.name or self.workspace.id):
+            raise ConfigError(
+                "A target Fabric workspace is required for this operation: set "
+                "workspace.name or workspace.id in local-spark.toml "
+                "(or LOCAL_SPARK_WORKSPACE_NAME / LOCAL_SPARK_WORKSPACE_ID)."
+            )
+        return self.workspace
 
 
 def find_config_file(start: Path | None = None) -> Path | None:

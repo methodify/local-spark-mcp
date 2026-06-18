@@ -61,7 +61,7 @@ def test_defaults_applied(tmp_path):
     assert cfg.runtime.default_sql_limit == 100
 
 
-def test_workspace_requires_exactly_one(tmp_path):
+def test_workspace_name_and_id_mutually_exclusive(tmp_path):
     both = write_config(
         tmp_path,
         """
@@ -73,9 +73,15 @@ def test_workspace_requires_exactly_one(tmp_path):
     with pytest.raises(ConfigError):
         load_config(both)
 
-    neither = write_config(tmp_path, "[workspace]\n")
+
+def test_workspace_optional_locally(tmp_path):
+    # No workspace is fine for local-only operation; loads without error.
+    neither = write_config(tmp_path, "[spark]\ndriver_memory = '4g'\n")
+    cfg = load_config(neither)
+    assert cfg.workspace.name is None and cfg.workspace.id is None
+    # ...but require_workspace() raises when the Fabric layer needs it.
     with pytest.raises(ConfigError):
-        load_config(neither)
+        cfg.require_workspace()
 
 
 def test_env_override_workspace(tmp_path, monkeypatch):
