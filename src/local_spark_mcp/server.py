@@ -42,6 +42,7 @@ def _base_engine_kwargs(config: Config) -> dict:
     return {
         "driver_memory": config.spark.driver_memory,
         "extra_configs": config.spark.extra_configs,
+        "env": config.spark.env,
         "java_home": config.runtime.java_home,
         "default_sql_limit": config.runtime.default_sql_limit,
     }

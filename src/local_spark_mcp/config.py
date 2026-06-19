@@ -43,6 +43,11 @@ class SparkConfig:
 
     driver_memory: str = "8g"
     extra_configs: dict[str, str] = field(default_factory=dict)
+    # Environment variables applied to BOTH the driver process and Spark Python
+    # workers (via spark.executorEnv.*). Use for native-lib data dirs
+    # (JAGEOCODER_DB2_DIR, LIBPOSTAL_DATA_DIR, …) and PYTHONPATH so distributed
+    # (mapPartitions/UDF) code can import + init the same libs as the driver.
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -139,6 +144,12 @@ def _parse_file(path: Path) -> Config:
     ):
         raise ConfigError("spark.extra_configs must be a table of string->string.")
 
+    spark_env = spark.get("env", {})
+    if not isinstance(spark_env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in spark_env.items()
+    ):
+        raise ConfigError("spark.env must be a table of string->string.")
+
     warm_on_start = runtime.get("warm_on_start", False)
     if not isinstance(warm_on_start, bool):
         raise ConfigError("runtime.warm_on_start must be a boolean (true/false).")
@@ -152,6 +163,7 @@ def _parse_file(path: Path) -> Config:
         spark=SparkConfig(
             driver_memory=_require_str(spark, "driver_memory", "spark") or "8g",
             extra_configs=dict(extra),
+            env=dict(spark_env),
         ),
         runtime=RuntimeConfig(
             default_sql_limit=int(runtime.get("default_sql_limit", 100)),

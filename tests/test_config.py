@@ -110,6 +110,39 @@ def test_env_override_scalars(tmp_path, monkeypatch):
     assert cfg.lakehouses.exclude == ["A", "B", "C"]
 
 
+def test_spark_env_table(tmp_path):
+    cfg = load_config(
+        write_config(
+            tmp_path,
+            """
+            [workspace]
+            id = "x"
+            [spark.env]
+            JAGEOCODER_DB2_DIR = "/data/jageo"
+            PYTHONPATH = "/lakehouse/lib"
+            """,
+        )
+    )
+    assert cfg.spark.env == {
+        "JAGEOCODER_DB2_DIR": "/data/jageo",
+        "PYTHONPATH": "/lakehouse/lib",
+    }
+
+
+def test_spark_env_defaults_empty(tmp_path):
+    cfg = load_config(write_config(tmp_path, '[workspace]\nid = "x"\n'))
+    assert cfg.spark.env == {}
+
+
+def test_spark_env_must_be_table_of_strings(tmp_path):
+    bad_scalar = write_config(tmp_path, '[workspace]\nid = "x"\n[spark]\nenv = "nope"\n')
+    with pytest.raises(ConfigError):
+        load_config(bad_scalar)
+    bad_value = write_config(tmp_path, '[workspace]\nid = "x"\n[spark.env]\nFOO = 3\n')
+    with pytest.raises(ConfigError):
+        load_config(bad_value)
+
+
 def test_warm_on_start_defaults_false(tmp_path):
     cfg = load_config(write_config(tmp_path, '[workspace]\nid = "x"\n'))
     assert cfg.runtime.warm_on_start is False

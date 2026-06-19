@@ -44,6 +44,16 @@ works out of the box (no sbt needed). First run downloads PySpark/Delta jars and
 is slow; subsequent runs reuse the cached environment. Use `--refresh` to pick up
 a new commit: `uvx --refresh --from git+https://github.com/methodify/local-spark-mcp local-spark-mcp`.
 
+### Native / 3rd-party Python libs in distributed code
+
+Spark Python workers run the **same interpreter** as the driver, so a library
+installed into the server's environment is importable in both `run_code` and in
+distributed code (`mapPartitions` / UDFs). Install such libs into that env — e.g.
+`uvx --with jageocoder --with postal --from git+…/local-spark-mcp local-spark-mcp`
+— and set any data-dir env vars (and/or `PYTHONPATH`) under `[spark.env]` in
+`local-spark.toml`; those are applied to both the driver and the workers. (A
+runtime `sys.path.append` only affects the driver — workers won't see it.)
+
 ## Configuration
 
 Configuration lives in a `local-spark.toml` file in the working directory (see

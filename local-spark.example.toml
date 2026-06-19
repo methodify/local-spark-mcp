@@ -18,6 +18,20 @@ exclude = []
 
 [spark]
 driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
+
+# Environment variables applied to BOTH the driver and the Spark Python workers.
+# Use this so distributed code (mapPartitions / UDFs) can import + init the same
+# native/3rd-party libs as the driver. The lib itself must be importable by the
+# session's interpreter — install it into the env the server runs in (e.g.
+# `uvx --with jageocoder --with postal --from git+…/local-spark-mcp local-spark-mcp`,
+# or `uv pip install …` into the venv); then set its data dirs here. For a lib
+# living at a path, add that path to PYTHONPATH below (works for workers; for the
+# driver, prefer installing into the env).
+[spark.env]
+# JAGEOCODER_DB2_DIR = "/lakehouse/default/Files/lib/jageocoder"
+# LIBPOSTAL_DATA_DIR = "/lakehouse/default/Files/lib/libpostal_senzing"
+# PYTHONPATH = "/lakehouse/default/Files/lib"
+
 # Arbitrary extra Spark configs (string -> string).
 [spark.extra_configs]
 # "spark.sql.shuffle.partitions" = "8"
