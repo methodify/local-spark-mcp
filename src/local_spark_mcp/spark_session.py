@@ -22,6 +22,7 @@ def build_spark(
     java_home: str | None = None,
     log_level: str = "WARN",
     onelake: dict | None = None,
+    env: dict[str, str] | None = None,
 ):
     """Create a Delta-enabled SparkSession.
 
@@ -42,10 +43,19 @@ def build_spark(
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
+    # User env vars: apply to this (driver) process — so run_code imports/inits
+    # see them, and the JVM inherits them — and to Spark Python workers via
+    # spark.executorEnv.*, so distributed code can import + init the same libs.
+    user_env = dict(env or {})
+    for key, value in user_env.items():
+        os.environ[key] = value
+
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
 
     configs = dict(extra_configs or {})
+    for key, value in user_env.items():
+        configs.setdefault(f"spark.executorEnv.{key}", value)
     extra_packages: list[str] = []
     if onelake:
         from .fabric import HADOOP_AZURE_PACKAGE, onelake_spark_configs

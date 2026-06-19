@@ -65,6 +65,49 @@ def test_sql_error_surfaces_as_worker_error(worker):
     assert "AnalysisException" in str(exc.value) or "TABLE_OR_VIEW" in str(exc.value)
 
 
+def test_spark_env_reaches_driver_and_workers(tmp_path):
+    """[spark.env] vars reach the driver process AND Spark Python workers; a
+    PYTHONPATH entry lets workers import a path-based lib (the native-lib gap)."""
+    libdir = tmp_path / "lib"
+    libdir.mkdir()
+    (libdir / "lsm_fake.py").write_text("MARK = 'lsm-fake-ok'\n")
+
+    w = WorkerProcess(
+        engine_kwargs={
+            "driver_memory": "2g",
+            "env": {"LSM_TEST_VAR": "hello-env", "PYTHONPATH": str(libdir)},
+        }
+    )
+    w.start()
+    try:
+        # Driver process sees the env vars (set before the JVM launched).
+        r = w.run_code("import os; print('D', os.environ.get('LSM_TEST_VAR'), str(os.environ.get('PYTHONPATH','')).find('lib') >= 0)")
+        assert r["ok"], r
+        assert "D hello-env True" in r["stdout"]
+
+        # Workers see the env var AND can import the path lib via executorEnv PYTHONPATH.
+        r2 = w.run_code(
+            """
+def probe(rows):
+    import os
+    try:
+        import lsm_fake
+        m = lsm_fake.MARK
+    except Exception as e:
+        m = f"FAIL {type(e).__name__}"
+    for _ in rows:
+        yield (os.environ.get("LSM_TEST_VAR"), m)
+        break
+out = spark.range(2).repartition(1).rdd.mapPartitions(probe).collect()
+print("W", out[0][0], out[0][1])
+"""
+        )
+        assert r2["ok"], r2
+        assert "W hello-env lsm-fake-ok" in r2["stdout"]
+    finally:
+        w.stop()
+
+
 def test_restart_clears_state():
     w = WorkerProcess(engine_kwargs={"driver_memory": "2g"})
     w.start()

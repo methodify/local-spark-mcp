@@ -78,6 +78,7 @@ class SparkEngine:
         app_name: str = "local-spark-mcp",
         onelake: dict | None = None,
         lakehouses: list[dict] | None = None,
+        env: dict[str, str] | None = None,
     ):
         self.default_sql_limit = default_sql_limit
         self.spark = build_spark(
@@ -86,6 +87,7 @@ class SparkEngine:
             java_home=java_home,
             app_name=app_name,
             onelake=onelake,
+            env=env,
         )
         self.shell = self._make_shell()
         self._bootstrap_namespace()

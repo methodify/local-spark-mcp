@@ -69,6 +69,13 @@ server's **stderr**; stdout is reserved for the MCP transport.
 
 - `config.py` — `local-spark.toml` schema + loader (file discovery, `LOCAL_SPARK_*`
   env overrides, validation). Workspace is optional until the Fabric layer needs it.
+  `[spark.env]` sets env vars on BOTH the driver process and Spark Python workers
+  (`spark.executorEnv.*`) — for native-lib data dirs / PYTHONPATH so distributed
+  (mapPartitions/UDF) code can import + init the same libs as the driver. Worker/
+  driver interpreter parity already holds (`PYSPARK_PYTHON=sys.executable`), so a
+  lib pip-installed into the server's env is importable on both; `[spark.env]`
+  covers the data dirs / path. A driver-only runtime `sys.path` change does NOT
+  reach workers — install into the env or use PYTHONPATH instead.
 - `java.py` — resolve a Spark-compatible `JAVA_HOME` (prefers vfox Java 17).
 - `spark_session.py` — local Delta session builder; pins `JAVA_HOME`, drops
   ambient `SPARK_HOME`, forces `PYSPARK_PYTHON=sys.executable` (hermetic to venv).
