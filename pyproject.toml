@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"  # pyspark 3.5.0 is validated on 3.12; avoid 3.13
 authors = [{ name = "Bryon" }]
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2.0,<2.0.0",
     "pyspark==3.5.0",
     "delta-spark==3.2.0",
     "ipython>=8.18",
