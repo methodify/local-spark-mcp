@@ -7,15 +7,43 @@ spawn a fresh one for a guaranteed-clean slate.
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 from .protocol import recv_msg, send_msg
 
 # Spark startup (JVM + Delta jar resolution) is slow on a cold worker.
 DEFAULT_STARTUP_TIMEOUT = 180.0
 DEFAULT_CALL_TIMEOUT = 600.0
+
+
+def _worker_spawn() -> tuple[str, dict]:
+    """Interpreter + env for the worker, robust to trampoline interpreters.
+
+    Under uvx on Windows the console-script launcher re-execs the BASE
+    uv-managed interpreter, so ``sys.executable`` in the server process cannot
+    import this package — the worker then dies on ModuleNotFoundError before
+    ever connecting back. Prefer the environment's own interpreter when one
+    exists next to ``sys.prefix``, and pin the package root onto PYTHONPATH so
+    any interpreter we do spawn can import us.
+    """
+    exe = sys.executable
+    candidate = (
+        Path(sys.prefix)
+        / ("Scripts" if os.name == "nt" else "bin")
+        / ("python.exe" if os.name == "nt" else "python")
+    )
+    if candidate.exists():
+        exe = str(candidate)
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = pkg_root if not existing else pkg_root + os.pathsep + existing
+    return exe, env
 
 
 class WorkerError(Exception):
@@ -68,19 +96,32 @@ class WorkerProcess:
         try:
             # Worker stdout/stderr go to OUR stderr — never the parent's stdout,
             # which the MCP stdio transport owns.
+            exe, env = _worker_spawn()
             self._proc = subprocess.Popen(
-                [sys.executable, "-m", "local_spark_mcp.worker", "--port", str(port)],
+                [exe, "-m", "local_spark_mcp.worker", "--port", str(port)],
                 stdout=sys.stderr.fileno(),
                 stderr=sys.stderr.fileno(),
+                env=env,
             )
-            listener.settimeout(self.startup_timeout)
-            try:
-                self._conn, _ = listener.accept()
-            except socket.timeout as exc:
-                self._kill_proc()
-                raise WorkerError(
-                    f"worker did not connect within {self.startup_timeout}s"
-                ) from exc
+            # Accept in short slices so a worker that dies at startup surfaces
+            # as its exit code immediately, not as a silent full-length timeout.
+            deadline = time.monotonic() + self.startup_timeout
+            listener.settimeout(1.0)
+            while True:
+                try:
+                    self._conn, _ = listener.accept()
+                    break
+                except socket.timeout:
+                    if self._proc.poll() is not None:
+                        raise WorkerError(
+                            f"worker exited with code {self._proc.returncode} before"
+                            " connecting — its traceback is on the server's stderr"
+                        )
+                    if time.monotonic() >= deadline:
+                        self._kill_proc()
+                        raise WorkerError(
+                            f"worker did not connect within {self.startup_timeout}s"
+                        )
         finally:
             listener.close()
 
