@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import time
+from pathlib import Path
 from collections import namedtuple
 
 import pytest
@@ -56,7 +57,7 @@ def test_onelake_provider_loads_and_fetches_through_hadoop():
         spark = engine.spark
         # the provider jar is registered on the session
         jars = spark._jsc.sc().listJars().mkString("\n")
-        assert "httptokenprovider" in jars.lower()
+        assert Path(default_jar_path()).name.lower() in jars.lower()
 
         # Resolve + instantiate the provider exactly as Hadoop ABFS would.
         jvm = spark._jvm

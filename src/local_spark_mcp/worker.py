@@ -38,6 +38,10 @@ def _handle(engine, method: str, params: dict):
         return engine.mount_table(params["lakehouse"], params["table"]), engine
     if method == "mount_tables":
         return engine.mount_tables(params["lakehouse"], params["tables"]), engine
+    if method == "shadow_status":
+        return engine.shadow_status(), engine
+    if method == "discard_shadow":
+        return engine.discard_shadow(), engine
     if method == "info":
         return engine.info(), engine
     raise ValueError(f"unknown method: {method!r}")

@@ -143,6 +143,52 @@ def test_spark_env_must_be_table_of_strings(tmp_path):
         load_config(bad_value)
 
 
+def test_write_policy_defaults(tmp_path):
+    cfg = load_config(write_config(tmp_path, '[workspace]\nid = "x"\n'))
+    assert cfg.runtime.write_mode == "sandbox"
+    assert cfg.runtime.persist_shadow is False
+    assert cfg.runtime.state_root == "~/.local-spark"
+    assert cfg.lakehouses.default is None
+
+
+def test_write_policy_from_file_and_env(tmp_path, monkeypatch):
+    path = write_config(
+        tmp_path,
+        """
+        [workspace]
+        id = "x"
+        [lakehouses]
+        default = "dataverse"
+        [runtime]
+        write_mode = "ReadOnly"
+        persist_shadow = true
+        state_root = "/tmp/lsm-state"
+        """,
+    )
+    cfg = load_config(path)
+    assert cfg.lakehouses.default == "dataverse"
+    assert cfg.runtime.write_mode == "readonly"  # normalized
+    assert cfg.runtime.persist_shadow is True
+    assert cfg.runtime.state_root == "/tmp/lsm-state"
+    monkeypatch.setenv("LOCAL_SPARK_WRITE_MODE", "writethrough")
+    monkeypatch.setenv("LOCAL_SPARK_DEFAULT_LAKEHOUSE", "silver")
+    monkeypatch.setenv("LOCAL_SPARK_PERSIST_SHADOW", "0")
+    cfg = load_config(path)
+    assert cfg.runtime.write_mode == "writethrough"
+    assert cfg.lakehouses.default == "silver"
+    assert cfg.runtime.persist_shadow is False
+
+
+def test_write_mode_rejects_unknown(tmp_path, monkeypatch):
+    path = write_config(tmp_path, '[workspace]\nid = "x"\n[runtime]\nwrite_mode = "yolo"\n')
+    with pytest.raises(ConfigError, match="write_mode"):
+        load_config(path)
+    good = write_config(tmp_path, '[workspace]\nid = "x"\n')
+    monkeypatch.setenv("LOCAL_SPARK_WRITE_MODE", "nope")
+    with pytest.raises(ConfigError, match="write_mode"):
+        load_config(good)
+
+
 def test_warm_on_start_defaults_false(tmp_path):
     cfg = load_config(write_config(tmp_path, '[workspace]\nid = "x"\n'))
     assert cfg.runtime.warm_on_start is False

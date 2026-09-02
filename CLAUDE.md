@@ -27,6 +27,14 @@ databases and their tables mount lazily. **Validated live end to end** against a
 real workspace: discovery (8 lakehouses, 63 tables), mount, and an `abfss://`
 Delta read/query (1.4M rows) through the full stack.
 
+**REQUEST-001 (notebook parity, from `~/src/claude-fabric`) in progress.** Asks
+1–3 shipped and validated live on Linux and Windows: `OneLakeCatalog` (tables
+resolve by name on first touch, no mount step), default lakehouse, and the
+write policy (sandbox / readonly / writethrough, shadows via Delta shallow
+clone). Asks 4 (notebook runner + `notebookutils` shim) and 6 (Files mirror)
+pending; ask 5 (PyPI) deferred by the user, LICENSE/NOTICE done. Version stays
+0.1.x until everything lands, then 0.2.0.
+
 ⚠️ **Address OneLake by GUID, not name.** `abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}`
 works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
 400. `FabricAPIClient` / `LakehouseInfo` build GUID paths.
@@ -38,10 +46,11 @@ works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
 uv venv --python 3.12
 uv pip install -e ".[dev]"
 
-# Build the OneLake token-provider jar AND bundle it into the package
-# (needs Java 17 + sbt). The bundled jar (src/local_spark_mcp/jars/*.jar) ships in
-# the wheel so `uvx`/pip installs from GitHub work without sbt — re-run and commit
-# this whenever HttpTokenProvider.scala changes.
+# Build the Scala jar (ch.fs.HttpTokenProvider + ch.fs.OneLakeCatalog) AND bundle
+# it into the package (needs Java 17 + sbt). The bundled jar
+# (src/local_spark_mcp/jars/localsparkjars_*.jar) ships in the wheel so `uvx`/pip
+# installs from GitHub work without sbt — re-run and commit this whenever
+# anything under token-provider/src changes.
 JAVA_HOME=<jdk17> scripts/build_jar.sh
 
 # Fast tests (config + formatters + token server; no Spark)
@@ -51,6 +60,8 @@ JAVA_HOME=<jdk17> scripts/build_jar.sh
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest -m '' tests/test_worker_integration.py tests/test_server_e2e.py tests/test_fabric_session_integration.py -v
 # JVM token-provider tests (needs built jar + Java):
 LOCAL_SPARK_RUN_JVM=1 .venv/bin/python -m pytest tests/test_token_provider_jvm.py -v
+# Live catalog + write-policy test against a real workspace (az login; writes only to a sandbox shadow):
+LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py -v
 # Single test: append `::test_name`
 
 # Manual engine smoke (no MCP, no Fabric)
@@ -84,12 +95,30 @@ server's **stderr**; stdout is reserved for the MCP transport.
   "HADOOP_HOME and hadoop.home.dir are unset"). Order: `runtime.hadoop_home`
   → ambient `HADOOP_HOME` → the winutils bundled in the wheel
   (`winutils/`, see its PROVENANCE.md). No-op on POSIX.
-- `spark_session.py` — local Delta session builder; pins `JAVA_HOME`, drops
-  ambient `SPARK_HOME`, points `PYSPARK_PYTHON` at `preferred_python()`
-  (hermetic to the env, correct under uv/uvx trampolines).
+- `spark_session.py` — Delta session builder; pins `JAVA_HOME`, drops ambient
+  `SPARK_HOME`, points `PYSPARK_PYTHON` at `preferred_python()` (hermetic to the
+  env, correct under uv/uvx trampolines). In Fabric mode swaps the session
+  catalog to `ch.fs.OneLakeCatalog` and passes it `spark.localspark.*` confs
+  (workspace id, one `lakehouse.<name>=<guid>` per lakehouse, write mode, shadow
+  root). Always sets `spark.sql.warehouse.dir` to the per-session dir so managed
+  tables never land in the project cwd.
+- `token-provider/src/main/scala/OneLakeCatalog.scala` — the session catalog:
+  `DeltaCatalog` + on-demand resolution of `<lakehouse>.<table>` (checks OneLake
+  for `Tables/<table>/_delta_log`, materializes into the session catalog on first
+  touch) + the write policy in `createTable` **and the six `stage*` overloads**
+  (Delta is a `StagingTableCatalog`, so CTAS/`saveAsTable` bypass `createTable`).
+  A `ThreadLocal` reentrancy guard keeps the nested `CREATE TABLE` from
+  re-entering the resolver. Only OneLake existence checks are cached.
 - `engine.py` — `SparkEngine`: IPython `InteractiveShell` + injected `spark`/`sc`/
   `F`/`T`/`Window`. `run_code` (captured stdout + traceback), `run_sql`
-  (rows + truncation), `info`.
+  (rows + truncation), `info`. Owns per-session state under
+  `<state_root>/sessions/<pid>-<ts>/` (warehouse + session-scoped shadow;
+  deleted on stop, stale ones purged after 7 days) or a persistent shadow under
+  `<state_root>/lakehouses/<workspace-id>/shadow`. `USE`s the default lakehouse.
+  Installs the `DeltaTable.forName` bridge (`forName` resolves via the V1
+  catalog, which bypasses V2 plugins; the bridge resolves through `spark.table`
+  first, and refuses in readonly). `mount_table` forces catalog materialization;
+  `mount_tables` runs them in a thread pool. `shadow_status` / `discard_shadow`.
 - `protocol.py` / `worker.py` / `worker_client.py` — length-prefixed JSON over a
   dedicated localhost socket; worker process holds the engine; `WorkerProcess`
   spawns/handshakes/proxies and `restart()` = reset.
@@ -100,10 +129,11 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
 - `discovery.py` — `FabricAPIClient` (REST: resolve workspace, list lakehouses /
   tables, paging) + `LakehouseInfo` (GUID abfss path builder). Runs in the server.
-- `token-provider/` — sbt project for `ch.fs.HttpTokenProvider`. Its built jar is
-  bundled into `src/local_spark_mcp/jars/` (committed, shipped in the wheel) so
-  `uvx`/pip installs work without sbt. `default_jar_path()` prefers a fresh
-  in-repo build, else the bundled jar. Rebuild + re-bundle via
+- `token-provider/` — sbt project (`LocalSparkJars`) for `ch.fs.HttpTokenProvider`
+  and `ch.fs.OneLakeCatalog`; spark-sql and delta-spark are `provided`. Its built
+  jar is bundled into `src/local_spark_mcp/jars/` (committed, shipped in the
+  wheel) so `uvx`/pip installs work without sbt. `default_jar_path()` prefers a
+  fresh in-repo build, else the bundled jar. Rebuild + re-bundle via
   `scripts/build_jar.sh`.
 
 ## Intended tool surface (from the design brief)
@@ -117,6 +147,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   or all-tables-in-a-lakehouse on demand.
 - **State management**: inspect session/catalog state; reset the runtime
   (= respawn the worker for a clean slate).
+- **Write policy**: `shadow_status` (write mode + which lakehouse tables are
+  shadowed locally) and `discard_shadow` (drop the shadows; next touch re-clones).
 
 ## Locked design decisions
 
@@ -146,13 +178,25 @@ sections below; this is the summary of record.
 7. **Lakehouse selection — all by default, optional exclude-list.** Every
    lakehouse in the workspace is registered; excludes trim noise. Cheap because
    hydration is lazy (see #8).
-8. **Table hydration — lazy, with auto-mount.** At startup, register selected
-   lakehouses as Spark databases only. Tables mount on demand
-   (`CREATE TABLE ... USING DELTA LOCATION`), keeping startup fast. `run_sql`
-   **auto-mounts** a referenced `<lakehouse>`.`<table>` on first use (catch
-   not-found → mount if it's a known lakehouse → retry), so the agent just
-   queries by name like the Fabric runtime; `mount_table`/`mount_lakehouse`
-   remain for explicit/bulk mounting. Worker startup is **lazy by default**
+8. **Table hydration — resolved on first touch by `OneLakeCatalog`, with a
+   write policy.** At startup, register selected lakehouses as Spark databases
+   only, and `USE` the default lakehouse (`[lakehouses] default`) if set. Tables
+   are NOT pre-mounted: the session catalog is `ch.fs.OneLakeCatalog` (extends
+   Delta's `DeltaCatalog`), which on a catalog miss for `<lakehouse>.<table>`
+   checks OneLake for `Tables/<table>/_delta_log` and materializes the table — so
+   `spark.table`, `spark.read.table`, `spark.sql`, `saveAsTable`, `INSERT`, SQL
+   `MERGE`, and (through a small `DeltaTable.forName` bridge, because `forName`
+   uses the V1 catalog) `dwlib`'s MERGE all work by name with no mount step,
+   exactly like the Fabric runtime; a table that doesn't exist still raises the
+   original not-found. Materialization honors `runtime.write_mode`: **sandbox**
+   (default) creates a Delta SHALLOW CLONE under the shadow root — metadata
+   only, reads stay live from OneLake, writes land locally, OneLake is never
+   modified; **readonly** is sandbox plus refusal of `createTable` and
+   `forName`; **writethrough** points at OneLake. New tables under a lakehouse
+   follow the same policy. Shadows are keyed by lakehouse id and session-scoped
+   by default (`persist_shadow` opts in). `mount_table`/`mount_lakehouse` force
+   materialization (in parallel for bulk); `run_sql`'s catch-and-mount fallback
+   stays as a no-op safety net. Worker startup is **lazy by default**
    (first tool call that needs it), single-flight, and the cold start is covered
    by MCP progress heartbeats emitted throughout every long op — so no client
    timeout, just first-call lag on whichever agent uses it. Lazy keeps a swarm of

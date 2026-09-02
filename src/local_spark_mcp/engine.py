@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import os
 import re
+import shutil
+import time
 import traceback as _tb
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from .spark_session import build_spark
 
@@ -80,8 +85,38 @@ class SparkEngine:
         lakehouses: list[dict] | None = None,
         env: dict[str, str] | None = None,
         hadoop_home: str | None = None,
+        default_lakehouse: str | None = None,
+        write_mode: str = "sandbox",
+        persist_shadow: bool = False,
+        state_root: str | None = None,
     ):
         self.default_sql_limit = default_sql_limit
+        self.write_mode = write_mode
+        self.persist_shadow = persist_shadow
+        self.default_lakehouse: str | None = None  # resolved in _register_lakehouses
+        lakehouses = lakehouses or []
+        workspace_id = lakehouses[0]["workspace_id"] if lakehouses else None
+
+        # Per-session state: the managed-table warehouse (so nothing lands in the
+        # project cwd) and, unless persisted, the write-policy shadow.
+        self._state_root = Path(state_root or "~/.local-spark").expanduser()
+        self._session_dir = self._state_root / "sessions" / f"{os.getpid()}-{int(time.time())}"
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+        _purge_stale_sessions(self._state_root / "sessions")
+        if persist_shadow and workspace_id:
+            self.shadow_root = self._state_root / "lakehouses" / workspace_id / "shadow"
+        else:
+            self.shadow_root = self._session_dir / "shadow"
+        self.shadow_root.mkdir(parents=True, exist_ok=True)
+
+        catalog = None
+        if onelake and lakehouses:
+            catalog = {
+                "workspace_id": workspace_id,
+                "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
+                "write_mode": write_mode,
+                "shadow_root": self.shadow_root.as_posix(),
+            }
         self.spark = build_spark(
             driver_memory=driver_memory,
             extra_configs=extra_configs,
@@ -90,10 +125,12 @@ class SparkEngine:
             onelake=onelake,
             env=env,
             hadoop_home=hadoop_home,
+            catalog=catalog,
+            warehouse_dir=(self._session_dir / "warehouse").as_posix(),
         )
         self.shell = self._make_shell()
+        self._register_lakehouses(lakehouses, default_lakehouse)
         self._bootstrap_namespace()
-        self._register_lakehouses(lakehouses or [])
 
     def _make_shell(self):
         from IPython.core.interactiveshell import InteractiveShell
@@ -118,15 +155,60 @@ class SparkEngine:
                 "Window": Window,
             }
         )
+        self._install_delta_forname_bridge()
+
+    def _install_delta_forname_bridge(self) -> None:
+        """Bridge ``DeltaTable.forName`` to OneLakeCatalog.
+
+        ``forName`` resolves through Spark's V1 session catalog, which bypasses V2
+        catalog plugins — so an unregistered lakehouse table would fail there even
+        though ``spark.table`` resolves it. Resolve via ``spark.table`` first
+        (materializing on first touch), then call the original. ``forName`` is also
+        the write gateway ``dwlib`` uses for MERGE, so readonly refuses here.
+        Installed before any user import, so a library that patches
+        ``DataFrameReader.table`` (as dwlib does) still chains through this.
+        """
+        try:
+            from delta.tables import DeltaTable
+        except ImportError:  # delta python API not installed — nothing to bridge
+            return
+        engine = self
+        original = DeltaTable.forName
+
+        def forName(cls, sparkSession, tableOrViewName):
+            engine._refuse_if_readonly(tableOrViewName)
+            sparkSession.table(tableOrViewName)
+            return original(sparkSession, tableOrViewName)
+
+        DeltaTable.forName = classmethod(forName)
+
+    def _refuse_if_readonly(self, table_name: str) -> None:
+        if self.write_mode != "readonly" or not getattr(self, "lakehouses", None):
+            return
+        parts = [part.strip("`") for part in table_name.split(".")]
+        if len(parts) == 2:
+            lakehouse = parts[0]
+        elif len(parts) == 1:
+            lakehouse = self.default_lakehouse
+        else:
+            return
+        if lakehouse and self._resolve_lakehouse(lakehouse) is not None:
+            raise PermissionError(
+                f"write_mode is 'readonly': DeltaTable.forName({table_name!r}) is a "
+                "write gateway (MERGE/UPDATE/DELETE). Set LOCAL_SPARK_WRITE_MODE (or "
+                "[runtime] write_mode in local-spark.toml) to 'sandbox' to write "
+                "locally, or 'writethrough' to write to OneLake."
+            )
 
     @staticmethod
     def _q(identifier: str) -> str:
         """Backtick-quote a Spark SQL identifier."""
         return "`" + identifier.replace("`", "``") + "`"
 
-    def _register_lakehouses(self, lakehouses: list[dict]) -> None:
-        """Register each (non-excluded) lakehouse as a Spark database. Tables are
-        NOT mounted here — that's lazy, via mount_table/mount_tables."""
+    def _register_lakehouses(self, lakehouses: list[dict], default_lakehouse: str | None = None) -> None:
+        """Register each (non-excluded) lakehouse as a Spark database and select
+        the default. Tables are NOT mounted here: OneLakeCatalog resolves them on
+        first touch (and mount_table/mount_tables force it explicitly)."""
         from .discovery import LakehouseInfo
 
         self.lakehouses: dict[str, LakehouseInfo] = {}
@@ -135,6 +217,16 @@ class SparkEngine:
             info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
             self.lakehouses[info.name] = info
             self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(info.name)}")
+        if default_lakehouse and self.lakehouses:
+            info = self._resolve_lakehouse(default_lakehouse)
+            if info is None:
+                raise ValueError(
+                    f"default lakehouse {default_lakehouse!r} is not in the workspace "
+                    f"(or is excluded); known: {sorted(self.lakehouses)}"
+                )
+            # Unqualified names now resolve here, like a Fabric notebook's default lakehouse.
+            self.spark.sql(f"USE {self._q(info.name)}")
+            self.default_lakehouse = info.name
 
     def _resolve_lakehouse(self, name: str):
         """Look up a lakehouse by name (case-insensitively, since Spark
@@ -149,29 +241,45 @@ class SparkEngine:
         return None
 
     def mount_table(self, lakehouse: str, table: str) -> dict:
-        """Register a single OneLake Delta table as <lakehouse>.<table>."""
+        """Force OneLakeCatalog to materialize <lakehouse>.<table> now.
+
+        Resolution goes through the catalog so the write policy applies: a
+        shallow clone under the shadow root in sandbox/readonly, an external
+        OneLake table in writethrough. Raises AnalysisException if the table
+        does not exist in OneLake.
+        """
         info = self._resolve_lakehouse(lakehouse)
         if info is None:
             raise ValueError(
                 f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}"
             )
-        path = info.table_path(table)
-        self.spark.sql(
-            f"CREATE TABLE IF NOT EXISTS {self._q(info.name)}.{self._q(table)} "
-            f"USING DELTA LOCATION '{path}'"
-        )
+        self.spark.table(f"{self._q(info.name)}.{self._q(table)}")
         self._mounted.setdefault(info.name, set()).add(table)
-        return {"lakehouse": info.name, "table": table, "path": path}
+        return {
+            "lakehouse": info.name,
+            "table": table,
+            "path": info.table_path(table),
+            "write_mode": self.write_mode,
+        }
 
-    def mount_tables(self, lakehouse: str, tables: list[str]) -> dict:
-        """Register several tables; per-table errors are captured, not fatal."""
-        mounted, failed = [], []
-        for table in tables:
+    def mount_tables(self, lakehouse: str, tables: list[str], workers: int = 8) -> dict:
+        """Materialize several tables in parallel; each is an independent Delta
+        log read from OneLake. Per-table errors are captured, not fatal."""
+
+        def one(table: str):
             try:
                 self.mount_table(lakehouse, table)
-                mounted.append(table)
+                return table, None
             except Exception as exc:  # keep going; report per-table
-                failed.append({"table": table, "error": f"{type(exc).__name__}: {exc}"})
+                return table, f"{type(exc).__name__}: {exc}"
+
+        mounted, failed = [], []
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
+            for table, error in pool.map(one, tables):
+                if error is None:
+                    mounted.append(table)
+                else:
+                    failed.append({"table": table, "error": error})
         return {"lakehouse": lakehouse, "mounted": mounted, "failed": failed}
 
     def run_code(self, code: str) -> ExecResult:
@@ -276,14 +384,75 @@ class SparkEngine:
             "current_database": catalog.currentDatabase(),
             "databases": databases,
             "lakehouses": sorted(getattr(self, "lakehouses", {})),
+            "default_lakehouse": self.default_lakehouse,
+            "write_mode": self.write_mode,
+            "shadow_root": self.shadow_root.as_posix(),
+            "shadows": [f"{t['lakehouse']}.{t['table']}" for t in self._shadow_tables()],
             "execution_count": self.shell.execution_count,
             "default_sql_limit": self.default_sql_limit,
         }
+
+    # ---- write-policy shadow ----
+
+    def _shadow_tables(self) -> list[dict]:
+        """Shadowed tables on disk: <shadow_root>/<lakehouse-id>/<table>/_delta_log."""
+        id_to_name = {info.id: name for name, info in getattr(self, "lakehouses", {}).items()}
+        found: list[dict] = []
+        if not self.shadow_root.is_dir():
+            return found
+        for lh_dir in sorted(self.shadow_root.iterdir()):
+            if not lh_dir.is_dir():
+                continue
+            for table_dir in sorted(lh_dir.iterdir()):
+                if (table_dir / "_delta_log").is_dir():
+                    found.append({
+                        "lakehouse": id_to_name.get(lh_dir.name, lh_dir.name),
+                        "table": table_dir.name,
+                        "path": table_dir.as_posix(),
+                    })
+        return found
+
+    def shadow_status(self) -> dict:
+        return {
+            "write_mode": self.write_mode,
+            "shadow_root": self.shadow_root.as_posix(),
+            "persistent": self.persist_shadow,
+            "tables": self._shadow_tables(),
+        }
+
+    def discard_shadow(self) -> dict:
+        """Drop every shadowed table from the catalog and delete the shadow files,
+        so the next touch re-clones from OneLake. OneLake is not affected."""
+        tables = self._shadow_tables()
+        for t in tables:
+            try:
+                self.spark.sql(f"DROP TABLE IF EXISTS {self._q(t['lakehouse'])}.{self._q(t['table'])}")
+            except Exception:  # external table; best effort — files go next
+                pass
+        shutil.rmtree(self.shadow_root, ignore_errors=True)
+        self.shadow_root.mkdir(parents=True, exist_ok=True)
+        self._mounted = {}
+        return {"discarded": len(tables), "tables": tables}
 
     def stop(self):
         try:
             self.spark.stop()
         except Exception:  # pragma: no cover - best effort on shutdown
+            pass
+        # Session-scoped state (warehouse + non-persistent shadow) goes with the session.
+        shutil.rmtree(self._session_dir, ignore_errors=True)
+
+
+def _purge_stale_sessions(sessions_dir: Path, max_age_days: int = 7) -> None:
+    """Best-effort cleanup of session dirs a crashed worker never removed."""
+    if not sessions_dir.is_dir():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    for entry in sessions_dir.iterdir():
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
             pass
 
 

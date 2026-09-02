@@ -45,6 +45,8 @@ def build_spark(
     onelake: dict | None = None,
     env: dict[str, str] | None = None,
     hadoop_home: str | None = None,
+    catalog: dict | None = None,
+    warehouse_dir: str | None = None,
 ):
     """Create a Delta-enabled SparkSession.
 
@@ -96,13 +98,25 @@ def build_spark(
         configs.update(onelake_spark_configs(**onelake))
         extra_packages.append(HADOOP_AZURE_PACKAGE)
 
+    # With a Fabric catalog, swap Delta's session catalog for ours: DeltaCatalog
+    # plus on-demand resolution of lakehouse tables and the write policy. The
+    # class ships in our jar (on spark.jars alongside the token provider).
+    catalog_class = "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+    if catalog:
+        catalog_class = "ch.fs.OneLakeCatalog"
+        configs["spark.localspark.workspace_id"] = catalog["workspace_id"]
+        configs["spark.localspark.write_mode"] = catalog["write_mode"]
+        configs["spark.localspark.shadow_root"] = catalog["shadow_root"]
+        for name, lakehouse_id in catalog["lakehouses"].items():
+            configs[f"spark.localspark.lakehouse.{name}"] = lakehouse_id
+    if warehouse_dir:
+        # Managed-table location. Per session, so nothing lands in the project cwd.
+        configs["spark.sql.warehouse.dir"] = warehouse_dir
+
     builder = (
         SparkSession.builder.appName(app_name)
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
+        .config("spark.sql.catalog.spark_catalog", catalog_class)
         .config("spark.driver.memory", driver_memory)
         .config("spark.sql.sources.default", "delta")
     )

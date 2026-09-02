@@ -15,6 +15,7 @@ from pathlib import Path
 
 CONFIG_FILENAME = "local-spark.toml"
 ENV_PREFIX = "LOCAL_SPARK_"
+WRITE_MODES = ("sandbox", "readonly", "writethrough")
 
 
 class ConfigError(Exception):
@@ -35,6 +36,9 @@ class LakehouseConfig:
     trims the noise (cheap, since table hydration is lazy)."""
 
     exclude: list[str] = field(default_factory=list)
+    # Unqualified table names resolve here (USE <default> at session init), the
+    # way a Fabric notebook's default lakehouse works.
+    default: str | None = None
 
 
 @dataclass
@@ -59,6 +63,15 @@ class RuntimeConfig:
     token_jar_path: str | None = None  # override for the HttpTokenProvider jar
     hadoop_home: str | None = None  # Windows winutils dir (default: bundled)
     warm_on_start: bool = False  # eagerly start Spark at launch (default: lazy)
+    # Write policy for lakehouse tables. sandbox: writes land in a local shadow
+    # (shallow clones + new tables), OneLake untouched. readonly: like sandbox
+    # but creating tables and DeltaTable.forName writes are refused.
+    # writethrough: writes go to OneLake. See OneLakeCatalog.
+    write_mode: str = "sandbox"
+    # Session-scoped shadows are deleted when the session ends; set true to keep
+    # them under <state_root>/lakehouses/<workspace-id>/shadow across sessions.
+    persist_shadow: bool = False
+    state_root: str = "~/.local-spark"  # per-session warehouse, shadows, mirrors
 
 
 @dataclass
@@ -80,6 +93,11 @@ class Config:
             )
         if self.runtime.default_sql_limit <= 0:
             raise ConfigError("runtime.default_sql_limit must be a positive integer.")
+        if self.runtime.write_mode not in WRITE_MODES:
+            raise ConfigError(
+                f"runtime.write_mode must be one of {', '.join(WRITE_MODES)} "
+                f"(got {self.runtime.write_mode!r})."
+            )
 
     def require_workspace(self) -> WorkspaceConfig:
         """Return the workspace, raising if none is configured (used by the
@@ -154,13 +172,19 @@ def _parse_file(path: Path) -> Config:
     warm_on_start = runtime.get("warm_on_start", False)
     if not isinstance(warm_on_start, bool):
         raise ConfigError("runtime.warm_on_start must be a boolean (true/false).")
+    persist_shadow = runtime.get("persist_shadow", False)
+    if not isinstance(persist_shadow, bool):
+        raise ConfigError("runtime.persist_shadow must be a boolean (true/false).")
 
     config = Config(
         workspace=WorkspaceConfig(
             name=_require_str(ws, "name", "workspace"),
             id=_require_str(ws, "id", "workspace"),
         ),
-        lakehouses=LakehouseConfig(exclude=list(exclude)),
+        lakehouses=LakehouseConfig(
+            exclude=list(exclude),
+            default=_require_str(lh, "default", "lakehouses"),
+        ),
         spark=SparkConfig(
             driver_memory=_require_str(spark, "driver_memory", "spark") or "8g",
             extra_configs=dict(extra),
@@ -172,6 +196,9 @@ def _parse_file(path: Path) -> Config:
             token_jar_path=_require_str(runtime, "token_jar_path", "runtime"),
             hadoop_home=_require_str(runtime, "hadoop_home", "runtime"),
             warm_on_start=warm_on_start,
+            write_mode=(_require_str(runtime, "write_mode", "runtime") or "sandbox").lower(),
+            persist_shadow=persist_shadow,
+            state_root=_require_str(runtime, "state_root", "runtime") or "~/.local-spark",
         ),
         source_path=path,
     )
@@ -212,6 +239,18 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (warm := env.get(f"{ENV_PREFIX}WARM_ON_START")) is not None:
         config.runtime.warm_on_start = _parse_bool(warm, f"{ENV_PREFIX}WARM_ON_START")
+
+    if (default_lh := env.get(f"{ENV_PREFIX}DEFAULT_LAKEHOUSE")) is not None:
+        config.lakehouses.default = default_lh or None
+
+    if (mode := env.get(f"{ENV_PREFIX}WRITE_MODE")) is not None:
+        config.runtime.write_mode = mode.strip().lower()
+
+    if (persist := env.get(f"{ENV_PREFIX}PERSIST_SHADOW")) is not None:
+        config.runtime.persist_shadow = _parse_bool(persist, f"{ENV_PREFIX}PERSIST_SHADOW")
+
+    if (root := env.get(f"{ENV_PREFIX}STATE_ROOT")) is not None:
+        config.runtime.state_root = root
 
 
 def load_config(path: Path | None = None, *, search_from: Path | None = None) -> Config:

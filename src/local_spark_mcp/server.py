@@ -26,12 +26,18 @@ reset_runtime wipes all state by restarting the session.
 
 When a Fabric workspace is configured, its lakehouses appear as Spark databases
 and their Delta tables as `<lakehouse>`.`<table>` — the same catalog shape as the
-Fabric runtime. Just query tables by name with run_sql; a referenced table is
-auto-mounted on first use and stays available for the rest of the session (so
-run_code can use it afterward too). list_lakehouses / list_tables help you
-explore; mount_lakehouse bulk-mounts a whole lakehouse if you want everything up
-front. Work entirely through named tables and databases, exactly as in a Fabric
-notebook, so the code you arrive at transfers to Fabric with a similar outcome.
+Fabric runtime. Reference any table by name from run_code or run_sql (spark.table,
+spark.read.table, spark.sql, saveAsTable, DeltaTable.forName all work); it
+resolves on first touch with no mount step. If a default lakehouse is configured,
+unqualified names resolve against it, as on Fabric. list_lakehouses / list_tables
+help you explore; mount_lakehouse pre-registers a whole lakehouse.
+
+Writes follow the write policy (session_info / shadow_status show it). In the
+default `sandbox` mode nothing reaches OneLake: tables you write become local
+shadows (shallow clones, so reads stay live) and new tables land locally; later
+reads in this session see them. `readonly` refuses writes; `writethrough` writes
+to OneLake. Work entirely through named tables and databases, exactly as in a
+Fabric notebook, so the code you arrive at transfers with a similar outcome.
 """
 
 # Max width of a single SQL table cell before it is elided.
@@ -45,6 +51,10 @@ def _base_engine_kwargs(config: Config) -> dict:
         "env": config.spark.env,
         "java_home": config.runtime.java_home,
         "hadoop_home": config.runtime.hadoop_home,
+        "default_lakehouse": config.lakehouses.default,
+        "write_mode": config.runtime.write_mode,
+        "persist_shadow": config.runtime.persist_shadow,
+        "state_root": config.runtime.state_root,
         "default_sql_limit": config.runtime.default_sql_limit,
     }
 
@@ -309,6 +319,21 @@ def format_info(info: dict) -> str:
     lhs = info.get("lakehouses") or []
     if lhs:
         lines.append(f"  fabric lakehouses ({len(lhs)}): {', '.join(lhs)}")
+        lines.append(f"  default lakehouse: {info.get('default_lakehouse') or '(none)'}")
+        lines.append(f"  write_mode: {info.get('write_mode')}")
+        shadows = info.get("shadows") or []
+        lines.append(f"  shadowed tables ({len(shadows)}): {', '.join(shadows) if shadows else '(none)'}")
+    return "\n".join(lines)
+
+
+def format_shadow(res: dict) -> str:
+    tables = res.get("tables") or []
+    lines = [
+        f"write_mode: {res.get('write_mode')}",
+        f"shadow root: {res.get('shadow_root')} ({'persistent' if res.get('persistent') else 'session-scoped'})",
+        f"shadowed tables ({len(tables)}):",
+    ]
+    lines += [f"  {t['lakehouse']}.{t['table']}  -> {t['path']}" for t in tables] or ["  (none)"]
     return "\n".join(lines)
 
 
@@ -401,6 +426,23 @@ def build_server(state: ServerState | None = None) -> FastMCP:
                 "(set [workspace] in local-spark.toml to enable OneLake)."
             )
         return None
+
+    @mcp.tool()
+    async def shadow_status(ctx: Context) -> str:
+        """Show the write policy and which lakehouse tables are shadowed locally this session (shallow clones written to, and new tables). Nothing under a shadow has reached OneLake."""
+        if note := _local_only_note():
+            return note
+        res = await state.call("shadow_status", on_wait=_pinger(ctx, "checking shadow"))
+        return format_shadow(res)
+
+    @mcp.tool()
+    async def discard_shadow(ctx: Context) -> str:
+        """Drop all local shadow tables for this session so the next touch re-reads from OneLake. Does not affect OneLake."""
+        if note := _local_only_note():
+            return note
+        res = await state.call("discard_shadow", on_wait=_pinger(ctx, "discarding shadow"))
+        names = ", ".join(f"{t['lakehouse']}.{t['table']}" for t in res.get("tables", []))
+        return f"Discarded {res.get('discarded', 0)} shadowed table(s){': ' + names if names else ''}."
 
     @mcp.tool()
     async def list_lakehouses(ctx: Context) -> str:

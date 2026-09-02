@@ -15,6 +15,9 @@ name = "My Fabric Workspace"
 # (cheap — table hydration is lazy). List names here to exclude noisy ones.
 exclude = []
 # env override: LOCAL_SPARK_LAKEHOUSE_EXCLUDE="Staging,Sandbox"
+# Default lakehouse: unqualified table names resolve here (USE <default> at
+# session init), like a Fabric notebook's default lakehouse.
+# default = "dataverse"   # env: LOCAL_SPARK_DEFAULT_LAKEHOUSE
 
 [spark]
 driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
@@ -38,6 +41,18 @@ driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
 
 [runtime]
 default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPARK_SQL_LIMIT
+# Write policy for lakehouse tables (env: LOCAL_SPARK_WRITE_MODE):
+#   sandbox (default): nothing reaches OneLake. A table you write becomes a local
+#       shallow clone (metadata only; reads stay live) and new tables land in the
+#       local shadow; later reads this session see them.
+#   readonly: like sandbox, but creating tables and DeltaTable.forName (MERGE)
+#       are refused with a message naming this setting.
+#   writethrough: writes go to OneLake; new tables land under Tables/<name>.
+write_mode = "sandbox"
+# persist_shadow = false  # keep shadows under <state_root>/lakehouses/<workspace-id>/
+#                         # across sessions (default: deleted with the session).
+#                         # env: LOCAL_SPARK_PERSIST_SHADOW
+# state_root = "~/.local-spark"  # per-session warehouse + shadows; env: LOCAL_SPARK_STATE_ROOT
 # warm_on_start = false   # default: lazy — Spark starts on first use (cold start
 #                         # is covered by progress heartbeats, so no client timeout).
 #                         # Set true to eagerly warm the JVM at launch. Leave false

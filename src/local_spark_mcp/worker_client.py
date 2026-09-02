@@ -175,6 +175,12 @@ class WorkerProcess:
     def get_info(self) -> dict:
         return self._call("info")
 
+    def shadow_status(self) -> dict:
+        return self._call("shadow_status")
+
+    def discard_shadow(self) -> dict:
+        return self._call("discard_shadow")
+
     def ping(self) -> dict:
         return self._call("ping", timeout=10.0)
 
