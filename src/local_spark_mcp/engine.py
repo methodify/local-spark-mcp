@@ -793,7 +793,8 @@ def _shadow_state(table_dir: Path) -> tuple[str, int]:
         return "unknown", -1
     op = None
     try:
-        for line in (log / f"{versions[0]:020d}.json").read_text().splitlines():
+        # explicit UTF-8: Windows' default codec (cp1252) fails on Delta's non-ASCII commit metadata
+        for line in (log / f"{versions[0]:020d}.json").read_text(encoding="utf-8", errors="replace").splitlines():
             if '"commitInfo"' in line:
                 op = json.loads(line).get("commitInfo", {}).get("operation")
                 break

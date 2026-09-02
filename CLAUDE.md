@@ -356,6 +356,10 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
   which lacks the venv's site-packages.
 - Tests must not interpolate raw filesystem paths into generated code —
   `C:\Users\...` becomes an invalid escape. Use `Path.as_posix()`.
+- **Always pass `encoding="utf-8"` to `read_text`/`write_text`/`open`.** Windows
+  defaults to cp1252, and Delta commit JSON (among others) contains non-ASCII
+  bytes; the resulting `UnicodeDecodeError` silently mis-classified every
+  shadow as `written` on Windows.
 
 ## Environment (verified on this machine)
 

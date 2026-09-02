@@ -33,6 +33,17 @@ def test_new_table_is_written_at_version_zero(tmp_path):
     assert _shadow_state(tmp_path / "t") == ("written", 0)
 
 
+def test_clone_commit_with_non_ascii_metadata_is_read(tmp_path):
+    # Delta commit JSON carries non-ASCII bytes; the read must not depend on the platform codec
+    log = tmp_path / "t" / "_delta_log"
+    log.mkdir(parents=True)
+    (log / f"{0:020d}.json").write_text(
+        json.dumps({"commitInfo": {"operation": "CLONE", "userName": "Bryon \u00e9\u2014\u00e5"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    assert _shadow_state(tmp_path / "t") == ("read", 0)
+
+
 def test_empty_log_is_unknown(tmp_path):
     (tmp_path / "t" / "_delta_log").mkdir(parents=True)
     assert _shadow_state(tmp_path / "t") == ("unknown", -1)
