@@ -36,8 +36,19 @@ Writes follow the write policy (session_info / shadow_status show it). In the
 default `sandbox` mode nothing reaches OneLake: tables you write become local
 shadows (shallow clones, so reads stay live) and new tables land locally; later
 reads in this session see them. `readonly` refuses writes; `writethrough` writes
-to OneLake. Work entirely through named tables and databases, exactly as in a
-Fabric notebook, so the code you arrive at transfers with a similar outcome.
+to OneLake.
+
+`/lakehouse/default/Files` is a real local directory (a link to a mirror of the
+default lakehouse's Files/, shown by session_info) for plain Python IO,
+subprocesses, and native libraries. Only the configured subtrees are pulled at
+start; sync_files pulls more on demand, and push is allowed only in
+writethrough. Tables/ is never mirrored — use the catalog. run_notebook runs a
+Fabric notebook from its Git .py source in this same namespace, with
+`notebookutils` / `mssparkutils` available.
+
+Work entirely through named tables, databases, and /lakehouse/default/Files,
+exactly as in a Fabric notebook, so the code you arrive at transfers with a
+similar outcome.
 """
 
 # Max width of a single SQL table cell before it is elided.
@@ -535,7 +546,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def list_tables(lakehouse: str, ctx: Context) -> str:
-        """List the Delta tables in a Fabric lakehouse. Tables are not queryable via SQL until you mount them with mount_table or mount_lakehouse."""
+        """List the Delta tables in a Fabric lakehouse (from the Fabric REST API). Any of them can be referenced by name right away; mounting is optional."""
         if note := _local_only_note():
             return note
         try:

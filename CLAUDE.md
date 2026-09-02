@@ -27,13 +27,14 @@ databases and their tables mount lazily. **Validated live end to end** against a
 real workspace: discovery (8 lakehouses, 63 tables), mount, and an `abfss://`
 Delta read/query (1.4M rows) through the full stack.
 
-**REQUEST-001 (notebook parity, from `~/src/claude-fabric`) in progress.** Asks
-1–4 shipped and validated live on Linux and Windows: `OneLakeCatalog` (tables
-resolve by name on first touch, no mount step), default lakehouse, the write
-policy (sandbox / readonly / writethrough, shadows via Delta shallow clone), and
-`run_notebook` + the `notebookutils`/`mssparkutils` shim. Ask 6 (Files mirror,
-`/lakehouse/default/Files`) pending; ask 5 (PyPI) deferred by the user,
-LICENSE/NOTICE done. Version stays 0.1.x until everything lands, then 0.2.0.
+**REQUEST-001 (notebook parity, from `~/src/claude-fabric`) shipped as 0.2.0**,
+validated live on Linux and Windows: `OneLakeCatalog` (tables resolve by name on
+first touch, no mount step), default lakehouse, the write policy (sandbox /
+readonly / writethrough, shadows via Delta shallow clone), `run_notebook` + the
+`notebookutils`/`mssparkutils` shim, and the Files mirror behind
+`/lakehouse/default/Files` (`files.py`). Ask 5 (PyPI) is deferred by the user;
+NOTICE is in place, the LICENSE choice is still open. The response lives at
+`~/src/claude-fabric/tmp/exchange/local-spark-mcp/RESPONSE-001-notebook-parity.md`.
 
 ⚠️ **Address OneLake by GUID, not name.** `abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}`
 works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
@@ -60,8 +61,8 @@ JAVA_HOME=<jdk17> scripts/build_jar.sh
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest -m '' tests/test_worker_integration.py tests/test_server_e2e.py tests/test_fabric_session_integration.py -v
 # JVM token-provider tests (needs built jar + Java):
 LOCAL_SPARK_RUN_JVM=1 .venv/bin/python -m pytest tests/test_token_provider_jvm.py -v
-# Live catalog + write-policy and notebookutils tests against a real workspace (az login; writes only to a sandbox shadow):
-LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py tests/test_notebookutils_live.py -v
+# Live catalog + write-policy, notebookutils, and Files-mirror tests against a real workspace (az login; writes only to a sandbox shadow / the local mirror):
+LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py tests/test_notebookutils_live.py tests/test_files_mirror_live.py -v
 # Notebook runner (local Spark, synthetic notebooks) and the parser over the real Git export (skips if absent):
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_notebook_runner_integration.py tests/test_notebook_parser.py -v
 # Single test: append `::test_name`
@@ -148,11 +149,29 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - `notebookutils_shim.py` — `notebookutils` / `mssparkutils` for local runs:
   `credentials.getSecret` (Key Vault, ambient credential), `variableLibrary
   .getLibrary` (Fabric REST definition → attributes, active value set applied),
-  `fs.ls`/`exists` for `abfss://` (OneLake data plane; `/lakehouse` paths and
-  `mount` arrive with ask 6), `notebook.run`/`runMultiple` (sequential in
+  `fs.ls`/`exists` for `abfss://` (OneLake data plane) and for `/lakehouse/...`
+  and mount points (the Files mirror), `fs.mount` (registers + links a mount
+  point to the mirror), `notebook.run`/`runMultiple` (sequential in
   dependency order; raises with `.result` like Fabric)/`exit`, `session.stop`
   (no-op), `runtime.context`. Anything else raises `NotImplementedError` naming
   the member. Registered in `sys.modules` and the namespace at bootstrap.
+- `files.py` — `FilesMirror`: the local mirror of a lakehouse's `Files/` under
+  `<mirror_root>/<workspace-id>/<lakehouse-id>/Files` (default
+  `<state_root>/lakehouses/...`, shared across projects). Selective `pull` of
+  configured subtrees through the OneLake data plane (`azure-storage-file-
+  datalake`; unchanged files skipped by size + mtime), `push` only in
+  writethrough. `link_default` points `/lakehouse/default` (POSIX symlink) or
+  `C:\lakehouse\default` (junction, `mklink /J`, unelevated) at the lakehouse
+  dir so `<link>/Files` is the mirror; a lockfile
+  (`<mirror_root>/.lakehouse-link.json`) records the owner and the link is never
+  repointed while another LIVE session holds it for a different lakehouse, never
+  replaces a real directory, and a dangling `/lakehouse` symlink whose target is
+  under a writable location is repaired (this machine: root-owned
+  `/lakehouse -> ~/src/mosaic/lakehouse`). When the link can't be made the
+  one-time sudo command is reported and the session continues;
+  `LOCAL_SPARK_FILES_ROOT` (driver + `spark.executorEnv`) always names the
+  mirror. `resolve()` maps `/lakehouse/<default|name>/Files/...` and mount
+  points for the shim. `Tables/` is never mirrored.
 - `token-provider/` — sbt project (`LocalSparkJars`) for `ch.fs.HttpTokenProvider`
   and `ch.fs.OneLakeCatalog`; spark-sql and delta-spark are `provided`. Its built
   jar is bundled into `src/local_spark_mcp/jars/` (committed, shipped in the
@@ -175,6 +194,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   shadowed locally) and `discard_shadow` (drop the shadows; next touch re-clones).
 - **run_notebook** — run a Fabric notebook from its Git `.py` source in the
   persistent namespace, with cell selection, parameters, and `notebookutils`.
+- **sync_files** — pull `Files/` subtrees into the mirror behind
+  `/lakehouse/default/Files` (or push, in writethrough only).
 
 ## Locked design decisions
 
@@ -228,6 +249,14 @@ sections below; this is the summary of record.
    timeout, just first-call lag on whichever agent uses it. Lazy keeps a swarm of
    agents from each warming a JVM; opt into eager warm-at-launch with
    `runtime.warm_on_start = true` (env `LOCAL_SPARK_WARM_ON_START`).
+
+9. **Files — a real local mirror, not a shim or FUSE.** `/lakehouse/default/Files`
+   is a symlink/junction to `<mirror_root>/<ws>/<lh>/Files`; only configured
+   subtrees sync (`[files] sync`), writes stay local under the write policy,
+   push is writethrough-only. The global path is guarded by a lockfile and
+   never clobbered; `LOCAL_SPARK_FILES_ROOT` is the always-available fallback.
+   `run_notebook` repoints the link for a notebook whose default lakehouse
+   differs and restores it afterwards.
 
 ## The reference implementation — read this first
 

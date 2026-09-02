@@ -12,7 +12,9 @@ with a reasonably similar outcome — no cloud compute burned while exploring.
 
 ## Status
 
-Milestones A, B.1, B.2 complete and validated live. See `CLAUDE.md` for the
+Version 0.2.0: the core session plus **notebook parity** — a Fabric notebook
+from the Git export runs unmodified against real OneLake data, in a sandbox by
+default. Validated live on Linux/WSL and Windows. See `CLAUDE.md` for the
 architecture and the locked design decisions.
 
 ## Running it (via `uvx`, from GitHub)
@@ -59,6 +61,58 @@ distributed code (`mapPartitions` / UDFs). Install such libs into that env — e
 — and set any data-dir env vars (and/or `PYTHONPATH`) under `[spark.env]` in
 `local-spark.toml`; those are applied to both the driver and the workers. (A
 runtime `sys.path.append` only affects the driver — workers won't see it.)
+
+## Working like a Fabric notebook
+
+- **Tables by name.** Lakehouses are Spark databases; `spark.table("dataverse.custtable")`,
+  `spark.sql`, `saveAsTable`, `INSERT`, `MERGE`, and `DeltaTable.forName` resolve
+  `<lakehouse>.<table>` on first touch, with no mount step. Set
+  `[lakehouses] default` (env `LOCAL_SPARK_DEFAULT_LAKEHOUSE`) and unqualified
+  names resolve against it, as on Fabric.
+- **Write policy** (`[runtime] write_mode`, env `LOCAL_SPARK_WRITE_MODE`).
+  `sandbox` (default): nothing reaches OneLake — a table you write becomes a
+  local Delta shallow clone (metadata only, so reads stay live and the first
+  write is quick) and new tables land locally; later reads in the session see
+  them. `readonly`: sandbox plus refusal of table creation and `DeltaTable.forName`.
+  `writethrough`: writes go to OneLake. `shadow_status` / `discard_shadow` show
+  and reset the local shadows. Shadows are session-scoped unless
+  `persist_shadow = true`.
+- **`run_notebook`** runs a notebook from its Git `.py` source cell by cell in
+  the persistent namespace, with cell selection (`"0-4,7"`), parameters
+  (applied after the PARAMETERS CELL), and the notebook's own default lakehouse.
+  `%pip` / `!pip` / `%run` lines are reported, not run — bring libraries in with
+  `uvx --with`. `[notebooks] root` (env `LOCAL_SPARK_NOTEBOOKS_ROOT`) lets you
+  address notebooks by Fabric display name.
+- **`notebookutils` / `mssparkutils`** are importable: `credentials.getSecret`
+  (Key Vault), `variableLibrary.getLibrary` (Fabric REST), `fs.ls` / `fs.exists`
+  / `fs.mount`, `notebook.run` / `runMultiple` / `exit`, `session.stop`,
+  `runtime.context`. Other members raise `NotImplementedError` naming the member.
+- **`/lakehouse/default/Files` is a real directory** — a link to a local mirror
+  of the default lakehouse's `Files/`, so `open`, `os.listdir`, subprocesses,
+  and native libraries reading a data directory all work. List the subtrees to
+  pull under `[files] sync` (env `LOCAL_SPARK_FILES_SYNC`); unchanged files are
+  skipped, so a 2 GB tree downloads once. Writes land in the mirror; `sync_files`
+  pulls more on demand and pushes only in `writethrough`. `Tables/` is never
+  mirrored. The mirror lives under `~/.local-spark/lakehouses/<workspace-id>/<lakehouse-id>/Files`
+  (env `LOCAL_SPARK_MIRROR_ROOT`), shared by every project that uses that
+  lakehouse, and `LOCAL_SPARK_FILES_ROOT` names it for code that avoids the
+  global path.
+
+### The `/lakehouse` path
+
+The link is one global path per machine, so a lockfile records which session
+owns it and the server refuses to repoint it while another live session holds
+it for a different lakehouse (session_info reports this, and the mirror path
+still works).
+
+- **Linux and WSL:** `/lakehouse` must exist and be writable by you. One-time
+  setup: `sudo mkdir /lakehouse && sudo chown $USER /lakehouse`. If `/lakehouse`
+  is already a symlink into a directory you own, the server uses it as is. The
+  server never creates `/lakehouse` itself; it reports the command and runs
+  without the link.
+- **Windows:** `C:\lakehouse\default` is a directory junction, created without
+  elevation. A path beginning with `/` resolves against the current drive, so
+  `/lakehouse/default/Files` works when the session runs from `C:`.
 
 ## Configuration
 
