@@ -12,7 +12,7 @@ with a reasonably similar outcome — no cloud compute burned while exploring.
 
 ## Status
 
-Version 0.2.0: the core session plus **notebook parity** — a Fabric notebook
+Version 0.2.x: the core session plus **notebook parity** — a Fabric notebook
 from the Git export runs unmodified against real OneLake data, in a sandbox by
 default. Validated live on Linux/WSL and Windows. See `CLAUDE.md` for the
 architecture and the locked design decisions.
@@ -122,3 +122,8 @@ launched. Environment variables (`LOCAL_SPARK_*`) override individual settings �
 convenient in the MCP `env` block above when you don't want a file. With no
 workspace configured the server runs local-only (no Fabric). Auth is ambient via
 `az login`, so nothing in the config is secret.
+
+## License
+
+Apache License 2.0. See `LICENSE`, and `NOTICE` for the bundled third-party
+components (Apache Hadoop winutils).

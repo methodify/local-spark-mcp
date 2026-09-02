@@ -1,6 +1,8 @@
 local-spark-mcp
 Copyright (c) 2026 Bryon Williams / methodify
 
+Licensed under the Apache License, Version 2.0; see the LICENSE file.
+
 This distribution bundles third-party software:
 
 Apache Hadoop winutils (src/local_spark_mcp/winutils/bin/winutils.exe and

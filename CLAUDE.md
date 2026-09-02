@@ -27,13 +27,13 @@ databases and their tables mount lazily. **Validated live end to end** against a
 real workspace: discovery (8 lakehouses, 63 tables), mount, and an `abfss://`
 Delta read/query (1.4M rows) through the full stack.
 
-**REQUEST-001 (notebook parity, from `~/src/claude-fabric`) shipped as 0.2.0**,
+**REQUEST-001 (notebook parity, from `~/src/claude-fabric`) shipped as 0.2.x**,
 validated live on Linux and Windows: `OneLakeCatalog` (tables resolve by name on
 first touch, no mount step), default lakehouse, the write policy (sandbox /
 readonly / writethrough, shadows via Delta shallow clone), `run_notebook` + the
 `notebookutils`/`mssparkutils` shim, and the Files mirror behind
 `/lakehouse/default/Files` (`files.py`). Ask 5 (PyPI) is deferred by the user;
-NOTICE is in place, the LICENSE choice is still open. The response lives at
+the project is Apache-2.0 (LICENSE + NOTICE, shipped in 0.2.1). The response lives at
 `~/src/claude-fabric/tmp/exchange/local-spark-mcp/RESPONSE-001-notebook-parity.md`.
 
 ⚠️ **Address OneLake by GUID, not name.** `abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}`
