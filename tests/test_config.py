@@ -262,3 +262,30 @@ def test_find_config_walks_up(tmp_path):
     nested.mkdir(parents=True)
     found = find_config_file(nested)
     assert found == tmp_path / "local-spark.toml"
+
+
+def test_files_section_defaults_and_values(tmp_path, monkeypatch):
+    cfg = load_config(write_config(tmp_path, '[workspace]\nid = "x"\n'))
+    assert cfg.files.sync == [] and cfg.files.mirror_root is None
+    path = write_config(
+        tmp_path,
+        """
+        [workspace]
+        id = "x"
+        [files]
+        sync = ["lib/", "metadata/config.json"]
+        mirror_root = "/data/mirror"
+        """,
+    )
+    cfg = load_config(path)
+    assert cfg.files.sync == ["lib/", "metadata/config.json"]
+    assert cfg.files.mirror_root == "/data/mirror"
+    monkeypatch.setenv("LOCAL_SPARK_FILES_SYNC", "a/, b/c.txt ,")
+    monkeypatch.setenv("LOCAL_SPARK_MIRROR_ROOT", "/other")
+    cfg = load_config(path)
+    assert cfg.files.sync == ["a/", "b/c.txt"] and cfg.files.mirror_root == "/other"
+
+
+def test_files_sync_must_be_string_list(tmp_path):
+    with pytest.raises(ConfigError, match="files.sync"):
+        load_config(write_config(tmp_path, '[workspace]\nid = "x"\n[files]\nsync = "lib/"\n'))

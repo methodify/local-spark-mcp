@@ -16,6 +16,15 @@ name = "My Fabric Workspace"
 # / runMultiple resolve names the same way. env: LOCAL_SPARK_NOTEBOOKS_ROOT
 # root = "fabric-git-repo/data-warehouse"
 
+[files]
+# Files mirror: /lakehouse/default/Files is a link to a local mirror of the
+# default lakehouse's Files/ (shared across projects, keyed by workspace and
+# lakehouse id). List the Files/ subtrees to pull at session start; unchanged
+# files are skipped, so large trees (libpostal data) download once. Writes land
+# locally; `sync_files(direction="push")` uploads only in writethrough mode.
+# sync = ["lib/", "metadata/"]      # env: LOCAL_SPARK_FILES_SYNC="lib/,metadata/"
+# mirror_root = "~/.local-spark/lakehouses"   # env: LOCAL_SPARK_MIRROR_ROOT
+
 [lakehouses]
 # All lakehouses in the workspace are registered as Spark databases by default
 # (cheap — table hydration is lazy). List names here to exclude noisy ones.

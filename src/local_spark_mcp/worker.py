@@ -46,6 +46,8 @@ def _handle(engine, method: str, params: dict):
             default_lakehouse=params.get("default_lakehouse"),
             parameters=params.get("parameters"),
         ), engine
+    if method == "sync_files":
+        return engine.sync_files(params.get("paths"), params.get("direction", "pull"), params.get("lakehouse")), engine
     if method == "shadow_status":
         return engine.shadow_status(), engine
     if method == "discard_shadow":

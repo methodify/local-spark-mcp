@@ -90,9 +90,15 @@ class SparkEngine:
         persist_shadow: bool = False,
         state_root: str | None = None,
         notebooks_root: str | None = None,
+        files_sync: list[str] | None = None,
+        mirror_root: str | None = None,
     ):
         self.default_sql_limit = default_sql_limit
         self.notebooks_root = notebooks_root
+        self.files_sync = list(files_sync or [])
+        self.files: "FilesMirror | None" = None
+        self.files_link: dict | None = None
+        self.files_sync_report: list[dict] = []
         self._notebook_index: dict | None = None
         self._cred = None
         self._fabric_client = None
@@ -113,6 +119,23 @@ class SparkEngine:
         else:
             self.shadow_root = self._session_dir / "shadow"
         self.shadow_root.mkdir(parents=True, exist_ok=True)
+
+        env = dict(env or {})
+        if onelake and lakehouses:
+            from .discovery import LakehouseInfo as _LI
+            from .files import FilesMirror
+
+            registry = {lh["name"]: _LI(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"]) for lh in lakehouses}
+            self.files = FilesMirror(
+                root=Path(mirror_root).expanduser() if mirror_root else self._state_root / "lakehouses",
+                workspace_id=workspace_id, lakehouses=registry, write_mode=write_mode,
+                credential_factory=self.credential,
+            )
+            if default_lakehouse:
+                try:
+                    env["LOCAL_SPARK_FILES_ROOT"] = str(self.files.mirror_dir(default_lakehouse))
+                except LookupError:
+                    pass  # reported by _register_lakehouses
 
         catalog = None
         if onelake and lakehouses:
@@ -136,6 +159,31 @@ class SparkEngine:
         self.shell = self._make_shell()
         self._register_lakehouses(lakehouses, default_lakehouse)
         self._bootstrap_namespace()
+        if self.files is not None and self.default_lakehouse:
+            self._activate_files(self.default_lakehouse)
+
+    def _activate_files(self, lakehouse: str) -> None:
+        """Point /lakehouse/default at this lakehouse's mirror and pull the
+        configured Files/ subtrees (cached: unchanged files are skipped)."""
+        self.files_link = self.files.link_default(lakehouse)
+        for rel in self.files_sync:
+            try:
+                self.files_sync_report.append(self.files.pull(lakehouse, [rel]).to_dict())
+            except Exception as exc:  # keep the session usable; report instead
+                self.files_sync_report.append({"direction": "pull", "lakehouse": lakehouse, "paths": [rel],
+                                               "errors": [f"{type(exc).__name__}: {exc}"]})
+
+    def sync_files(self, paths: list[str] | None = None, direction: str = "pull", lakehouse: str | None = None) -> dict:
+        if self.files is None:
+            raise RuntimeError("no Fabric workspace configured (set [workspace] in local-spark.toml)")
+        name = lakehouse or self.default_lakehouse
+        if not name:
+            raise RuntimeError("no lakehouse given and no default lakehouse configured")
+        if direction == "pull":
+            return self.files.pull(name, paths or self.files_sync or None).to_dict()
+        if direction == "push":
+            return self.files.push(name, paths).to_dict()
+        raise ValueError("direction must be 'pull' or 'push'")
 
     def _make_shell(self):
         from IPython.core.interactiveshell import InteractiveShell
@@ -403,6 +451,10 @@ class SparkEngine:
             else:
                 self.spark.sql(f"USE {self._q(info.name)}")
                 effective_db, switched = info.name, True
+                if self.files is not None and info.name != self.default_lakehouse:
+                    self._activate_files(info.name)
+                    warnings.append(f"/lakehouse/default repointed to {info.name!r} for this run"
+                                    + ("" if self.files_link.get("linked") else f" (link unavailable: {self.files_link.get('reason')})"))
         elif lh_name:
             warnings.append(f"notebook names default lakehouse {lh_name!r} but no Fabric workspace is configured")
 
@@ -467,6 +519,8 @@ class SparkEngine:
         finally:
             if switched:
                 self.spark.sql(f"USE {self._q(prev_db)}")
+                if self.files is not None and effective_db != self.default_lakehouse and self.default_lakehouse:
+                    self._activate_files(self.default_lakehouse)
         if any(r.get("status") in ("error", "unsupported") for r in results):
             status = "error"
         return {
@@ -523,6 +577,16 @@ class SparkEngine:
         host = u.hostname
         service = DataLakeServiceClient(f"https://{host}", credential=self.credential())
         return service.get_file_system_client(workspace), u.path.lstrip("/")
+
+    def files_resolve(self, path: str):
+        if self.files is None:
+            return None
+        return self.files.resolve(path, self.default_lakehouse)
+
+    def files_mount(self, source: str, mount_point: str) -> dict:
+        if self.files is None:
+            raise RuntimeError("no Fabric workspace configured (set [workspace] in local-spark.toml)")
+        return self.files.mount(source, mount_point, self.default_lakehouse)
 
     def onelake_ls(self, path: str) -> list:
         from .notebookutils_shim import FileInfo
@@ -617,6 +681,9 @@ class SparkEngine:
             "write_mode": self.write_mode,
             "shadow_root": self.shadow_root.as_posix(),
             "shadows": [f"{t['lakehouse']}.{t['table']}" for t in self._shadow_tables()],
+            "files_root": (self.files_link or {}).get("files_root"),
+            "files_link": self.files_link,
+            "files_sync": self.files_sync_report,
             "execution_count": self.shell.execution_count,
             "default_sql_limit": self.default_sql_limit,
         }
@@ -668,6 +735,8 @@ class SparkEngine:
             self.spark.stop()
         except Exception:  # pragma: no cover - best effort on shutdown
             pass
+        if self.files is not None:
+            self.files.release_link()
         # Session-scoped state (warehouse + non-persistent shadow) goes with the session.
         shutil.rmtree(self._session_dir, ignore_errors=True)
 
@@ -698,6 +767,12 @@ class _ShimEngine:
 
     def onelake_exists(self, path):
         return self._e.onelake_exists(path)
+
+    def files_resolve(self, path):
+        return self._e.files_resolve(path)
+
+    def files_mount(self, source, mount_point):
+        return self._e.files_mount(source, mount_point)
 
 
 def _sql_preview(res: "SqlResult", max_rows: int = 20) -> str:

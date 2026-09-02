@@ -56,6 +56,8 @@ def _base_engine_kwargs(config: Config) -> dict:
         "persist_shadow": config.runtime.persist_shadow,
         "state_root": config.runtime.state_root,
         "notebooks_root": config.notebooks.root,
+        "files_sync": config.files.sync,
+        "mirror_root": config.files.mirror_root,
         "default_sql_limit": config.runtime.default_sql_limit,
     }
 
@@ -324,6 +326,20 @@ def format_info(info: dict) -> str:
         lines.append(f"  write_mode: {info.get('write_mode')}")
         shadows = info.get("shadows") or []
         lines.append(f"  shadowed tables ({len(shadows)}): {', '.join(shadows) if shadows else '(none)'}")
+        link = info.get("files_link")
+        if link:
+            state = f"-> {link['path']}" if link.get("linked") else f"NOT linked: {link.get('reason')}"
+            lines.append(f"  files root: {link.get('files_root')} ({state})")
+            for rep in info.get("files_sync") or []:
+                errs = f", {len(rep.get('errors', []))} error(s)" if rep.get("errors") else ""
+                lines.append(f"  files sync {rep.get('paths')}: {rep.get('transferred', 0)} pulled, {rep.get('skipped', 0)} unchanged{errs}")
+    return "\n".join(lines)
+
+
+def format_sync(res: dict) -> str:
+    lines = [f"{res['direction']} {res['lakehouse']} {res.get('paths')}: {res.get('transferred', 0)} transferred "
+             f"({res.get('bytes', 0):,} bytes), {res.get('skipped', 0)} unchanged"]
+    lines += [f"  error: {e}" for e in res.get("errors", [])[:20]]
     return "\n".join(lines)
 
 
@@ -472,6 +488,23 @@ def build_server(state: ServerState | None = None) -> FastMCP:
             on_wait=_pinger(ctx, "running notebook"),
         )
         return format_notebook_result(res)
+
+    @mcp.tool()
+    async def sync_files(
+        ctx: Context,
+        paths: str | None = None,
+        direction: str = "pull",
+        lakehouse: str | None = None,
+    ) -> str:
+        """Sync a lakehouse's Files/ with the local mirror behind /lakehouse/default/Files (session_info shows the mirror path). `paths` is a comma-separated list of Files/ subtrees or files (default: the configured [files] sync list); unchanged files are skipped. direction="pull" downloads from OneLake; "push" uploads local changes and is allowed only when write_mode is writethrough. `lakehouse` defaults to the default lakehouse."""
+        if note := _local_only_note():
+            return note
+        path_list = [p.strip() for p in paths.split(",") if p.strip()] if paths else None
+        try:
+            res = await state.call("sync_files", path_list, direction, lakehouse, on_wait=_pinger(ctx, f"{direction}ing files"))
+        except WorkerError as exc:
+            return f"sync_files failed: {exc}"
+        return format_sync(res)
 
     @mcp.tool()
     async def shadow_status(ctx: Context) -> str:

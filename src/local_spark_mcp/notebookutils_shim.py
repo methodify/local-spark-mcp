@@ -91,26 +91,39 @@ class _FS:
     def __init__(self, engine):
         self._engine = engine
 
-    def _files_path(self, path: str):
-        raise NotImplementedError(
-            f"notebookutils.fs on {path!r}: local /lakehouse mirror paths arrive with the "
-            "Files mirror (REQUEST-001 ask 6); abfss:// paths are supported now."
-        )
+    def _local(self, path: str) -> Path:
+        local = self._engine.files_resolve(path)
+        if local is None:
+            raise FileNotFoundError(
+                f"notebookutils.fs: {path!r} is not an abfss:// path, a /lakehouse/... path, or a "
+                "registered mount point (Tables/ is never mirrored — use the catalog)."
+            )
+        return local
 
     def ls(self, path: str) -> list[FileInfo]:
         if path.startswith("abfss://"):
             return self._engine.onelake_ls(path)
-        return self._files_path(path)
+        local = self._local(path)
+        if not local.exists():
+            raise FileNotFoundError(f"{path} (mirror: {local}) does not exist locally; sync_files may pull it")
+        base = path.rstrip("/")
+        return [
+            FileInfo(name=child.name, path=f"{base}/{child.name}",
+                     size=child.stat().st_size if child.is_file() else 0, isDir=child.is_dir())
+            for child in sorted(local.iterdir())
+        ]
 
     def exists(self, path: str) -> bool:
         if path.startswith("abfss://"):
             return self._engine.onelake_exists(path)
-        return self._files_path(path)
+        local = self._engine.files_resolve(path)
+        return bool(local and local.exists())
 
     def mount(self, source: str, mountPoint: str, extraConfigs=None):  # noqa: N803
-        raise NotImplementedError(
-            "notebookutils.fs.mount arrives with the Files mirror (REQUEST-001 ask 6)."
-        )
+        return self._engine.files_mount(source, mountPoint).get("linked", False) or True
+
+    def unmount(self, mountPoint: str):  # noqa: N803
+        return True
 
 
 class _Notebook:

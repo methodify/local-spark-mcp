@@ -83,9 +83,20 @@ class NotebooksConfig:
 
 
 @dataclass
+class FilesConfig:
+    """Files mirror: which ``Files/`` subtrees to pull for the default lakehouse
+    (e.g. ["lib/", "metadata/"]) and where mirrors live (default
+    <state_root>/lakehouses/<workspace-id>/<lakehouse-id>/Files)."""
+
+    sync: list[str] = field(default_factory=list)
+    mirror_root: str | None = None
+
+
+@dataclass
 class Config:
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     notebooks: NotebooksConfig = field(default_factory=NotebooksConfig)
+    files: FilesConfig = field(default_factory=FilesConfig)
     lakehouses: LakehouseConfig = field(default_factory=LakehouseConfig)
     spark: SparkConfig = field(default_factory=SparkConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -159,6 +170,10 @@ def _parse_file(path: Path) -> Config:
 
     ws = data.get("workspace", {})
     nbs = data.get("notebooks", {})
+    files = data.get("files", {})
+    sync = files.get("sync", [])
+    if not isinstance(sync, list) or not all(isinstance(x, str) for x in sync):
+        raise ConfigError("files.sync must be a list of strings.")
     lh = data.get("lakehouses", {})
     spark = data.get("spark", {})
     runtime = data.get("runtime", {})
@@ -192,6 +207,7 @@ def _parse_file(path: Path) -> Config:
             id=_require_str(ws, "id", "workspace"),
         ),
         notebooks=NotebooksConfig(root=_require_str(nbs, "root", "notebooks")),
+        files=FilesConfig(sync=list(sync), mirror_root=_require_str(files, "mirror_root", "files")),
         lakehouses=LakehouseConfig(
             exclude=list(exclude),
             default=_require_str(lh, "default", "lakehouses"),
@@ -265,6 +281,12 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (nb_root := env.get(f"{ENV_PREFIX}NOTEBOOKS_ROOT")) is not None:
         config.notebooks.root = nb_root or None
+
+    if (sync := env.get(f"{ENV_PREFIX}FILES_SYNC")) is not None:
+        config.files.sync = [s.strip() for s in sync.split(",") if s.strip()]
+
+    if (mirror := env.get(f"{ENV_PREFIX}MIRROR_ROOT")) is not None:
+        config.files.mirror_root = mirror or None
 
 
 def load_config(path: Path | None = None, *, search_from: Path | None = None) -> Config:

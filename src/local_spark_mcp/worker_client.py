@@ -182,6 +182,9 @@ class WorkerProcess:
             "default_lakehouse": default_lakehouse, "parameters": parameters,
         })
 
+    def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:
+        return self._call("sync_files", {"paths": paths, "direction": direction, "lakehouse": lakehouse})
+
     def shadow_status(self) -> dict:
         return self._call("shadow_status")
 

@@ -22,7 +22,7 @@ LH = os.environ.get("LOCAL_SPARK_LIVE_LAKEHOUSE", "customer")
 TABLE = os.environ.get("LOCAL_SPARK_LIVE_TABLE", "sources_name")
 
 
-def _engine(tmp_path, write_mode):
+def _engine(tmp_path, write_mode, **kw):
     from local_spark_mcp.discovery import FabricAPIClient
     from local_spark_mcp.engine import SparkEngine
     from local_spark_mcp.fabric import default_jar_path
@@ -39,9 +39,9 @@ def _engine(tmp_path, write_mode):
         driver_memory="4g",
         onelake={"endpoint": srv.url, "secret": srv.secret, "jar_path": default_jar_path()},
         lakehouses=lakehouses,
-        default_lakehouse=LH,
         write_mode=write_mode,
         state_root=str(tmp_path / "state"),
+        **{"default_lakehouse": LH, **kw},
     )
     return eng, srv
 
