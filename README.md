@@ -74,9 +74,10 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   local Delta shallow clone (metadata only, so reads stay live and the first
   write is quick) and new tables land locally; later reads in the session see
   them. `readonly`: sandbox plus refusal of table creation and `DeltaTable.forName`.
-  `writethrough`: writes go to OneLake. `shadow_status` / `discard_shadow` show
-  and reset the local shadows. Shadows are session-scoped unless
-  `persist_shadow = true`.
+  `writethrough`: writes go to OneLake. `shadow_status` lists the local shadows
+  with a state: `read` (materialized by a read, unchanged) or `written` (has
+  local writes); `discard_shadow` resets them, or only the `read` or `written`
+  ones with `only=`. Shadows are session-scoped unless `persist_shadow = true`.
 - **`run_notebook`** runs a notebook from its Git `.py` source cell by cell in
   the persistent namespace, with cell selection (`"0-4,7"`), parameters
   (applied after the PARAMETERS CELL), and the notebook's own default lakehouse.
@@ -90,7 +91,8 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
 - **`/lakehouse/default/Files` is a real directory** — a link to a local mirror
   of the default lakehouse's `Files/`, so `open`, `os.listdir`, subprocesses,
   and native libraries reading a data directory all work. List the subtrees to
-  pull under `[files] sync` (env `LOCAL_SPARK_FILES_SYNC`); unchanged files are
+  pull under `[files] sync` (env `LOCAL_SPARK_FILES_SYNC`) — subtrees like
+  `lib/` or single files like `_dwlib_hydrate_options.txt`; unchanged files are
   skipped, so a 2 GB tree downloads once. Writes land in the mirror; `sync_files`
   pulls more on demand and pushes only in `writethrough`. `Tables/` is never
   mirrored. The mirror lives under `~/.local-spark/lakehouses/<workspace-id>/<lakehouse-id>/Files`

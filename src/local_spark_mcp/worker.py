@@ -51,7 +51,7 @@ def _handle(engine, method: str, params: dict):
     if method == "shadow_status":
         return engine.shadow_status(), engine
     if method == "discard_shadow":
-        return engine.discard_shadow(), engine
+        return engine.discard_shadow(params.get("only")), engine
     if method == "info":
         return engine.info(), engine
     raise ValueError(f"unknown method: {method!r}")

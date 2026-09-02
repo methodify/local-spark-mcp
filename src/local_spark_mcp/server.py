@@ -13,6 +13,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from . import __version__
 from .config import Config, ConfigError, load_config
 from .worker_client import WorkerError, WorkerProcess
 
@@ -390,7 +391,9 @@ def format_shadow(res: dict) -> str:
         f"shadow root: {res.get('shadow_root')} ({'persistent' if res.get('persistent') else 'session-scoped'})",
         f"shadowed tables ({len(tables)}):",
     ]
-    lines += [f"  {t['lakehouse']}.{t['table']}  -> {t['path']}" for t in tables] or ["  (none)"]
+    lines += [f"  {t['lakehouse']}.{t['table']}  [{t.get('state', '?')}, v{t.get('version', '?')}]  -> {t['path']}" for t in tables] or ["  (none)"]
+    if tables:
+        lines.append("  read = materialized by a read only (a shallow clone; nothing changed); written = has local writes")
     return "\n".join(lines)
 
 
@@ -448,6 +451,8 @@ def build_server(state: ServerState | None = None) -> FastMCP:
             state.shutdown()
 
     mcp = FastMCP("local-spark", instructions=INSTRUCTIONS, lifespan=lifespan)
+    # serverInfo.version in `initialize` is this package's version, not the mcp SDK's
+    mcp._mcp_server.version = __version__
 
     @mcp.tool()
     async def run_code(code: str, ctx: Context) -> str:
@@ -526,11 +531,13 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         return format_shadow(res)
 
     @mcp.tool()
-    async def discard_shadow(ctx: Context) -> str:
-        """Drop all local shadow tables for this session so the next touch re-reads from OneLake. Does not affect OneLake."""
+    async def discard_shadow(ctx: Context, only: str | None = None) -> str:
+        """Drop local shadow tables for this session so the next touch re-reads from OneLake. Does not affect OneLake. `only="read"` drops just the read-materialized clones (keeps your writes); `only="written"` drops just the tables you wrote; default drops all."""
         if note := _local_only_note():
             return note
-        res = await state.call("discard_shadow", on_wait=_pinger(ctx, "discarding shadow"))
+        if only not in (None, "read", "written"):
+            return "discard_shadow: `only` must be \"read\", \"written\", or omitted."
+        res = await state.call("discard_shadow", only, on_wait=_pinger(ctx, "discarding shadow"))
         names = ", ".join(f"{t['lakehouse']}.{t['table']}" for t in res.get("tables", []))
         return f"Discarded {res.get('discarded', 0)} shadowed table(s){': ' + names if names else ''}."
 

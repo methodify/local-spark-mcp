@@ -64,6 +64,7 @@ def test_sandbox_resolves_without_mount_and_isolates_writes(tmp_path):
         shadows = eng.shadow_status()["tables"]
         assert [(t["lakehouse"], t["table"]) for t in shadows] == [(LH, TABLE)]
         assert os.path.isdir(os.path.join(shadows[0]["path"], "_delta_log"))
+        assert shadows[0]["state"] == "read"  # a shallow clone nobody has written to
 
         # 2) unqualified read resolves against the default lakehouse
         out2 = _run(eng, f"print('U', spark.table('{TABLE}').count())")
@@ -81,12 +82,13 @@ def test_sandbox_resolves_without_mount_and_isolates_writes(tmp_path):
         _run(eng, f"spark.sql('INSERT INTO {LH}.{TABLE} SELECT * FROM {LH}.{TABLE} LIMIT 1'); print('W', spark.table('{LH}.{TABLE}').count())")
         after = [f for f in os.listdir(shadows[0]["path"]) if f.endswith(".parquet")]
         assert len(after) == len(before) + 1
+        assert eng.shadow_status()["tables"][0]["state"] == "written"
 
         # 6) a NEW table under a lakehouse namespace lands in the shadow and is queryable
         _run(eng, f"spark.range(3).write.saveAsTable('{LH}.lsm_catalog_probe')")
         assert eng.run_sql(f"SELECT COUNT(*) AS c FROM {LH}.lsm_catalog_probe").rows[0][0] == 3
-        names = {(t["lakehouse"], t["table"]) for t in eng.shadow_status()["tables"]}
-        assert (LH, "lsm_catalog_probe") in names
+        states = {(t["lakehouse"], t["table"]): t["state"] for t in eng.shadow_status()["tables"]}
+        assert states[(LH, "lsm_catalog_probe")] == "written"
 
         # 7) a table that does not exist still raises the original not-found
         r = eng.run_code(f"spark.table('{LH}.definitely_not_a_table_xyz')")
@@ -97,6 +99,12 @@ def test_sandbox_resolves_without_mount_and_isolates_writes(tmp_path):
         assert eng.shadow_status()["tables"] == []
         _run(eng, f"print('R', spark.table('{LH}.{TABLE}').count())")
         assert [(t["lakehouse"], t["table"]) for t in eng.shadow_status()["tables"]] == [(LH, TABLE)]
+
+        # 9) discard_shadow(only="read") drops the unchanged clone
+        assert eng.shadow_status()["tables"][0]["state"] == "read"
+        assert eng.discard_shadow(only="written")["discarded"] == 0
+        assert eng.discard_shadow(only="read")["discarded"] == 1
+        assert eng.shadow_status()["tables"] == []
     finally:
         eng.stop()
         srv.stop()

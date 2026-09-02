@@ -134,6 +134,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   spawns/handshakes/proxies and `restart()` = reset.
 - `server.py` — FastMCP stdio server; one serialized worker; lazy startup;
   blocking IPC offloaded to a thread; Fabric mode auto-enabled by `[workspace]`.
+  Reports the package version (`__version__`, pinned to `pyproject.toml` by a
+  test) as `serverInfo.version` instead of the mcp SDK's.
 - `token_server.py` — loopback OneLake token endpoint (DefaultAzureCredential,
   secret-guarded); owned by the server, outlives worker restarts.
 - `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
@@ -191,7 +193,10 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - **State management**: inspect session/catalog state; reset the runtime
   (= respawn the worker for a clean slate).
 - **Write policy**: `shadow_status` (write mode + which lakehouse tables are
-  shadowed locally) and `discard_shadow` (drop the shadows; next touch re-clones).
+  shadowed locally, each `read` — an untouched shallow clone — or `written`,
+  derived from the shadow's `_delta_log`: CLONE at version 0 and nothing after
+  = read) and `discard_shadow(only=None|"read"|"written")` (drop the shadows;
+  next touch re-clones).
 - **run_notebook** — run a Fabric notebook from its Git `.py` source in the
   persistent namespace, with cell selection, parameters, and `notebookutils`.
 - **sync_files** — pull `Files/` subtrees into the mirror behind

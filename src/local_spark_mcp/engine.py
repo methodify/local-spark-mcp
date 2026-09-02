@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import json
 import os
 import re
 import shutil
@@ -701,10 +702,13 @@ class SparkEngine:
                 continue
             for table_dir in sorted(lh_dir.iterdir()):
                 if (table_dir / "_delta_log").is_dir():
+                    state, version = _shadow_state(table_dir)
                     found.append({
                         "lakehouse": id_to_name.get(lh_dir.name, lh_dir.name),
                         "table": table_dir.name,
                         "path": table_dir.as_posix(),
+                        "state": state,
+                        "version": version,
                     })
         return found
 
@@ -716,18 +720,22 @@ class SparkEngine:
             "tables": self._shadow_tables(),
         }
 
-    def discard_shadow(self) -> dict:
-        """Drop every shadowed table from the catalog and delete the shadow files,
-        so the next touch re-clones from OneLake. OneLake is not affected."""
-        tables = self._shadow_tables()
+    def discard_shadow(self, only: str | None = None) -> dict:
+        """Drop shadowed tables from the catalog and delete their files, so the
+        next touch re-clones from OneLake. OneLake is not affected. `only` limits
+        it to the "read" (materialized by a read, unchanged) or "written" ones."""
+        tables = [t for t in self._shadow_tables() if only is None or t["state"] == only]
         for t in tables:
             try:
                 self.spark.sql(f"DROP TABLE IF EXISTS {self._q(t['lakehouse'])}.{self._q(t['table'])}")
             except Exception:  # external table; best effort — files go next
                 pass
-        shutil.rmtree(self.shadow_root, ignore_errors=True)
-        self.shadow_root.mkdir(parents=True, exist_ok=True)
-        self._mounted = {}
+            shutil.rmtree(t["path"], ignore_errors=True)
+            self._mounted.get(t["lakehouse"], set()).discard(t["table"])
+        if only is None:
+            shutil.rmtree(self.shadow_root, ignore_errors=True)
+            self.shadow_root.mkdir(parents=True, exist_ok=True)
+            self._mounted = {}
         return {"discarded": len(tables), "tables": tables}
 
     def stop(self):
@@ -773,6 +781,27 @@ class _ShimEngine:
 
     def files_mount(self, source, mount_point):
         return self._e.files_mount(source, mount_point)
+
+
+def _shadow_state(table_dir: Path) -> tuple[str, int]:
+    """("read" | "written", latest version). A shadow that is still the initial
+    shallow-clone commit (operation CLONE at its first version) was only read;
+    any later commit, or a first commit that is not a clone, means local writes."""
+    log = table_dir / "_delta_log"
+    versions = sorted(int(p.stem) for p in log.glob("*.json") if p.stem.isdigit())
+    if not versions:
+        return "unknown", -1
+    op = None
+    try:
+        for line in (log / f"{versions[0]:020d}.json").read_text().splitlines():
+            if '"commitInfo"' in line:
+                op = json.loads(line).get("commitInfo", {}).get("operation")
+                break
+    except (OSError, ValueError):
+        pass
+    if op == "CLONE" and len(versions) == 1:
+        return "read", versions[0]
+    return "written", versions[-1]
 
 
 def _sql_preview(res: "SqlResult", max_rows: int = 20) -> str:

@@ -188,8 +188,8 @@ class WorkerProcess:
     def shadow_status(self) -> dict:
         return self._call("shadow_status")
 
-    def discard_shadow(self) -> dict:
-        return self._call("discard_shadow")
+    def discard_shadow(self, only: str | None = None) -> dict:
+        return self._call("discard_shadow", {"only": only})
 
     def ping(self) -> dict:
         return self._call("ping", timeout=10.0)
