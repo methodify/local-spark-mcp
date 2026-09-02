@@ -32,7 +32,7 @@ def main():
             f"""
 people = [(1, "Alice", "2024-01-01"), (2, "Bob", "2024-02-01"), (3, "Cy", "2024-03-01")]
 df = spark.createDataFrame(people, ["id", "name", "joined"])
-df.write.format("delta").mode("overwrite").save("{tmp / 'people'}")
+df.write.format("delta").mode("overwrite").save("{(tmp / 'people').as_posix()}")
 print("wrote", df.count(), "rows")
 """
         ),
@@ -43,7 +43,7 @@ print("wrote", df.count(), "rows")
         "cell 2: register table, last-expr echo",
         engine.run_code(
             f"""
-spark.sql("CREATE TABLE IF NOT EXISTS people USING DELTA LOCATION '{tmp / 'people'}'")
+spark.sql("CREATE TABLE IF NOT EXISTS people USING DELTA LOCATION '{(tmp / 'people').as_posix()}'")
 df2 = spark.table("people")
 df2
 """

@@ -72,13 +72,21 @@ server's **stderr**; stdout is reserved for the MCP transport.
   `[spark.env]` sets env vars on BOTH the driver process and Spark Python workers
   (`spark.executorEnv.*`) — for native-lib data dirs / PYTHONPATH so distributed
   (mapPartitions/UDF) code can import + init the same libs as the driver. Worker/
-  driver interpreter parity already holds (`PYSPARK_PYTHON=sys.executable`), so a
+  driver interpreter parity already holds (`PYSPARK_PYTHON=preferred_python()`), so a
   lib pip-installed into the server's env is importable on both; `[spark.env]`
   covers the data dirs / path. A driver-only runtime `sys.path` change does NOT
   reach workers — install into the env or use PYTHONPATH instead.
 - `java.py` — resolve a Spark-compatible `JAVA_HOME` (prefers vfox Java 17).
+  Accepts `bin/java` **or** `bin/java.exe` — checking only the POSIX name
+  rejected every valid JDK on Windows.
+- `hadoop.py` — Windows only: resolve a HADOOP_HOME with `bin/winutils.exe`.
+  Spark 3.5 **cannot start** on Windows without it (`Shell.<clinit>` throws
+  "HADOOP_HOME and hadoop.home.dir are unset"). Order: `runtime.hadoop_home`
+  → ambient `HADOOP_HOME` → the winutils bundled in the wheel
+  (`winutils/`, see its PROVENANCE.md). No-op on POSIX.
 - `spark_session.py` — local Delta session builder; pins `JAVA_HOME`, drops
-  ambient `SPARK_HOME`, forces `PYSPARK_PYTHON=sys.executable` (hermetic to venv).
+  ambient `SPARK_HOME`, points `PYSPARK_PYTHON` at `preferred_python()`
+  (hermetic to the env, correct under uv/uvx trampolines).
 - `engine.py` — `SparkEngine`: IPython `InteractiveShell` + injected `spark`/`sc`/
   `F`/`T`/`Window`. `run_code` (captured stdout + traceback), `run_sql`
   (rows + truncation), `info`.
@@ -225,12 +233,32 @@ the reference's `docs/USAGE_EXAMPLES.md` (`.../scala-3.3.1/...0.1.jar`) is
 Local-disk fallback also exists at a higher level (`LocalSparkSession` over
 Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
 
+## Cross-platform notes (Windows validated end to end)
+
+- **Python 3.11 is pinned** (`>=3.11,<3.12`). It matches Fabric Runtime 1.3
+  (Spark 3.5 / Delta 3.2 / Python 3.11), and pyspark 3.5.0's Python workers
+  **crash on Windows under 3.12** ("Python worker exited unexpectedly") — proven
+  with vanilla pyspark, so it is not our bug. Linux tolerates 3.12; Windows does
+  not. Don't raise this ceiling without re-testing Windows `mapPartitions`.
+- **The worker must not inherit the server's stdin** (`stdin=subprocess.DEVNULL`
+  in `worker_client`). Under an MCP stdio server that handle is the client's
+  pipe; inheriting it deadlocks the child during interpreter startup on Windows
+  — it never reaches `__main__`, so the worker never connects back.
+- **`spark.jars` must be a `file://` URI** (`fabric._as_file_uri`). A bare
+  Windows path (`C:\...`) is parsed by Spark/Hadoop as a URI whose scheme is the
+  drive letter.
+- Spark's Python workers use `preferred_python()` (the env's own interpreter),
+  since under uv/uvx the running interpreter may be the BASE managed python,
+  which lacks the venv's site-packages.
+- Tests must not interpolate raw filesystem paths into generated code —
+  `C:\Users\...` becomes an invalid escape. Use `Path.as_posix()`.
+
 ## Environment (verified on this machine)
 
 - **`uv`** is the package manager (`uv 0.10.7`). The reference uses
   `uv pip install -e .` and a `src/` layout with `pyproject.toml`.
-- **Python:** repo targets **3.12** (`.python-version` in the reference); note
-  the default `python3` on PATH is conda's **3.11.5** — use a uv venv to pin.
+- **Python:** repo targets **3.11** (see the cross-platform notes above for why);
+  the default `python3` on PATH is conda's 3.11.5 — use a uv venv to pin.
 - **Java:** system `java` is 21, but Spark 3.5 officially supports only Java
   8/11/17. **`vfox` is installed and has Java 17.0.16-bsg** — use that for the
   Spark process (the server should pin/select Java 17, e.g. via vfox or by

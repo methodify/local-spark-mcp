@@ -52,12 +52,12 @@ async def test_full_mcp_roundtrip(tmp_path):
             path = tmp_path / "t"
             await session.call_tool(
                 "run_code",
-                {"code": f"spark.range(3).write.format('delta').mode('overwrite').save('{path}')"},
+                {"code": f"spark.range(3).write.format('delta').mode('overwrite').save('{path.as_posix()}')"},
                 read_timeout_seconds=long,
             )
             await session.call_tool(
                 "run_code",
-                {"code": f"spark.sql(\"CREATE TABLE t USING DELTA LOCATION '{path}'\")"},
+                {"code": f"spark.sql(\"CREATE TABLE t USING DELTA LOCATION '{path.as_posix()}'\")"},
                 read_timeout_seconds=long,
             )
             r = await session.call_tool("run_sql", {"sql": "SELECT * FROM t ORDER BY id"}, read_timeout_seconds=long)

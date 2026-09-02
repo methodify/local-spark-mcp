@@ -48,8 +48,8 @@ def test_sql_roundtrip_and_truncation(worker):
     tmp = Path(tempfile.mkdtemp(prefix="worker-it-"))
     code = f"""
 df = spark.createDataFrame([(i, f"n{{i}}") for i in range(10)], ["id", "name"])
-df.write.format("delta").mode("overwrite").save("{tmp / 'nums'}")
-spark.sql("CREATE TABLE IF NOT EXISTS nums USING DELTA LOCATION '{tmp / 'nums'}'")
+df.write.format("delta").mode("overwrite").save("{(tmp / 'nums').as_posix()}")
+spark.sql("CREATE TABLE IF NOT EXISTS nums USING DELTA LOCATION '{(tmp / 'nums').as_posix()}'")
 """
     assert worker.run_code(code)["ok"]
     res = worker.run_sql("SELECT * FROM nums ORDER BY id", limit=3)

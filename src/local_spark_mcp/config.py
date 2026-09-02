@@ -57,6 +57,7 @@ class RuntimeConfig:
     default_sql_limit: int = 100
     java_home: str | None = None
     token_jar_path: str | None = None  # override for the HttpTokenProvider jar
+    hadoop_home: str | None = None  # Windows winutils dir (default: bundled)
     warm_on_start: bool = False  # eagerly start Spark at launch (default: lazy)
 
 
@@ -169,6 +170,7 @@ def _parse_file(path: Path) -> Config:
             default_sql_limit=int(runtime.get("default_sql_limit", 100)),
             java_home=_require_str(runtime, "java_home", "runtime"),
             token_jar_path=_require_str(runtime, "token_jar_path", "runtime"),
+            hadoop_home=_require_str(runtime, "hadoop_home", "runtime"),
             warm_on_start=warm_on_start,
         ),
         source_path=path,
@@ -204,6 +206,9 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (jar := env.get(f"{ENV_PREFIX}TOKEN_JAR_PATH")) is not None:
         config.runtime.token_jar_path = jar
+
+    if (hadoop := env.get(f"{ENV_PREFIX}HADOOP_HOME")) is not None:
+        config.runtime.hadoop_home = hadoop
 
     if (warm := env.get(f"{ENV_PREFIX}WARM_ON_START")) is not None:
         config.runtime.warm_on_start = _parse_bool(warm, f"{ENV_PREFIX}WARM_ON_START")

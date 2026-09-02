@@ -11,7 +11,28 @@ from __future__ import annotations
 import os
 import sys
 
+from pathlib import Path
+
+from .hadoop import resolve_hadoop_home
 from .java import resolve_java_home
+
+
+def preferred_python() -> str:
+    """The environment's own interpreter, when one exists next to ``sys.prefix``.
+
+    Under uv/uvx the *running* interpreter can be the BASE managed python (a
+    venv ``python.exe`` trampoline re-execs it). That base interpreter has none
+    of the venv's site-packages, so Spark's Python workers would rely on Spark's
+    own PYTHONPATH to find pyspark — and die the moment a user-supplied
+    PYTHONPATH (via [spark.env]) replaces it. The venv interpreter has pyspark on
+    its own path, so it stays correct either way.
+    """
+    candidate = (
+        Path(sys.prefix)
+        / ("Scripts" if os.name == "nt" else "bin")
+        / ("python.exe" if os.name == "nt" else "python")
+    )
+    return str(candidate) if candidate.exists() else sys.executable
 
 
 def build_spark(
@@ -23,6 +44,7 @@ def build_spark(
     log_level: str = "WARN",
     onelake: dict | None = None,
     env: dict[str, str] | None = None,
+    hadoop_home: str | None = None,
 ):
     """Create a Delta-enabled SparkSession.
 
@@ -40,8 +62,19 @@ def build_spark(
     # (drop any ambient SPARK_HOME pointing at an external distro) and force
     # driver and workers onto the same Python to avoid PYTHON_VERSION_MISMATCH.
     os.environ.pop("SPARK_HOME", None)
-    os.environ["PYSPARK_PYTHON"] = sys.executable
-    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    _py = preferred_python()
+    os.environ["PYSPARK_PYTHON"] = _py
+    os.environ["PYSPARK_DRIVER_PYTHON"] = _py
+
+    # Windows: Spark won't even start without Hadoop's winutils (Shell.<clinit>
+    # throws "HADOOP_HOME and hadoop.home.dir are unset"). Resolve one (bundled
+    # by default) and put its bin/ on PATH so hadoop.dll is loadable too.
+    resolved_hadoop = resolve_hadoop_home(hadoop_home)
+    if resolved_hadoop:
+        os.environ["HADOOP_HOME"] = resolved_hadoop
+        hadoop_bin = str(Path(resolved_hadoop) / "bin")
+        if hadoop_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = hadoop_bin + os.pathsep + os.environ.get("PATH", "")
 
     # User env vars: apply to this (driver) process — so run_code imports/inits
     # see them, and the JVM inherits them — and to Spark Python workers via

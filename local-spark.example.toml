@@ -45,6 +45,10 @@ default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPA
 #                         # env: LOCAL_SPARK_WARM_ON_START
 # java_home = "/path/to/jdk17"   # pin the JVM (Spark 3.5 wants Java 8/11/17); env: LOCAL_SPARK_JAVA_HOME
 # token_jar_path = "/path/to/httptokenprovider_2.12-0.1.jar"  # override; default = in-repo sbt build
+# hadoop_home = "C:\\hadoop"   # WINDOWS ONLY: dir containing bin\\winutils.exe.
+#                              # Defaults to the copy bundled with this package;
+#                              # an ambient HADOOP_HOME also wins over the bundle.
+#                              # env: LOCAL_SPARK_HADOOP_HOME
 # env override: LOCAL_SPARK_TOKEN_JAR_PATH
 #
 # OneLake auth is automatic when a [workspace] is set: the server starts a

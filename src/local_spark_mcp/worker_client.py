@@ -16,8 +16,11 @@ from pathlib import Path
 
 from .protocol import recv_msg, send_msg
 
-# Spark startup (JVM + Delta jar resolution) is slow on a cold worker.
-DEFAULT_STARTUP_TIMEOUT = 180.0
+# Spark startup (JVM + Delta/hadoop-azure jar resolution) is slow on a cold
+# worker — markedly so on Windows first runs. Tool calls emit MCP progress
+# throughout, and a worker that dies is caught at once by the accept loop, so
+# a generous ceiling costs nothing but avoids spurious startup failures.
+DEFAULT_STARTUP_TIMEOUT = 600.0
 DEFAULT_CALL_TIMEOUT = 600.0
 
 
@@ -99,6 +102,12 @@ class WorkerProcess:
             exe, env = _worker_spawn()
             self._proc = subprocess.Popen(
                 [exe, "-m", "local_spark_mcp.worker", "--port", str(port)],
+                # The worker must NOT inherit our stdin: under an MCP stdio server
+                # that handle is the client's pipe. On Windows inheriting it
+                # deadlocks the child during interpreter startup (it never reaches
+                # __main__), so the worker never connects back. Holding the
+                # client's pipe would also mask EOF. DEVNULL is correct on POSIX too.
+                stdin=subprocess.DEVNULL,
                 stdout=sys.stderr.fileno(),
                 stderr=sys.stderr.fileno(),
                 env=env,

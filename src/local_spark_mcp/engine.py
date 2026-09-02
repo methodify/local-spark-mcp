@@ -79,6 +79,7 @@ class SparkEngine:
         onelake: dict | None = None,
         lakehouses: list[dict] | None = None,
         env: dict[str, str] | None = None,
+        hadoop_home: str | None = None,
     ):
         self.default_sql_limit = default_sql_limit
         self.spark = build_spark(
@@ -88,6 +89,7 @@ class SparkEngine:
             app_name=app_name,
             onelake=onelake,
             env=env,
+            hadoop_home=hadoop_home,
         )
         self.shell = self._make_shell()
         self._bootstrap_namespace()

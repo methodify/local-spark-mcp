@@ -18,7 +18,10 @@ def test_onelake_configs_shape():
     cfg = fabric.onelake_spark_configs(
         endpoint="http://127.0.0.1:5/token", secret="s3cr3t", jar_path="/x/y.jar"
     )
-    assert cfg["spark.jars"] == "/x/y.jar"
+    # spark.jars must be a URI: a bare Windows path (C:\...) is parsed by
+    # Spark/Hadoop as a URI whose scheme is the drive letter.
+    assert cfg["spark.jars"].startswith("file://")
+    assert cfg["spark.jars"].endswith("/y.jar")
     assert cfg["spark.hadoop.fs.azure.account.auth.type"] == "Custom"
     assert cfg["spark.hadoop.fs.azure.account.oauth.provider.type"] == "ch.fs.HttpTokenProvider"
     assert cfg["spark.hadoop.fs.azure.tokenprovider.endpoint"] == "http://127.0.0.1:5/token"

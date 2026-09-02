@@ -1,9 +1,9 @@
 [project]
 name = "local-spark-mcp"
-version = "0.1.3"
+version = "0.1.4"
 description = "MCP server giving an agent a stateful local Spark session for prototyping PySpark notebooks targeting Microsoft Fabric"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"  # pyspark 3.5.0 is validated on 3.12; avoid 3.13
+requires-python = ">=3.11,<3.12"  # matches Fabric Runtime 1.3 (Spark 3.5, Delta 3.2, Python 3.11); pyspark 3.5.0 workers break on 3.12 (Windows)
 authors = [{ name = "Bryon" }]
 dependencies = [
     "mcp>=1.2.0,<2.0.0",
@@ -30,7 +30,7 @@ build-backend = "hatchling.build"
 packages = ["src/local_spark_mcp"]
 # Ship the prebuilt token-provider jar so `uvx`/pip installs from GitHub work
 # without sbt (Fabric/OneLake mode needs it). Rebuild via scripts/build_jar.sh.
-artifacts = ["src/local_spark_mcp/jars/*.jar"]
+artifacts = ["src/local_spark_mcp/jars/*.jar", "src/local_spark_mcp/winutils/bin/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

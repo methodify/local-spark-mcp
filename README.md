@@ -32,12 +32,18 @@ environment. Register it as an MCP server in Claude Code (`.mcp.json`):
 }
 ```
 
-Prerequisites on the host:
+Runs on **Linux/WSL and Windows** (both validated end to end against live
+OneLake). Prerequisites on the host:
 
 - **Java 17** for Spark 3.5 (the server prefers a vfox-managed JDK 17, else
   `JAVA_HOME`; or set `runtime.java_home` / `LOCAL_SPARK_JAVA_HOME`). System
   Java 21 will not work.
 - **`az login`** — OneLake/Fabric auth is ambient via `DefaultAzureCredential`.
+- **Windows**: nothing extra. Hadoop's `winutils.exe`/`hadoop.dll` (required for
+  Spark to start at all on Windows) ship inside the package; point
+  `runtime.hadoop_home` at your own Hadoop if you prefer. Python 3.11 is used on
+  every platform — it matches Fabric Runtime 1.3, and pyspark 3.5.0's Python
+  workers crash on Windows under 3.12.
 
 The prebuilt OneLake token-provider jar ships inside the package, so Fabric mode
 works out of the box (no sbt needed). First run downloads PySpark/Delta jars and

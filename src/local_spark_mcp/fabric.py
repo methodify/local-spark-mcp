@@ -44,6 +44,12 @@ def default_jar_path() -> str | None:
     return packaged[-1] if packaged else None
 
 
+def _as_file_uri(path: str) -> str:
+    """file:// URI for a jar path. A bare Windows path (``C:\\...``) is parsed by
+    Spark/Hadoop as a URI whose scheme is the drive letter, so always pass a URI."""
+    return Path(path).resolve().as_uri()
+
+
 def onelake_spark_configs(*, endpoint: str, secret: str, jar_path: str) -> dict[str, str]:
     """Spark configs that route OneLake ABFS auth through HttpTokenProvider.
 
@@ -55,7 +61,7 @@ def onelake_spark_configs(*, endpoint: str, secret: str, jar_path: str) -> dict[
         # the package mechanism onto Spark's jar classloader), so it links its
         # CustomTokenProviderAdaptee superclass. spark.jars puts it there; ABFS
         # resolves the provider via the Hadoop Configuration's (Spark) classloader.
-        "spark.jars": jar_path,
+        "spark.jars": _as_file_uri(jar_path),
         "spark.hadoop.fs.azure.account.auth.type": "Custom",
         "spark.hadoop.fs.azure.account.oauth.provider.type": PROVIDER_CLASS,
         "spark.hadoop.fs.azure.tokenprovider.endpoint": endpoint,

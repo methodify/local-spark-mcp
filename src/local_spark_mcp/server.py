@@ -44,6 +44,7 @@ def _base_engine_kwargs(config: Config) -> dict:
         "extra_configs": config.spark.extra_configs,
         "env": config.spark.env,
         "java_home": config.runtime.java_home,
+        "hadoop_home": config.runtime.hadoop_home,
         "default_sql_limit": config.runtime.default_sql_limit,
     }
 
