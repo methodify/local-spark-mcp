@@ -1,0 +1,15 @@
+local-spark-mcp
+Copyright (c) 2026 Bryon Williams / methodify
+
+This distribution bundles third-party software:
+
+Apache Hadoop winutils (src/local_spark_mcp/winutils/bin/winutils.exe and
+hadoop.dll), Windows helper binaries built from Apache Hadoop 3.3.5 and
+obtained from https://github.com/cdarlint/winutils. Apache Hadoop is
+Copyright The Apache Software Foundation and is licensed under the Apache
+License, Version 2.0; a copy of that license is included at
+src/local_spark_mcp/winutils/LICENSE-2.0.txt, and file hashes and provenance
+are recorded in src/local_spark_mcp/winutils/PROVENANCE.md.
+
+The Scala jar at src/local_spark_mcp/jars/ (ch.fs.HttpTokenProvider,
+ch.fs.OneLakeCatalog) is original to this project.
