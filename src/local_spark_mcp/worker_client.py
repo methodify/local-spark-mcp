@@ -175,6 +175,13 @@ class WorkerProcess:
     def get_info(self) -> dict:
         return self._call("info")
 
+    def run_notebook(self, path: str, cells=None, stop_on_error: bool = True,
+                     default_lakehouse: str | None = None, parameters: dict | None = None) -> dict:
+        return self._call("run_notebook", {
+            "path": path, "cells": cells, "stop_on_error": stop_on_error,
+            "default_lakehouse": default_lakehouse, "parameters": parameters,
+        })
+
     def shadow_status(self) -> dict:
         return self._call("shadow_status")
 

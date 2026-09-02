@@ -10,6 +10,12 @@ name = "My Fabric Workspace"
 # id = "00000000-0000-0000-0000-000000000000"
 # env overrides: LOCAL_SPARK_WORKSPACE_NAME / LOCAL_SPARK_WORKSPACE_ID
 
+[notebooks]
+# Fabric Git export folder. run_notebook resolves relative paths and Fabric
+# display names (via each item's .platform) under it; notebookutils.notebook.run
+# / runMultiple resolve names the same way. env: LOCAL_SPARK_NOTEBOOKS_ROOT
+# root = "fabric-git-repo/data-warehouse"
+
 [lakehouses]
 # All lakehouses in the workspace are registered as Spark databases by default
 # (cheap — table hydration is lazy). List names here to exclude noisy ones.

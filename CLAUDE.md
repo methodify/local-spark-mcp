@@ -28,12 +28,12 @@ real workspace: discovery (8 lakehouses, 63 tables), mount, and an `abfss://`
 Delta read/query (1.4M rows) through the full stack.
 
 **REQUEST-001 (notebook parity, from `~/src/claude-fabric`) in progress.** Asks
-1–3 shipped and validated live on Linux and Windows: `OneLakeCatalog` (tables
-resolve by name on first touch, no mount step), default lakehouse, and the
-write policy (sandbox / readonly / writethrough, shadows via Delta shallow
-clone). Asks 4 (notebook runner + `notebookutils` shim) and 6 (Files mirror)
-pending; ask 5 (PyPI) deferred by the user, LICENSE/NOTICE done. Version stays
-0.1.x until everything lands, then 0.2.0.
+1–4 shipped and validated live on Linux and Windows: `OneLakeCatalog` (tables
+resolve by name on first touch, no mount step), default lakehouse, the write
+policy (sandbox / readonly / writethrough, shadows via Delta shallow clone), and
+`run_notebook` + the `notebookutils`/`mssparkutils` shim. Ask 6 (Files mirror,
+`/lakehouse/default/Files`) pending; ask 5 (PyPI) deferred by the user,
+LICENSE/NOTICE done. Version stays 0.1.x until everything lands, then 0.2.0.
 
 ⚠️ **Address OneLake by GUID, not name.** `abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}`
 works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
@@ -42,8 +42,8 @@ works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
 ## Commands
 
 ```bash
-# Setup (Python 3.12 via uv; pulls pyspark/delta — slow first time)
-uv venv --python 3.12
+# Setup (Python 3.11 via uv — see cross-platform notes; pulls pyspark/delta, slow first time)
+uv venv --python 3.11
 uv pip install -e ".[dev]"
 
 # Build the Scala jar (ch.fs.HttpTokenProvider + ch.fs.OneLakeCatalog) AND bundle
@@ -60,8 +60,10 @@ JAVA_HOME=<jdk17> scripts/build_jar.sh
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest -m '' tests/test_worker_integration.py tests/test_server_e2e.py tests/test_fabric_session_integration.py -v
 # JVM token-provider tests (needs built jar + Java):
 LOCAL_SPARK_RUN_JVM=1 .venv/bin/python -m pytest tests/test_token_provider_jvm.py -v
-# Live catalog + write-policy test against a real workspace (az login; writes only to a sandbox shadow):
-LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py -v
+# Live catalog + write-policy and notebookutils tests against a real workspace (az login; writes only to a sandbox shadow):
+LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py tests/test_notebookutils_live.py -v
+# Notebook runner (local Spark, synthetic notebooks) and the parser over the real Git export (skips if absent):
+LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_notebook_runner_integration.py tests/test_notebook_parser.py -v
 # Single test: append `::test_name`
 
 # Manual engine smoke (no MCP, no Fabric)
@@ -119,6 +121,13 @@ server's **stderr**; stdout is reserved for the MCP transport.
   catalog, which bypasses V2 plugins; the bridge resolves through `spark.table`
   first, and refuses in readonly). `mount_table` forces catalog materialization;
   `mount_tables` runs them in a thread pool. `shadow_status` / `discard_shadow`.
+  `run_notebook(path, cells, stop_on_error, default_lakehouse, parameters)`
+  runs a parsed notebook cell by cell in the same namespace: markdown skipped,
+  `%%sql` via `run_sql`, line magics stripped and reported, `USE` of the
+  notebook's own default lakehouse for the run (restored after), parameters
+  applied after the PARAMETERS CELL (so they override, as in a pipeline run),
+  `NotebookExit` recognized via `_exec` (which returns the raised exception
+  alongside the `ExecResult`).
 - `protocol.py` / `worker.py` / `worker_client.py` — length-prefixed JSON over a
   dedicated localhost socket; worker process holds the engine; `WorkerProcess`
   spawns/handshakes/proxies and `restart()` = reset.
@@ -128,7 +137,22 @@ server's **stderr**; stdout is reserved for the MCP transport.
   secret-guarded); owned by the server, outlives worker restarts.
 - `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
 - `discovery.py` — `FabricAPIClient` (REST: resolve workspace, list lakehouses /
-  tables, paging) + `LakehouseInfo` (GUID abfss path builder). Runs in the server.
+  tables, paging; `list_items` + `get_item_definition_parts` with LRO polling,
+  used for Variable Libraries) + `LakehouseInfo` (GUID abfss path builder).
+- `notebook.py` — parser for the Fabric Git `notebook-content.py` format
+  (markers with exactly 20 asterisks, `# META` JSON following each code cell,
+  `# MAGIC`-prefixed `%%sql` cells, `# `-prefixed markdown, raw `%pip`/`!pip`
+  line magics). Warns, never refuses. `select_cells` ("3", "0-4,7"),
+  `index_notebooks` (display name → path via each `.platform`, since folder names
+  often differ). Validated against all 143 notebooks in the workspace export.
+- `notebookutils_shim.py` — `notebookutils` / `mssparkutils` for local runs:
+  `credentials.getSecret` (Key Vault, ambient credential), `variableLibrary
+  .getLibrary` (Fabric REST definition → attributes, active value set applied),
+  `fs.ls`/`exists` for `abfss://` (OneLake data plane; `/lakehouse` paths and
+  `mount` arrive with ask 6), `notebook.run`/`runMultiple` (sequential in
+  dependency order; raises with `.result` like Fabric)/`exit`, `session.stop`
+  (no-op), `runtime.context`. Anything else raises `NotImplementedError` naming
+  the member. Registered in `sys.modules` and the namespace at bootstrap.
 - `token-provider/` — sbt project (`LocalSparkJars`) for `ch.fs.HttpTokenProvider`
   and `ch.fs.OneLakeCatalog`; spark-sql and delta-spark are `provided`. Its built
   jar is bundled into `src/local_spark_mcp/jars/` (committed, shipped in the
@@ -149,6 +173,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   (= respawn the worker for a clean slate).
 - **Write policy**: `shadow_status` (write mode + which lakehouse tables are
   shadowed locally) and `discard_shadow` (drop the shadows; next touch re-clones).
+- **run_notebook** — run a Fabric notebook from its Git `.py` source in the
+  persistent namespace, with cell selection, parameters, and `notebookutils`.
 
 ## Locked design decisions
 
@@ -326,6 +352,12 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
   Fabric / OneLake; worth considering for discovery or auth.
 
 ## Working notes
+
+- IPython's `InteractiveShell.instance()` is a **process-wide singleton**. One
+  engine per worker process in production, but tests that build several
+  `SparkEngine`s in one process share the shell and its `user_ns` — anything
+  installed into the namespace must be assigned, not `setdefault`ed, or a later
+  engine keeps the earlier engine's objects (this bit the `notebookutils` shim).
 
 - Spark sessions are heavy and slow to start; the MCP server holds one alive
   across tool calls — that persistence is the whole product. Design startup,

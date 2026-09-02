@@ -11,6 +11,8 @@ dependencies = [
     "delta-spark==3.2.0",
     "ipython>=8.18",
     "azure-identity>=1.25.1",
+    "azure-keyvault-secrets>=4.8",
+    "azure-storage-file-datalake>=12.14",
     "httpx>=0.28.1",
 ]
 

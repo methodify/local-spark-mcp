@@ -55,6 +55,7 @@ def _base_engine_kwargs(config: Config) -> dict:
         "write_mode": config.runtime.write_mode,
         "persist_shadow": config.runtime.persist_shadow,
         "state_root": config.runtime.state_root,
+        "notebooks_root": config.notebooks.root,
         "default_sql_limit": config.runtime.default_sql_limit,
     }
 
@@ -326,6 +327,35 @@ def format_info(info: dict) -> str:
     return "\n".join(lines)
 
 
+def format_notebook_result(res: dict, *, max_stdout: int = 1500) -> str:
+    lines = [f"notebook: {res.get('path')}", f"status: {res.get('status')}"]
+    if res.get("default_lakehouse"):
+        lines.append(f"default lakehouse: {res['default_lakehouse']}")
+    if res.get("exit_value") is not None:
+        lines.append(f"exit value: {res['exit_value']!r}")
+    ran = [c for c in res.get("cells", []) if c.get("status") != "skipped"]
+    lines.append(f"cells: {len(ran)} run of {res.get('cells_total')} (markdown skipped)")
+    for c in res.get("cells", []):
+        if c.get("status") == "skipped":
+            continue
+        lines.append(f"[{c['index']}] {c['language']} {c['status']} (line {c['line']})")
+        for m in c.get("unsupported", []):
+            lines.append(f"    unsupported, not run: {m}")
+        out = (c.get("stdout") or "").rstrip()
+        if out:
+            if len(out) > max_stdout:
+                out = out[:max_stdout] + "\n    … [truncated]"
+            lines += ["    " + l for l in out.splitlines()]
+        if c.get("error"):
+            lines.append(f"    error: {c['error']}")
+    if res.get("first_traceback"):
+        lines.append("first traceback:")
+        lines += ["    " + l for l in res["first_traceback"].rstrip().splitlines()[-25:]]
+    for w in res.get("warnings", []):
+        lines.append(f"warning: {w}")
+    return "\n".join(lines)
+
+
 def format_shadow(res: dict) -> str:
     tables = res.get("tables") or []
     lines = [
@@ -426,6 +456,22 @@ def build_server(state: ServerState | None = None) -> FastMCP:
                 "(set [workspace] in local-spark.toml to enable OneLake)."
             )
         return None
+
+    @mcp.tool()
+    async def run_notebook(
+        path: str,
+        ctx: Context,
+        cells: str | None = None,
+        stop_on_error: bool = True,
+        default_lakehouse: str | None = None,
+        parameters: dict | None = None,
+    ) -> str:
+        """Run a Fabric notebook from its Git .py source (notebook-content.py) cell by cell in this session's persistent namespace. `path` is a file, a `<name>.Notebook/` folder, a path under the configured notebooks root, or a Fabric display name. Markdown is skipped; `%%sql` cells run as Spark SQL; `%pip`/`!pip`/`%run` lines are reported, not run (install libraries via `uvx --with`). `cells` selects by index or range ("3", "0-4,7") for partial reruns. `parameters` override the PARAMETERS CELL like a pipeline run. The notebook's own default lakehouse (from its metadata) is used unless `default_lakehouse` overrides it. `notebookutils` / `mssparkutils` are available to cells."""
+        res = await state.call(
+            "run_notebook", path, cells, stop_on_error, default_lakehouse, parameters,
+            on_wait=_pinger(ctx, "running notebook"),
+        )
+        return format_notebook_result(res)
 
     @mcp.tool()
     async def shadow_status(ctx: Context) -> str:

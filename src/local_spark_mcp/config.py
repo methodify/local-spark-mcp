@@ -75,8 +75,17 @@ class RuntimeConfig:
 
 
 @dataclass
+class NotebooksConfig:
+    """Where the Fabric Git export lives; notebook.run() resolves names against
+    the .platform displayName under this root."""
+
+    root: str | None = None
+
+
+@dataclass
 class Config:
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
+    notebooks: NotebooksConfig = field(default_factory=NotebooksConfig)
     lakehouses: LakehouseConfig = field(default_factory=LakehouseConfig)
     spark: SparkConfig = field(default_factory=SparkConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -149,6 +158,7 @@ def _parse_file(path: Path) -> Config:
         raise ConfigError(f"Failed to parse {path}: {exc}") from exc
 
     ws = data.get("workspace", {})
+    nbs = data.get("notebooks", {})
     lh = data.get("lakehouses", {})
     spark = data.get("spark", {})
     runtime = data.get("runtime", {})
@@ -181,6 +191,7 @@ def _parse_file(path: Path) -> Config:
             name=_require_str(ws, "name", "workspace"),
             id=_require_str(ws, "id", "workspace"),
         ),
+        notebooks=NotebooksConfig(root=_require_str(nbs, "root", "notebooks")),
         lakehouses=LakehouseConfig(
             exclude=list(exclude),
             default=_require_str(lh, "default", "lakehouses"),
@@ -251,6 +262,9 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (root := env.get(f"{ENV_PREFIX}STATE_ROOT")) is not None:
         config.runtime.state_root = root
+
+    if (nb_root := env.get(f"{ENV_PREFIX}NOTEBOOKS_ROOT")) is not None:
+        config.notebooks.root = nb_root or None
 
 
 def load_config(path: Path | None = None, *, search_from: Path | None = None) -> Config:

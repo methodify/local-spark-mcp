@@ -38,6 +38,14 @@ def _handle(engine, method: str, params: dict):
         return engine.mount_table(params["lakehouse"], params["table"]), engine
     if method == "mount_tables":
         return engine.mount_tables(params["lakehouse"], params["tables"]), engine
+    if method == "run_notebook":
+        return engine.run_notebook(
+            params["path"],
+            cells=params.get("cells"),
+            stop_on_error=params.get("stop_on_error", True),
+            default_lakehouse=params.get("default_lakehouse"),
+            parameters=params.get("parameters"),
+        ), engine
     if method == "shadow_status":
         return engine.shadow_status(), engine
     if method == "discard_shadow":

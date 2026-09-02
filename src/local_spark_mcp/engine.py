@@ -89,8 +89,13 @@ class SparkEngine:
         write_mode: str = "sandbox",
         persist_shadow: bool = False,
         state_root: str | None = None,
+        notebooks_root: str | None = None,
     ):
         self.default_sql_limit = default_sql_limit
+        self.notebooks_root = notebooks_root
+        self._notebook_index: dict | None = None
+        self._cred = None
+        self._fabric_client = None
         self.write_mode = write_mode
         self.persist_shadow = persist_shadow
         self.default_lakehouse: str | None = None  # resolved in _register_lakehouses
@@ -156,6 +161,22 @@ class SparkEngine:
             }
         )
         self._install_delta_forname_bridge()
+        self._install_notebookutils()
+
+    def _install_notebookutils(self) -> None:
+        """Make ``import notebookutils`` / ``import mssparkutils`` resolve to the
+        local shim inside cells."""
+        import sys
+
+        from .notebookutils_shim import NotebookUtils
+
+        shim = NotebookUtils(_ShimEngine(self))
+        # Assign, don't setdefault: IPython's shell is a process-wide singleton,
+        # so a later engine in the same process must replace an earlier shim.
+        sys.modules["notebookutils"] = shim
+        sys.modules["mssparkutils"] = shim
+        self.shell.user_ns["notebookutils"] = shim
+        self.shell.user_ns["mssparkutils"] = shim
 
     def _install_delta_forname_bridge(self) -> None:
         """Bridge ``DeltaTable.forName`` to OneLakeCatalog.
@@ -282,8 +303,9 @@ class SparkEngine:
                     failed.append({"table": table, "error": error})
         return {"lakehouse": lakehouse, "mounted": mounted, "failed": failed}
 
-    def run_code(self, code: str) -> ExecResult:
-        """Run a cell of Python against the persistent namespace."""
+    def _exec(self, code: str) -> tuple[ExecResult, BaseException | None]:
+        """Run a cell; also return the raised exception (the runner needs to
+        recognize NotebookExit, which IPython otherwise reports as an error)."""
         from IPython.utils.capture import capture_output
 
         with capture_output() as cap:
@@ -309,7 +331,7 @@ class SparkEngine:
             if text:
                 stdout += text + "\n"
 
-        return ExecResult(
+        outcome = ExecResult(
             ok=bool(result.success),
             stdout=_truncate(stdout),
             stderr=_truncate(cap.stderr),
@@ -317,6 +339,213 @@ class SparkEngine:
             traceback=_truncate(tb) if tb else None,
             execution_count=self.shell.execution_count,
         )
+        return outcome, exc
+
+    def run_code(self, code: str) -> ExecResult:
+        """Run a cell of Python against the persistent namespace."""
+        return self._exec(code)[0]
+
+    # ---- notebook runner ----
+
+    def _resolve_notebook_path(self, path: str) -> Path:
+        p = Path(path).expanduser()
+        candidates = [p]
+        if self.notebooks_root and not p.is_absolute():
+            candidates.append(Path(self.notebooks_root).expanduser() / p)
+        for c in candidates:
+            if c.is_file():
+                return c
+            if c.is_dir() and (c / "notebook-content.py").is_file():
+                return c / "notebook-content.py"
+        # a Fabric display name under the notebooks root
+        if self.notebooks_root:
+            from .notebook import index_notebooks
+
+            if self._notebook_index is None or path not in self._notebook_index:
+                self._notebook_index = index_notebooks(self.notebooks_root)
+            if path in self._notebook_index:
+                return self._notebook_index[path]
+        raise FileNotFoundError(
+            f"notebook {path!r} not found (tried the path as given"
+            + (f", under notebooks root {self.notebooks_root!r}, and as a .platform displayName there" if self.notebooks_root else "; no notebooks root configured")
+            + ")"
+        )
+
+    def run_notebook(
+        self,
+        path: str,
+        cells=None,
+        stop_on_error: bool = True,
+        default_lakehouse: str | None = None,
+        parameters: dict | None = None,
+    ) -> dict:
+        """Run a Fabric notebook (Git .py format) cell by cell in this namespace."""
+        from .notebook import load_notebook, select_cells, strip_line_magics
+        from .notebookutils_shim import NotebookExit
+
+        nb_path = self._resolve_notebook_path(path)
+        nb = load_notebook(nb_path)
+        selected = select_cells(cells, len(nb.cells))
+        warnings = list(nb.warnings)
+
+        # Default lakehouse for this run: explicit arg, else the notebook's META.
+        lh_name = default_lakehouse or nb.default_lakehouse_name
+        prev_db = self.spark.catalog.currentDatabase()
+        effective_db = prev_db
+        switched = False
+        if lh_name and getattr(self, "lakehouses", None):
+            info = self._resolve_lakehouse(lh_name)
+            if info is None:
+                warnings.append(
+                    f"default lakehouse {lh_name!r} is not registered (excluded or not in the "
+                    f"workspace); running against {prev_db!r}"
+                )
+            else:
+                self.spark.sql(f"USE {self._q(info.name)}")
+                effective_db, switched = info.name, True
+        elif lh_name:
+            warnings.append(f"notebook names default lakehouse {lh_name!r} but no Fabric workspace is configured")
+
+        params = dict(parameters or {})
+        injected = not params
+        results: list[dict] = []
+        first_tb = None
+        first_error = None
+        exit_value = None
+        status = "ok"
+        try:
+            for cell in nb.cells:
+                if cell.index not in selected:
+                    continue
+                entry = {"index": cell.index, "kind": cell.kind, "language": cell.language, "line": cell.line}
+                if cell.kind == "markdown":
+                    entry["status"] = "skipped"
+                    results.append(entry)
+                    continue
+                # Parameters override the parameters cell (as a pipeline run does);
+                # with no parameters cell, inject before the first code cell.
+                if not injected and cell.kind != "parameters" and not nb.has_parameters_cell:
+                    self.shell.user_ns.update(params)
+                    injected = True
+                code, unsupported = strip_line_magics(cell)
+                if unsupported:
+                    entry["unsupported"] = unsupported
+                if cell.language == "sparksql":
+                    try:
+                        res = self.run_sql(code)
+                        entry["status"] = "ok"
+                        entry["stdout"] = _sql_preview(res)
+                    except Exception as exc:
+                        entry["status"] = "error"
+                        entry["error"] = f"{type(exc).__name__}: {exc}".splitlines()[0]
+                        first_error = first_error or entry["error"]
+                elif cell.language == "python":
+                    res, exc = self._exec(code)
+                    entry["stdout"] = res.stdout
+                    if isinstance(exc, NotebookExit):
+                        entry["status"] = "exited"
+                        exit_value = exc.value
+                        results.append(entry)
+                        break
+                    if res.ok:
+                        entry["status"] = "ok"
+                    else:
+                        entry["status"] = "error"
+                        entry["error"] = res.error
+                        first_error = first_error or res.error
+                        first_tb = first_tb or res.traceback
+                else:
+                    entry["status"] = "unsupported"
+                    entry["error"] = f"cell magic %%{cell.cell_magic} is not supported locally"
+                    first_error = first_error or entry["error"]
+                if cell.kind == "parameters" and not injected:
+                    self.shell.user_ns.update(params)
+                    injected = True
+                results.append(entry)
+                if entry["status"] in ("error", "unsupported") and stop_on_error:
+                    break
+        finally:
+            if switched:
+                self.spark.sql(f"USE {self._q(prev_db)}")
+        if any(r.get("status") in ("error", "unsupported") for r in results):
+            status = "error"
+        return {
+            "path": str(nb_path),
+            "status": status,
+            "default_lakehouse": effective_db if switched else None,
+            "cells_total": len(nb.cells),
+            "cells": results,
+            "first_error": first_error,
+            "first_traceback": first_tb,
+            "exit_value": exit_value,
+            "warnings": warnings,
+        }
+
+    # ---- helpers the notebookutils shim calls ----
+
+    def credential(self):
+        if self._cred is None:
+            from azure.identity import DefaultAzureCredential
+
+            self._cred = DefaultAzureCredential()
+        return self._cred
+
+    def workspace_id(self) -> str:
+        infos = list(getattr(self, "lakehouses", {}).values())
+        if not infos:
+            raise RuntimeError("no Fabric workspace configured (set [workspace] in local-spark.toml)")
+        return infos[0].workspace_id
+
+    def fabric_client(self):
+        if self._fabric_client is None:
+            from .discovery import FabricAPIClient
+
+            self._fabric_client = FabricAPIClient(credential=self.credential())
+        return self._fabric_client
+
+    def runtime_context(self) -> dict:
+        lh = self._resolve_lakehouse(self.default_lakehouse) if self.default_lakehouse else None
+        return {
+            "currentWorkspaceId": lh.workspace_id if lh else None,
+            "defaultLakehouseId": lh.id if lh else None,
+            "defaultLakehouseName": lh.name if lh else None,
+            "currentNotebookName": None,
+        }
+
+    def _onelake_fs(self, path: str):
+        """(file_system_client, relative path) for an abfss:// OneLake URL."""
+        from urllib.parse import urlparse
+
+        from azure.storage.filedatalake import DataLakeServiceClient
+
+        u = urlparse(path)
+        workspace = u.username or u.netloc.split("@")[0]
+        host = u.hostname
+        service = DataLakeServiceClient(f"https://{host}", credential=self.credential())
+        return service.get_file_system_client(workspace), u.path.lstrip("/")
+
+    def onelake_ls(self, path: str) -> list:
+        from .notebookutils_shim import FileInfo
+
+        fs, rel = self._onelake_fs(path)
+        base = path.rstrip("/")
+        return [
+            FileInfo(name=p.name.rsplit("/", 1)[-1], path=f"{base}/{p.name.rsplit('/', 1)[-1]}",
+                     size=p.content_length or 0, isDir=bool(p.is_directory))
+            for p in fs.get_paths(path=rel, recursive=False)
+        ]
+
+    def onelake_exists(self, path: str) -> bool:
+        fs, rel = self._onelake_fs(path)
+        try:
+            fs.get_file_client(rel).get_file_properties()
+            return True
+        except Exception:
+            try:
+                fs.get_directory_client(rel).get_directory_properties()
+                return True
+            except Exception:
+                return False
 
     # "[TABLE_OR_VIEW_NOT_FOUND] ... `db`.`table` cannot be found"
     _MISSING_TABLE_RE = re.compile(r"`([^`]+)`\.`([^`]+)`")
@@ -441,6 +670,44 @@ class SparkEngine:
             pass
         # Session-scoped state (warehouse + non-persistent shadow) goes with the session.
         shutil.rmtree(self._session_dir, ignore_errors=True)
+
+
+class _ShimEngine:
+    """The narrow surface the notebookutils shim needs from the engine."""
+
+    def __init__(self, engine: "SparkEngine"):
+        self._e = engine
+
+    def run_notebook(self, path, **kw):
+        return self._e.run_notebook(path, **kw)
+
+    def credential(self):
+        return self._e.credential()
+
+    def workspace_id(self):
+        return self._e.workspace_id()
+
+    def fabric_client(self):
+        return self._e.fabric_client()
+
+    def runtime_context(self):
+        return self._e.runtime_context()
+
+    def onelake_ls(self, path):
+        return self._e.onelake_ls(path)
+
+    def onelake_exists(self, path):
+        return self._e.onelake_exists(path)
+
+
+def _sql_preview(res: "SqlResult", max_rows: int = 20) -> str:
+    """Compact text for a %%sql cell's result."""
+    if not res.columns:
+        return "(statement executed)"
+    head = " | ".join(res.columns)
+    rows = [" | ".join("NULL" if v is None else str(v) for v in r) for r in res.rows[:max_rows]]
+    tail = f"[{res.row_count} row(s){'; truncated' if res.truncated else ''}]"
+    return "\n".join([head, *rows, tail])
 
 
 def _purge_stale_sessions(sessions_dir: Path, max_age_days: int = 7) -> None:

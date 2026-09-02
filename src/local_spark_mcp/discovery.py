@@ -110,6 +110,62 @@ class FabricAPIClient:
             for it in items
         ]
 
+    def list_items(self, workspace_id: str, item_type: str) -> list[dict]:
+        client = self._http()
+        try:
+            resp = client.get(
+                f"{self.base_url}/workspaces/{workspace_id}/items",
+                headers={"Authorization": f"Bearer {self._token_value()}"},
+                params={"type": item_type},
+            )
+        finally:
+            if self._client is None:
+                client.close()
+        if resp.status_code != 200:
+            raise FabricAPIError(f"list items -> {resp.status_code}: {resp.text[:300]}")
+        return resp.json().get("value", [])
+
+    def get_item_definition_parts(self, workspace_id: str, item_id: str, *, timeout: float = 120.0) -> dict:
+        """POST .../getDefinition (a long-running operation), then decode each
+        base64 part; JSON parts are parsed. Returns {part_path: content}."""
+        import base64
+        import json
+        import time
+
+        headers = {"Authorization": f"Bearer {self._token_value()}"}
+        client = self._http()
+        try:
+            resp = client.post(f"{self.base_url}/workspaces/{workspace_id}/items/{item_id}/getDefinition", headers=headers)
+            if resp.status_code == 202:
+                location = resp.headers.get("Location")
+                deadline = time.monotonic() + timeout
+                while True:
+                    time.sleep(float(resp.headers.get("Retry-After", 2)))
+                    status = client.get(location, headers=headers).json().get("status")
+                    if status == "Succeeded":
+                        break
+                    if status == "Failed" or time.monotonic() > deadline:
+                        raise FabricAPIError(f"getDefinition for {item_id} {status or 'timed out'}")
+                body = client.get(f"{location}/result", headers=headers).json()
+            elif resp.status_code == 200:
+                body = resp.json()
+            else:
+                raise FabricAPIError(f"getDefinition -> {resp.status_code}: {resp.text[:300]}")
+        finally:
+            if self._client is None:
+                client.close()
+        parts = {}
+        for part in body.get("definition", {}).get("parts", []):
+            raw = base64.b64decode(part.get("payload", "")).decode("utf-8", errors="replace")
+            if part["path"].endswith(".json") or part["path"] == ".platform":
+                try:
+                    parts[part["path"]] = json.loads(raw)
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            parts[part["path"]] = raw
+        return parts
+
     def list_tables(self, workspace_id: str, lakehouse_id: str) -> list[str]:
         items = self._get_pages(
             f"/workspaces/{workspace_id}/lakehouses/{lakehouse_id}/tables", "data"
