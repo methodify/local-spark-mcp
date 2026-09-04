@@ -7,7 +7,9 @@ blocking worker IPC runs in a thread so the asyncio event loop stays responsive.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -114,16 +116,42 @@ class ServerState:
         return bool(self.config.workspace.name or self.config.workspace.id)
 
     def _resolve_jar(self) -> str:
-        from .fabric import default_jar_path
+        from .fabric import default_jar_path, validate_jar
 
-        jar = self.config.runtime.token_jar_path or default_jar_path()
-        if not jar or not Path(jar).is_file():
+        configured = self.config.runtime.token_jar_path
+        jar = configured or default_jar_path()
+        origin = self.config.origin("runtime.token_jar_path") if configured else "bundled with the package"
+        if not jar:
             raise ConfigError(
-                "OneLake token provider jar not found. Build it "
-                "(cd token-provider && sbt package) or set runtime.token_jar_path "
-                "in local-spark.toml."
+                "OneLake token/catalog jar not found. Rebuild the package (scripts/build_jar.sh) "
+                "or set runtime.token_jar_path in local-spark.toml (LOCAL_SPARK_TOKEN_JAR_PATH)."
             )
+        try:
+            validate_jar(jar, origin=origin)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ConfigError(str(exc)) from exc
         return jar
+
+    def validate_runtime(self) -> dict:
+        """Fail fast, in the server, on the values the worker would otherwise
+        choke on 90 seconds later: JDK, jar, winutils. Errors name the origin of
+        the offending value. Returns what resolved."""
+        from .hadoop import HadoopNotFoundError, resolve_hadoop_home
+        from .java import JavaNotFoundError, resolve_java_home
+
+        rt = self.config.runtime
+        resolved = {}
+        try:
+            resolved["java_home"] = resolve_java_home(rt.java_home, origin=self.config.origin("runtime.java_home"))
+        except JavaNotFoundError as exc:
+            raise ConfigError(str(exc)) from exc
+        try:
+            resolved["hadoop_home"] = resolve_hadoop_home(rt.hadoop_home)
+        except HadoopNotFoundError as exc:
+            raise ConfigError(f"{exc} [runtime.hadoop_home from {self.config.origin('runtime.hadoop_home')}]") from exc
+        if self._fabric_enabled():
+            resolved["jar"] = self._resolve_jar()
+        return resolved
 
     def _discover(self) -> None:
         """Resolve the workspace and list its (non-excluded) lakehouses (REST)."""
@@ -176,8 +204,8 @@ class ServerState:
 
     async def _do_start(self) -> None:
         """The actual (slow) startup: discovery + token server + Spark worker."""
+        self.validate_runtime()  # fail fast, naming the origin of a bad value
         if self._fabric_enabled():
-            self._resolve_jar()  # fail fast on a missing jar
             await self._ensure_discovered()
             if self._token_server is None:
                 from .token_server import TokenServer
@@ -589,8 +617,37 @@ def build_server(state: ServerState | None = None) -> FastMCP:
     return mcp
 
 
-def main() -> None:
-    state = ServerState()
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="local-spark-mcp", description="MCP server: a stateful local Spark session for Fabric notebooks.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--config", metavar="PATH", help="read this local-spark.toml (env: LOCAL_SPARK_CONFIG=PATH)")
+    group.add_argument("--no-config", action="store_true", help="read no config file; LOCAL_SPARK_* only (env: LOCAL_SPARK_CONFIG=none)")
+    parser.add_argument("--version", action="version", version=f"local-spark-mcp {__version__}")
+    return parser.parse_args(argv)
+
+
+def log_startup(config: Config) -> None:
+    """What a maintainer reads when 'the doctor was green and the server is dead'."""
+    print(f"local-spark-mcp {__version__} (python {sys.version.split()[0]})", file=sys.stderr)
+    for line in config.describe_sources():
+        print(f"  {line}", file=sys.stderr)
+    rt = config.runtime
+    for key, value in (("runtime.java_home", rt.java_home), ("runtime.token_jar_path", rt.token_jar_path), ("runtime.hadoop_home", rt.hadoop_home)):
+        if value:
+            print(f"  {key} = {value}  [{config.origin(key)}]", file=sys.stderr)
+    ws = config.workspace
+    print(f"  workspace: {ws.name or ws.id or '(none — local-only mode)'}  write_mode={rt.write_mode}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    try:
+        config = load_config(Path(args.config) if args.config else None, no_config=args.no_config)
+    except ConfigError as exc:
+        print(f"local-spark-mcp: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    log_startup(config)
+    state = ServerState(config)
     mcp = build_server(state)
     try:
         mcp.run(transport="stdio")

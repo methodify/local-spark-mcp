@@ -8,6 +8,7 @@ covers the OneLake auth wiring only.)
 from __future__ import annotations
 
 import glob
+import zipfile
 from pathlib import Path
 
 # Spark 3.5.0 bundles Hadoop 3.3.4; match hadoop-azure to it (3.3.6 collides with
@@ -17,6 +18,8 @@ from pathlib import Path
 #   abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}
 HADOOP_AZURE_PACKAGE = "org.apache.hadoop:hadoop-azure:3.3.4"
 PROVIDER_CLASS = "ch.fs.HttpTokenProvider"
+CATALOG_CLASS = "ch.fs.OneLakeCatalog"
+REQUIRED_CLASSES = (PROVIDER_CLASS, CATALOG_CLASS)
 _JAR_GLOB = "token-provider/target/scala-2.12/*.jar"
 
 
@@ -67,3 +70,24 @@ def onelake_spark_configs(*, endpoint: str, secret: str, jar_path: str) -> dict[
         "spark.hadoop.fs.azure.tokenprovider.endpoint": endpoint,
         "spark.hadoop.fs.azure.tokenprovider.secret": secret,
     }
+
+
+def validate_jar(jar_path: str, *, origin: str = "") -> None:
+    """Fail fast if the jar is missing, unreadable, or lacks a class this version
+    needs — instead of Spark reporting ClassNotFound on the first query."""
+    src = f" (from {origin})" if origin else ""
+    path = Path(jar_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"token/catalog jar not found{src}: {jar_path}")
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"jar{src} is not a valid jar/zip: {jar_path} ({exc})") from exc
+    missing = [c for c in REQUIRED_CLASSES if c.replace(".", "/") + ".class" not in names]
+    if missing:
+        raise ValueError(
+            f"jar{src} at {jar_path} is missing {', '.join(missing)}; this version of "
+            f"local-spark-mcp needs the bundled localsparkjars jar (or a fresh scripts/build_jar.sh build). "
+            "Remove runtime.token_jar_path / LOCAL_SPARK_TOKEN_JAR_PATH to use the bundled one."
+        )

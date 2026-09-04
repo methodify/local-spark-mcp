@@ -1,6 +1,8 @@
 # local-spark-mcp configuration.
 # Copy to `local-spark.toml` in your project working directory and edit.
 # Every setting can be overridden by a LOCAL_SPARK_* environment variable.
+# LOCAL_SPARK_CONFIG=<path> reads a specific file; LOCAL_SPARK_CONFIG=none (or
+# `local-spark-mcp --no-config`) reads no file and uses LOCAL_SPARK_* only.
 # Nothing here is secret — auth is ambient via `az login` / DefaultAzureCredential.
 
 [workspace]

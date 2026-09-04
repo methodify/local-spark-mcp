@@ -14,6 +14,16 @@ from local_spark_mcp.discovery import LakehouseInfo
 from local_spark_mcp.server import ServerState, format_mount
 
 
+
+def _fake_jar(path):
+    """A jar that passes validate_jar: both classes present."""
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as zf:
+        for c in ("ch/fs/HttpTokenProvider.class", "ch/fs/OneLakeCatalog.class"):
+            zf.writestr(c, b"\xca\xfe\xba\xbe")
+    return path
+
 def test_onelake_configs_shape():
     cfg = fabric.onelake_spark_configs(
         endpoint="http://127.0.0.1:5/token", secret="s3cr3t", jar_path="/x/y.jar"
@@ -56,8 +66,7 @@ def test_resolve_jar_uses_override_and_validates(tmp_path):
     with pytest.raises(ConfigError):
         state._resolve_jar()
 
-    jar = tmp_path / "present.jar"
-    jar.write_text("")
+    jar = _fake_jar(tmp_path / "present.jar")
     ok = ServerState(
         config=Config(
             workspace=WorkspaceConfig(name="W"),
@@ -100,8 +109,7 @@ def test_discover_applies_exclude():
 
 
 def test_engine_kwargs_include_lakehouses_in_fabric_mode(tmp_path):
-    jar = tmp_path / "p.jar"
-    jar.write_text("")
+    jar = _fake_jar(tmp_path / "p.jar")
     state = _fabric_state(client=_FakeClient(["customer"]))
     state.config.runtime.token_jar_path = str(jar)
     state._discover()

@@ -15,6 +15,8 @@ from pathlib import Path
 
 CONFIG_FILENAME = "local-spark.toml"
 ENV_PREFIX = "LOCAL_SPARK_"
+CONFIG_ENV = f"{ENV_PREFIX}CONFIG"  # path to the file, or "none" / "" to skip the search
+NO_CONFIG = "none"
 WRITE_MODES = ("sandbox", "readonly", "writethrough")
 
 
@@ -101,6 +103,23 @@ class Config:
     spark: SparkConfig = field(default_factory=SparkConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     source_path: Path | None = None
+    # dotted key ("runtime.java_home") -> where its value came from: the file
+    # path or the LOCAL_SPARK_* variable. Absent = built-in default.
+    origins: dict[str, str] = field(default_factory=dict)
+    # how the file (or no file) was chosen, for the startup log
+    file_note: str = ""
+
+    def origin(self, key: str) -> str:
+        return self.origins.get(key, "not from a config file or LOCAL_SPARK_* variable")
+
+    def describe_sources(self) -> list[str]:
+        """One line per source, for stderr at startup: which file was read (or
+        why none), then each LOCAL_SPARK_* override that applied."""
+        lines = [f"config file: {self.source_path}" if self.source_path else f"config file: none ({self.file_note})"]
+        for key, origin in self.origins.items():
+            if origin.startswith(ENV_PREFIX):
+                lines.append(f"env override: {origin} -> {key}")
+        return lines
 
     def validate(self) -> None:
         ws = self.workspace
@@ -109,14 +128,17 @@ class Config:
         # require_workspace() when it actually needs to connect.
         if ws.name and ws.id:
             raise ConfigError(
-                "Set only one of workspace.name or workspace.id, not both."
+                "Set only one of workspace.name or workspace.id, not both "
+                f"[name from {self.origin('workspace.name')}; id from {self.origin('workspace.id')}]."
             )
         if self.runtime.default_sql_limit <= 0:
-            raise ConfigError("runtime.default_sql_limit must be a positive integer.")
+            raise ConfigError(
+                f"runtime.default_sql_limit must be a positive integer [from {self.origin('runtime.default_sql_limit')}]."
+            )
         if self.runtime.write_mode not in WRITE_MODES:
             raise ConfigError(
                 f"runtime.write_mode must be one of {', '.join(WRITE_MODES)} "
-                f"(got {self.runtime.write_mode!r})."
+                f"(got {self.runtime.write_mode!r}) [from {self.origin('runtime.write_mode')}]."
             )
 
     def require_workspace(self) -> WorkspaceConfig:
@@ -229,12 +251,19 @@ def _parse_file(path: Path) -> Config:
         ),
         source_path=path,
     )
+    src = f"{CONFIG_FILENAME} at {path}"
+    for section, table in (("workspace", ws), ("notebooks", nbs), ("files", files), ("lakehouses", lh), ("spark", spark), ("runtime", runtime)):
+        for key in table:
+            config.origins[f"{section}.{key}"] = src
     return config
 
 
 def _apply_env_overrides(config: Config) -> None:
     """Apply LOCAL_SPARK_* environment overrides in place."""
     env = os.environ
+    for var, key in _ENV_KEYS.items():
+        if env.get(var) is not None:
+            config.origins[key] = var
 
     if (name := env.get(f"{ENV_PREFIX}WORKSPACE_NAME")) is not None:
         config.workspace.name = name
@@ -289,23 +318,63 @@ def _apply_env_overrides(config: Config) -> None:
         config.files.mirror_root = mirror or None
 
 
-def load_config(path: Path | None = None, *, search_from: Path | None = None) -> Config:
+_ENV_KEYS = {
+    f"{ENV_PREFIX}WORKSPACE_NAME": "workspace.name",
+    f"{ENV_PREFIX}WORKSPACE_ID": "workspace.id",
+    f"{ENV_PREFIX}LAKEHOUSE_EXCLUDE": "lakehouses.exclude",
+    f"{ENV_PREFIX}DEFAULT_LAKEHOUSE": "lakehouses.default",
+    f"{ENV_PREFIX}DRIVER_MEMORY": "spark.driver_memory",
+    f"{ENV_PREFIX}SQL_LIMIT": "runtime.default_sql_limit",
+    f"{ENV_PREFIX}JAVA_HOME": "runtime.java_home",
+    f"{ENV_PREFIX}TOKEN_JAR_PATH": "runtime.token_jar_path",
+    f"{ENV_PREFIX}HADOOP_HOME": "runtime.hadoop_home",
+    f"{ENV_PREFIX}WARM_ON_START": "runtime.warm_on_start",
+    f"{ENV_PREFIX}WRITE_MODE": "runtime.write_mode",
+    f"{ENV_PREFIX}PERSIST_SHADOW": "runtime.persist_shadow",
+    f"{ENV_PREFIX}STATE_ROOT": "runtime.state_root",
+    f"{ENV_PREFIX}NOTEBOOKS_ROOT": "notebooks.root",
+    f"{ENV_PREFIX}FILES_SYNC": "files.sync",
+    f"{ENV_PREFIX}MIRROR_ROOT": "files.mirror_root",
+}
+
+
+def load_config(
+    path: Path | None = None,
+    *,
+    search_from: Path | None = None,
+    no_config: bool = False,
+) -> Config:
     """Load configuration.
 
     Resolution order:
-      1. If ``path`` is given, parse that file (must exist).
-      2. Else search up from ``search_from`` (or cwd) for ``local-spark.toml``.
-      3. Else start from defaults (env vars must then supply the workspace).
+      1. If ``path`` is given (or ``LOCAL_SPARK_CONFIG`` names a file), parse
+         that file (must exist).
+      2. If ``no_config`` (or ``LOCAL_SPARK_CONFIG`` is ``none``/empty), read no
+         file: defaults + env only.
+      3. Else search up from ``search_from`` (or cwd) for ``local-spark.toml``.
+      4. Else start from defaults (env vars must then supply the workspace).
     Environment overrides are applied last, then the result is validated.
     """
+    env_cfg = os.environ.get(CONFIG_ENV)
+    note = ""
+    if path is None and not no_config and env_cfg is not None:
+        if env_cfg.strip().lower() in (NO_CONFIG, ""):
+            no_config, note = True, f"{CONFIG_ENV}={env_cfg!r}"
+        else:
+            path, note = Path(env_cfg).expanduser(), f"from {CONFIG_ENV}"
     if path is not None:
         path = Path(path)
         if not path.is_file():
-            raise ConfigError(f"Config file not found: {path}")
+            raise ConfigError(f"Config file not found: {path}" + (f" ({note})" if note else ""))
         config = _parse_file(path)
+        config.file_note = note
+    elif no_config:
+        config = Config(file_note=note or "--no-config")
     else:
         found = find_config_file(search_from)
-        config = _parse_file(found) if found else Config()
+        config = _parse_file(found) if found else Config(
+            file_note=f"none found in or above {(search_from or Path.cwd()).resolve()}"
+        )
 
     _apply_env_overrides(config)
     config.validate()

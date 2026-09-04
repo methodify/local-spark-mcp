@@ -125,6 +125,20 @@ convenient in the MCP `env` block above when you don't want a file. With no
 workspace configured the server runs local-only (no Fabric). Auth is ambient via
 `az login`, so nothing in the config is secret.
 
+To control which file is read, set `LOCAL_SPARK_CONFIG` to a path, or to `none`
+to read no file at all (environment only). The console script accepts the same
+as `--config PATH` / `--no-config`. At startup the server logs to stderr which
+file it read (or why none), every `LOCAL_SPARK_*` override that applied, and the
+origin of `java_home` / `token_jar_path` / `hadoop_home`; a value that fails
+validation is reported with its origin, and the jar is checked for the classes
+this version needs before Spark starts.
+
+Java discovery, when `java_home` is not set: a vfox-managed JDK 17/11, then
+`JAVA_HOME`, then `java` on `PATH`. Every candidate is resolved through
+symlinks and junctions, a path to `bin/java` is normalized to its home, and a
+JDK whose `release` file says anything other than 8, 11, or 17 is skipped. The
+error lists each candidate and why it was rejected.
+
 ## License
 
 Apache License 2.0. See `LICENSE`, and `NOTICE` for the bundled third-party

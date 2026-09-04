@@ -1,6 +1,6 @@
 [project]
 name = "local-spark-mcp"
-version = "0.2.3"
+version = "0.2.4"
 description = "MCP server giving an agent a stateful local Spark session for prototyping PySpark notebooks targeting Microsoft Fabric"
 readme = "README.md"
 license = "Apache-2.0"

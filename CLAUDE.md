@@ -83,6 +83,11 @@ server's **stderr**; stdout is reserved for the MCP transport.
 
 - `config.py` — `local-spark.toml` schema + loader (file discovery, `LOCAL_SPARK_*`
   env overrides, validation). Workspace is optional until the Fabric layer needs it.
+  `LOCAL_SPARK_CONFIG=<path>|none` (CLI `--config` / `--no-config`) selects or
+  skips the file. Every value records its origin (`Config.origins`, file path or
+  env var); validation errors and `server.validate_runtime()` (JDK, jar classes,
+  winutils — checked in the server before the worker spawns) name it, and
+  `describe_sources()` is logged to stderr at launch.
   `[spark.env]` sets env vars on BOTH the driver process and Spark Python workers
   (`spark.executorEnv.*`) — for native-lib data dirs / PYTHONPATH so distributed
   (mapPartitions/UDF) code can import + init the same libs as the driver. Worker/
@@ -90,9 +95,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
   lib pip-installed into the server's env is importable on both; `[spark.env]`
   covers the data dirs / path. A driver-only runtime `sys.path` change does NOT
   reach workers — install into the env or use PYTHONPATH instead.
-- `java.py` — resolve a Spark-compatible `JAVA_HOME` (prefers vfox Java 17).
-  Accepts `bin/java` **or** `bin/java.exe` — checking only the POSIX name
-  rejected every valid JDK on Windows.
+- `java.py` — resolve a Spark-compatible `JAVA_HOME`: explicit → vfox Java
+  17/11 → `JAVA_HOME` → `java` on PATH. Every candidate is `realpath`'d (vfox
+  `current` junction, `/usr/lib/jvm/default`), a `bin/java[.exe]` path is
+  normalized to its home, and the `release` file's major must be 8/11/17 (system
+  Java 21 is rejected with the reason). The error lists each candidate and its
+  source. Accepts `bin/java` **or** `bin/java.exe`.
 - `hadoop.py` — Windows only: resolve a HADOOP_HOME with `bin/winutils.exe`.
   Spark 3.5 **cannot start** on Windows without it (`Shell.<clinit>` throws
   "HADOOP_HOME and hadoop.home.dir are unset"). Order: `runtime.hadoop_home`
@@ -138,7 +146,11 @@ server's **stderr**; stdout is reserved for the MCP transport.
   test) as `serverInfo.version` instead of the mcp SDK's.
 - `token_server.py` — loopback OneLake token endpoint (DefaultAzureCredential,
   secret-guarded); owned by the server, outlives worker restarts.
-- `fabric.py` — token-provider jar discovery + OneLake Spark config builder.
+- `fabric.py` — token-provider jar discovery + OneLake Spark config builder +
+  `validate_jar` (opens the zip; both `ch.fs.HttpTokenProvider` and
+  `ch.fs.OneLakeCatalog` must be present, else a message naming the jar, its
+  origin, and the missing class — a stale 0.1 jar in a project file caused a
+  ClassNotFound on the first query otherwise).
 - `discovery.py` — `FabricAPIClient` (REST: resolve workspace, list lakehouses /
   tables, paging; `list_items` + `get_item_definition_parts` with LRO polling,
   used for Variable Libraries) + `LakehouseInfo` (GUID abfss path builder).
