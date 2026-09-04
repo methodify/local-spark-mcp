@@ -36,6 +36,8 @@ def _handle(engine, method: str, params: dict):
         return engine.run_sql(params["sql"], params.get("limit")).to_dict(), engine
     if method == "mount_table":
         return engine.mount_table(params["lakehouse"], params["table"]), engine
+    if method == "table_features":
+        return engine.table_features(params["lakehouse"], params["tables"]), engine
     if method == "mount_tables":
         return engine.mount_tables(params["lakehouse"], params["tables"]), engine
     if method == "run_notebook":

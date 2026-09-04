@@ -266,6 +266,13 @@ class ServerState:
             on_wait,
         )
 
+    async def table_features(self, lakehouse: str, tables: list[str], on_wait=None) -> dict:
+        await self.ensure_ready(on_wait=on_wait)
+        async with self.lock:
+            return await _await_with_progress(
+                asyncio.to_thread(self._worker.table_features, lakehouse, tables), on_wait
+            )
+
     async def mount(self, lakehouse: str, tables: list[str] | None, on_wait=None) -> dict:
         await self.ensure_ready(on_wait=on_wait)
         async with self.lock:
@@ -366,6 +373,8 @@ def format_info(info: dict) -> str:
         lines.append(f"  write_mode: {info.get('write_mode')}")
         shadows = info.get("shadows") or []
         lines.append(f"  shadowed tables ({len(shadows)}): {', '.join(shadows) if shadows else '(none)'}")
+        if dv := info.get("deletion_vector_tables"):
+            lines.append(f"  deletion-vector tables, read-only here ({len(dv)}): {', '.join(dv)}")
         link = info.get("files_link")
         if link:
             state = f"-> {link['path']}" if link.get("linked") else f"NOT linked: {link.get('reason')}"
@@ -422,6 +431,21 @@ def format_shadow(res: dict) -> str:
     lines += [f"  {t['lakehouse']}.{t['table']}  [{t.get('state', '?')}, v{t.get('version', '?')}]  -> {t['path']}" for t in tables] or ["  (none)"]
     if tables:
         lines.append("  read = materialized by a read only (a shallow clone; nothing changed); written = has local writes")
+    dv = res.get("deletion_vector_tables") or []
+    if dv:
+        lines.append(f"deletion-vector tables ({len(dv)}; live read-only views, Delta 3.2 cannot shallow-clone them):")
+        lines += [f"  {t['lakehouse']}.{t['table']}" for t in dv]
+    return "\n".join(lines)
+
+
+def format_table_features(lakehouse: str, tables: list[str], feats: dict) -> str:
+    dv = [t for t in tables if (feats.get(t) or {}).get("deletion_vectors")]
+    lines = [f"{lakehouse} ({len(tables)} tables; {len(dv)} with deletion vectors -> read-only views in sandbox/readonly):"]
+    for t in tables:
+        f = feats.get(t) or {}
+        tag = "  [deletionVectors: read-only here]" if f.get("deletion_vectors") else ""
+        err = f"  (protocol unreadable: {f['error']})" if f.get("error") else ""
+        lines.append(f"  {t}{tag}{err}")
     return "\n".join(lines)
 
 
@@ -580,8 +604,8 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         return "Lakehouses (Spark databases):\n" + "\n".join(f"  {lh.name}" for lh in lhs)
 
     @mcp.tool()
-    async def list_tables(lakehouse: str, ctx: Context) -> str:
-        """List the Delta tables in a Fabric lakehouse (from the Fabric REST API). Any of them can be referenced by name right away; mounting is optional."""
+    async def list_tables(lakehouse: str, ctx: Context, features: bool = False) -> str:
+        """List the Delta tables in a Fabric lakehouse (from the Fabric REST API). Any of them can be referenced by name right away; mounting is optional. `features=True` also reads each table's Delta protocol (one log read per table; slow for hundreds) and flags tables with deletion vectors, which are read-only here in sandbox/readonly."""
         if note := _local_only_note():
             return note
         try:
@@ -590,7 +614,13 @@ def build_server(state: ServerState | None = None) -> FastMCP:
             return str(exc)
         if not tables:
             return f"{lakehouse}: no tables."
-        return f"{lakehouse} ({len(tables)} tables):\n" + "\n".join(f"  {t}" for t in tables)
+        if not features:
+            return f"{lakehouse} ({len(tables)} tables):\n" + "\n".join(f"  {t}" for t in tables)
+        try:
+            feats = await state.table_features(lakehouse, tables, on_wait=_pinger(ctx, "reading table protocols"))
+        except WorkerError as exc:
+            return f"list_tables failed reading protocols: {exc}"
+        return format_table_features(lakehouse, tables, feats)
 
     @mcp.tool()
     async def mount_table(lakehouse: str, table: str, ctx: Context) -> str:

@@ -66,6 +66,10 @@ default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPA
 #       are refused with a message naming this setting.
 #   writethrough: writes go to OneLake; new tables land under Tables/<name>.
 write_mode = "sandbox"
+# Deletion-vector tables (Link-to-Fabric mirrors) cannot be shallow-cloned by
+# Delta 3.2: they resolve as live read-only views in sandbox/readonly. Env
+# LOCAL_SPARK_DV_STRATEGY=view|clone overrides the automatic choice (clone
+# needs delta-spark >= 3.3 and a jar built against it).
 # persist_shadow = false  # keep shadows under <state_root>/lakehouses/<workspace-id>/
 #                         # across sessions (default: deleted with the session).
 #                         # env: LOCAL_SPARK_PERSIST_SHADOW

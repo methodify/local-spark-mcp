@@ -169,6 +169,9 @@ class WorkerProcess:
     def mount_table(self, lakehouse: str, table: str) -> dict:
         return self._call("mount_table", {"lakehouse": lakehouse, "table": table})
 
+    def table_features(self, lakehouse: str, tables: list[str]) -> dict:
+        return self._call("table_features", {"lakehouse": lakehouse, "tables": tables})
+
     def mount_tables(self, lakehouse: str, tables: list[str]) -> dict:
         return self._call("mount_tables", {"lakehouse": lakehouse, "tables": tables})
 

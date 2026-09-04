@@ -61,8 +61,8 @@ JAVA_HOME=<jdk17> scripts/build_jar.sh
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest -m '' tests/test_worker_integration.py tests/test_server_e2e.py tests/test_fabric_session_integration.py -v
 # JVM token-provider tests (needs built jar + Java):
 LOCAL_SPARK_RUN_JVM=1 .venv/bin/python -m pytest tests/test_token_provider_jvm.py -v
-# Live catalog + write-policy, notebookutils, and Files-mirror tests against a real workspace (az login; writes only to a sandbox shadow / the local mirror):
-LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py tests/test_notebookutils_live.py tests/test_files_mirror_live.py -v
+# Live catalog + write-policy, notebookutils, Files-mirror, and deletion-vector tests against a real workspace (az login; writes only to a sandbox shadow / the local mirror):
+LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py tests/test_notebookutils_live.py tests/test_files_mirror_live.py tests/test_deletion_vectors_live.py -v
 # Notebook runner (local Spark, synthetic notebooks) and the parser over the real Git export (skips if absent):
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_notebook_runner_integration.py tests/test_notebook_parser.py -v
 # Single test: append `::test_name`
@@ -120,6 +120,17 @@ server's **stderr**; stdout is reserved for the MCP transport.
   (Delta is a `StagingTableCatalog`, so CTAS/`saveAsTable` bypass `createTable`).
   A `ThreadLocal` reentrancy guard keeps the nested `CREATE TABLE` from
   re-entering the resolver. Only OneLake existence checks are cached.
+  **Deletion-vector tables** (Link-to-Fabric mirrors such as `dataverse_l2f`;
+  protocol feature `deletionVectors`): Delta 3.2 cannot SHALLOW CLONE them
+  (`DELTA_ADDING_DELETION_VECTORS_DISALLOWED`, and forcing the feature trips
+  the tightBounds check), so under `spark.localspark.dv_strategy=view` (the
+  default; Python picks it for delta-spark < 3.3) they become a live read-only
+  `VIEW` over the source path tagged `COMMENT 'localspark:deletion-vectors
+  source=…'`; `dv_strategy=clone` (delta-spark >= 3.3, validated live with a
+  jar built against 3.3.3) clones with `delta.enableDeletionVectors=true` and
+  gives the full sandbox. **The jar is compiled against a specific Delta
+  (`provided`) and is not binary-compatible across minors** — a Delta bump
+  means rebuilding and re-bundling it.
 - `engine.py` — `SparkEngine`: IPython `InteractiveShell` + injected `spark`/`sc`/
   `F`/`T`/`Window`. `run_code` (captured stdout + traceback), `run_sql`
   (rows + truncation), `info`. Owns per-session state under
@@ -130,6 +141,11 @@ server's **stderr**; stdout is reserved for the MCP transport.
   catalog, which bypasses V2 plugins; the bridge resolves through `spark.table`
   first, and refuses in readonly). `mount_table` forces catalog materialization;
   `mount_tables` runs them in a thread pool. `shadow_status` / `discard_shadow`.
+  Deletion-vector views: `_dv_tables()` finds them by the comment tag;
+  `run_sql` pre-checks SQL write targets (`_sql_write_target`) and the
+  `forName` bridge refuses with `dv_refusal()`; cell errors from writes against
+  such a view are annotated (`annotate_error`); `table_features()` reads
+  protocols per table for `list_tables(features=True)`.
   `run_notebook(path, cells, stop_on_error, default_lakehouse, parameters)`
   runs a parsed notebook cell by cell in the same namespace: markdown skipped,
   `%%sql` via `run_sql`, line magics stripped and reported, `USE` of the
@@ -213,6 +229,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   persistent namespace, with cell selection, parameters, and `notebookutils`.
 - **sync_files** — pull `Files/` subtrees into the mirror behind
   `/lakehouse/default/Files` (or push, in writethrough only).
+- **list_tables(features=True)** — per-table Delta protocol scan flagging
+  deletion-vector tables (read-only here on Delta 3.2).
 
 ## Locked design decisions
 

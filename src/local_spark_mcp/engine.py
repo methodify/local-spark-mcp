@@ -138,9 +138,11 @@ class SparkEngine:
                 except LookupError:
                     pass  # reported by _register_lakehouses
 
+        self.dv_strategy = _dv_strategy()
         catalog = None
         if onelake and lakehouses:
             catalog = {
+                "dv_strategy": self.dv_strategy,
                 "workspace_id": workspace_id,
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
@@ -248,6 +250,8 @@ class SparkEngine:
         def forName(cls, sparkSession, tableOrViewName):
             engine._refuse_if_readonly(tableOrViewName)
             sparkSession.table(tableOrViewName)
+            if engine.write_mode != "writethrough" and (dv := engine.is_dv_table(tableOrViewName)):
+                raise PermissionError(engine.dv_refusal(dv))
             return original(sparkSession, tableOrViewName)
 
         DeltaTable.forName = classmethod(forName)
@@ -352,6 +356,27 @@ class SparkEngine:
                     failed.append({"table": table, "error": error})
         return {"lakehouse": lakehouse, "mounted": mounted, "failed": failed}
 
+    def table_features(self, lakehouse: str, tables: list[str], workers: int = 8) -> dict:
+        """Delta protocol features per table, read from OneLake without
+        materializing anything: {table: {"features": [...], "deletion_vectors": bool,
+        "error": str|None}}. Opt-in (one Delta log read per table)."""
+        from delta.tables import DeltaTable
+
+        info = self._resolve_lakehouse(lakehouse)
+        if info is None:
+            raise LookupError(f"unknown lakehouse {lakehouse!r}")
+
+        def one(table: str):
+            try:
+                row = DeltaTable.forPath(self.spark, info.table_path(table)).detail().select("tableFeatures").first()
+                feats = sorted(row[0] or [])
+                return table, {"features": feats, "deletion_vectors": "deletionVectors" in feats, "error": None}
+            except Exception as exc:
+                return table, {"features": [], "deletion_vectors": None, "error": f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"}
+
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
+            return dict(pool.map(one, tables))
+
     def _exec(self, code: str) -> tuple[ExecResult, BaseException | None]:
         """Run a cell; also return the raised exception (the runner needs to
         recognize NotebookExit, which IPython otherwise reports as an error)."""
@@ -380,6 +405,12 @@ class SparkEngine:
             if text:
                 stdout += text + "\n"
 
+        if error:
+
+            stdout = self.annotate_error(stdout) or stdout
+
+            error = self.annotate_error(error) or error
+
         outcome = ExecResult(
             ok=bool(result.success),
             stdout=_truncate(stdout),
@@ -389,6 +420,24 @@ class SparkEngine:
             execution_count=self.shell.execution_count,
         )
         return outcome, exc
+
+    _VIEW_WRITE_MARKERS = ("EXPECT_TABLE_NOT_VIEW", "view", "not a Delta table", "DELTA_TABLE_NOT_FOUND",
+                           "DELTA_MISSING_DELTA_TABLE", "DELTA_UNSUPPORTED_SOURCE", "UNSUPPORTED_INSERT",
+                           "DELTA_MERGE_UNRESOLVED_EXPRESSION", "only supports Delta sources")
+
+    def annotate_error(self, text: str | None) -> str | None:
+        """Append the deletion-vector explanation when an error is a write against
+        one of the live views standing in for a deletion-vector table."""
+        if not text or not any(m in text for m in self._VIEW_WRITE_MARKERS):
+            return text
+        try:
+            dv = self._dv_tables()
+        except Exception:
+            return text
+        for t in dv:
+            if re.search(rf"\b{re.escape(t['table'])}\b", text, re.IGNORECASE):
+                return text.rstrip("\n") + "\n\nlocal-spark: " + self.dv_refusal(t)
+        return text
 
     def run_code(self, code: str) -> ExecResult:
         """Run a cell of Python against the persistent namespace."""
@@ -647,7 +696,16 @@ class SparkEngine:
         """Run a SQL statement and return up to ``limit`` rows."""
         if limit is None:
             limit = self.default_sql_limit
-        df = self._sql_with_automount(sql)
+        if self.write_mode != "writethrough" and (target := _sql_write_target(sql)):
+            if dv := self.is_dv_table(target):
+                raise RuntimeError(self.dv_refusal(dv))
+        try:
+            df = self._sql_with_automount(sql)
+        except Exception as exc:
+            annotated = self.annotate_error(str(exc))
+            if annotated != str(exc):
+                raise RuntimeError(annotated) from exc
+            raise
         columns = list(df.columns)
         # Pull one extra row to detect truncation without a full count.
         collected = df.limit(limit + 1).collect()
@@ -682,6 +740,8 @@ class SparkEngine:
             "write_mode": self.write_mode,
             "shadow_root": self.shadow_root.as_posix(),
             "shadows": [f"{t['lakehouse']}.{t['table']}" for t in self._shadow_tables()],
+            "deletion_vector_tables": [f"{t['lakehouse']}.{t['table']}" for t in self._dv_tables()],
+            "dv_strategy": self.dv_strategy,
             "files_root": (self.files_link or {}).get("files_root"),
             "files_link": self.files_link,
             "files_sync": self.files_sync_report,
@@ -712,12 +772,52 @@ class SparkEngine:
                     })
         return found
 
+    DV_VIEW_TAG = "localspark:deletion-vectors"
+
+    def _dv_tables(self) -> list[dict]:
+        """Lakehouse tables materialized as live views because their Delta
+        protocol declares deletionVectors (Delta 3.2 cannot shallow-clone them).
+        Read-only in sandbox/readonly; OneLakeCatalog tags the view's comment."""
+        found: list[dict] = []
+        for name in sorted(getattr(self, "lakehouses", {}) or {}):
+            try:
+                tables = self.spark.catalog.listTables(name)
+            except Exception:
+                continue
+            for t in tables:
+                desc = t.description or ""
+                if t.tableType == "VIEW" and desc.startswith(self.DV_VIEW_TAG):
+                    src = desc.split("source=", 1)[1] if "source=" in desc else ""
+                    found.append({"lakehouse": name, "table": t.name, "source": src})
+        return found
+
+    def is_dv_table(self, table_name: str) -> dict | None:
+        parts = [p.strip("`") for p in table_name.split(".")]
+        if len(parts) == 1 and self.default_lakehouse:
+            parts = [self.default_lakehouse, parts[0]]
+        if len(parts) != 2:
+            return None
+        for t in self._dv_tables():
+            if t["lakehouse"].lower() == parts[0].lower() and t["table"].lower() == parts[1].lower():
+                return t
+        return None
+
+    def dv_refusal(self, table: dict) -> str:
+        return (
+            f"{table['lakehouse']}.{table['table']} carries Delta deletion vectors (Link to Fabric "
+            "mirrors do), which Delta 3.2 cannot shallow-clone; it is registered as a live read-only "
+            f"view in write_mode '{self.write_mode}'. Reads work; writes are not supported locally. "
+            "Set LOCAL_SPARK_WRITE_MODE=writethrough to write to OneLake, or copy it: "
+            f"spark.table('{table['lakehouse']}.{table['table']}').write.saveAsTable('<lakehouse>.<new_name>')."
+        )
+
     def shadow_status(self) -> dict:
         return {
             "write_mode": self.write_mode,
             "shadow_root": self.shadow_root.as_posix(),
             "persistent": self.persist_shadow,
             "tables": self._shadow_tables(),
+            "deletion_vector_tables": self._dv_tables(),
         }
 
     def discard_shadow(self, only: str | None = None) -> dict:
@@ -781,6 +881,33 @@ class _ShimEngine:
 
     def files_mount(self, source, mount_point):
         return self._e.files_mount(source, mount_point)
+
+
+_WRITE_TARGET = re.compile(
+    r"^\s*(?:INSERT\s+(?:INTO|OVERWRITE)(?:\s+TABLE)?|MERGE\s+INTO|UPDATE|DELETE\s+FROM)\s+([`\w.]+)",
+    re.IGNORECASE,
+)
+
+
+def _sql_write_target(sql: str) -> str | None:
+    m = _WRITE_TARGET.match(sql)
+    return m.group(1) if m else None
+
+
+def _dv_strategy() -> str:
+    """How deletion-vector tables materialize in sandbox/readonly: Delta >= 3.3
+    can SHALLOW CLONE them (full sandbox, writes land locally); Delta 3.2 cannot,
+    so they become live read-only views. Override with LOCAL_SPARK_DV_STRATEGY."""
+    forced = os.environ.get("LOCAL_SPARK_DV_STRATEGY", "").strip().lower()
+    if forced in ("view", "clone"):
+        return forced
+    try:
+        from importlib.metadata import version
+
+        major, minor = (int(x) for x in version("delta-spark").split(".")[:2])
+        return "clone" if (major, minor) >= (3, 3) else "view"
+    except Exception:
+        return "view"
 
 
 def _shadow_state(table_dir: Path) -> tuple[str, int]:

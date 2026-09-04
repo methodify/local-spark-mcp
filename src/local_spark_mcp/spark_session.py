@@ -107,6 +107,7 @@ def build_spark(
         configs["spark.localspark.workspace_id"] = catalog["workspace_id"]
         configs["spark.localspark.write_mode"] = catalog["write_mode"]
         configs["spark.localspark.shadow_root"] = catalog["shadow_root"]
+        configs["spark.localspark.dv_strategy"] = catalog.get("dv_strategy", "view")
         for name, lakehouse_id in catalog["lakehouses"].items():
             configs[f"spark.localspark.lakehouse.{name}"] = lakehouse_id
     if warehouse_dir:

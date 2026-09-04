@@ -8,6 +8,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.connector.catalog.{Column, Identifier, StagedTable, Table}
 import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.catalog.DeltaCatalog
 import org.apache.spark.sql.types.StructType
 
@@ -40,6 +41,7 @@ import org.apache.spark.sql.types.StructType
  *   spark.localspark.write_mode          sandbox | readonly | writethrough
  *   spark.localspark.shadow_root         local dir for clones and new tables
  *   spark.localspark.onelake_host        default onelake.dfs.fabric.microsoft.com
+ *   spark.localspark.dv_strategy         view (default) | clone — deletion-vector tables
  */
 class OneLakeCatalog extends DeltaCatalog {
   import OneLakeCatalog._
@@ -47,6 +49,8 @@ class OneLakeCatalog extends DeltaCatalog {
   private def confOpt(key: String): Option[String] = spark.conf.getOption(key)
   private def writeMode: String = confOpt(WriteModeKey).getOrElse("sandbox").trim.toLowerCase
   private def host: String = confOpt(HostKey).getOrElse("onelake.dfs.fabric.microsoft.com")
+  /** "view" (default; Delta 3.2) or "clone" (Delta >= 3.3) for deletion-vector tables. */
+  private def dvStrategy: String = confOpt(DvStrategyKey).getOrElse("view").trim.toLowerCase
   private def workspaceId: Option[String] = confOpt(WorkspaceKey).filter(_.nonEmpty)
   private def shadowRoot: String = confOpt(ShadowRootKey).filter(_.nonEmpty).getOrElse(
     throw new IllegalStateException(s"$ShadowRootKey is not set")
@@ -93,6 +97,16 @@ class OneLakeCatalog extends DeltaCatalog {
   /** Shadows are keyed by lakehouse id, not name, so projects that touch the same lakehouse share them. */
   private def shadowPath(lakehouseId: String, table: String): String = s"$shadowRoot/$lakehouseId/$table"
 
+  /** True when the source table's protocol declares the deletionVectors feature.
+    * Delta 3.2 cannot SHALLOW CLONE such a table (the clone refuses the source's
+    * deletion vectors, and forcing them trips the tightBounds check), so those
+    * tables are materialized as live views instead — see materialize. */
+  private def hasDeletionVectors(src: String): Boolean =
+    try {
+      val protocol = DeltaLog.forTable(spark, new Path(src)).update().protocol
+      protocol.readerAndWriterFeatureNames.contains(DeletionVectorsFeature)
+    } catch { case _: Exception => false }
+
   /** Register the table in the session catalog according to the write policy. */
   private def materialize(ident: Identifier, ns: String, id: String, src: String): Unit = {
     val name = s"${quoted(ns)}.${quoted(ident.name())}"
@@ -104,6 +118,19 @@ class OneLakeCatalog extends DeltaCatalog {
         val shadow = shadowPath(id, ident.name())
         if (isDeltaDir(shadow)) {
           spark.sql(s"CREATE TABLE IF NOT EXISTS $name USING DELTA LOCATION '$shadow'")
+        } else if (hasDeletionVectors(src)) {
+          if (dvStrategy == "clone") {
+            // Delta >= 3.3 can shallow-clone a deletion-vector table when the
+            // clone enables the feature; the Python side picks this strategy.
+            spark.sql(s"CREATE TABLE $name SHALLOW CLONE delta.`$src` " +
+              "TBLPROPERTIES ('delta.enableDeletionVectors'='true') " +
+              s"LOCATION '$shadow'")
+          } else {
+            // Delta 3.2: live, read-only view. Reads go straight to OneLake; a
+            // write is refused by Spark (a view) and explained by the Python
+            // side, which finds these views by the comment tag.
+            spark.sql(s"CREATE VIEW IF NOT EXISTS $name COMMENT '$DvViewTag source=$src' AS SELECT * FROM delta.`$src`")
+          }
         } else {
           spark.sql(s"CREATE TABLE $name SHALLOW CLONE delta.`$src` LOCATION '$shadow'")
         }
@@ -194,6 +221,10 @@ class OneLakeCatalog extends DeltaCatalog {
 }
 
 object OneLakeCatalog {
+  val DeletionVectorsFeature = "deletionVectors"
+  val DvStrategyKey = "spark.localspark.dv_strategy"
+  /** Comment prefix on the view that stands in for a deletion-vector table. */
+  val DvViewTag = "localspark:deletion-vectors"
   val WorkspaceKey = "spark.localspark.workspace_id"
   val LakehousePrefix = "spark.localspark.lakehouse."
   val WriteModeKey = "spark.localspark.write_mode"
