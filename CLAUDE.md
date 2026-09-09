@@ -65,6 +65,8 @@ LOCAL_SPARK_RUN_JVM=1 .venv/bin/python -m pytest tests/test_token_provider_jvm.p
 LOCAL_SPARK_LIVE=1 LOCAL_SPARK_LIVE_WORKSPACE_ID=<guid> .venv/bin/python -m pytest tests/test_onelake_catalog_live.py tests/test_notebookutils_live.py tests/test_files_mirror_live.py tests/test_deletion_vectors_live.py -v
 # Notebook runner (local Spark, synthetic notebooks) and the parser over the real Git export (skips if absent):
 LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_notebook_runner_integration.py tests/test_notebook_parser.py -v
+# Correctness guard for joins over persisted frames (SPARK-45592; fails on pyspark 3.5.0):
+LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_cached_join_correctness.py -v
 # Single test: append `::test_name`
 
 # Manual engine smoke (no MCP, no Fabric)
@@ -371,9 +373,10 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
 
 - **Python 3.11 is pinned** (`>=3.11,<3.12`). It matches Fabric Runtime 1.3
   (Spark 3.5 / Delta 3.2 / Python 3.11), and pyspark 3.5.0's Python workers
-  **crash on Windows under 3.12** ("Python worker exited unexpectedly") — proven
-  with vanilla pyspark, so it is not our bug. Linux tolerates 3.12; Windows does
-  not. Don't raise this ceiling without re-testing Windows `mapPartitions`.
+  **crashed on Windows under 3.12** ("Python worker exited unexpectedly") —
+  proven with vanilla pyspark, so it is not our bug. Linux tolerates 3.12;
+  Windows did not on 3.5.0 (not re-tested on 3.5.9). Don't raise this ceiling
+  without re-testing Windows `mapPartitions`.
 - **The worker must not inherit the server's stdin** (`stdin=subprocess.DEVNULL`
   in `worker_client`). Under an MCP stdio server that handle is the client's
   pipe; inheriting it deadlocks the child during interpreter startup on Windows
@@ -404,9 +407,15 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
   "just works" portability.
 - **Build toolchain (for the token JAR):** `sbt` 1.9.8 and `scala` are
   installed via sdkman; `jq` is on PATH.
-- **Spark/Delta pinning:** match the Fabric runtime — reference uses
-  `pyspark==3.5.0`, `delta-spark==3.2.0`. Keep these pinned; mismatches break
-  Delta and Fabric parity.
+- **Spark/Delta pinning:** match the Fabric runtime. Fabric Runtime 1.3 is
+  actually Spark **3.5.5** (Microsoft build `3.5.5.5.4.…`) with Delta **3.2.1**
+  (see `microsoft/synapse-spark-runtime`, `Fabric/Runtime 1.3/Components.json`),
+  so we pin `pyspark==3.5.9` (latest 3.5.x; binary-compatible with the jar and
+  with `delta-spark==3.2.0`). **Never go back to 3.5.0:** it loses rows when
+  joining persisted frames under AQE (SPARK-45592 / SPARK-45282, fixed in
+  3.5.1; `tests/test_cached_join_correctness.py` guards it). delta-spark stays
+  3.2.0 (3.2.1 exists only as Microsoft's build; a Delta minor bump needs a jar
+  rebuild).
 - **Auth:** `DefaultAzureCredential` / `az login` (the `az` CLI is installed).
   See the token-provider chain above for how this reaches Spark's ABFS layer.
 - **`fab` CLI (ms-fabric-cli) 1.6.1 is installed.** It's a filesystem-shaped
@@ -427,6 +436,12 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
   installed into the namespace must be assigned, not `setdefault`ed, or a later
   engine keeps the earlier engine's objects (this bit the `notebookutils` shim).
 
+- **One JVM per test process.** `spark.jars.packages` (Delta, hadoop-azure)
+  are resolved when the JVM launches, so a pytest run that starts a local-mode
+  `SparkEngine` first and a Fabric-mode one afterwards in the same process
+  fails with "Cannot find catalog plugin class … OneLakeCatalog" (the catalog
+  can't link `DeltaCatalog`). Run local-mode and live suites as separate pytest
+  invocations. Production is unaffected: the worker is a fresh process.
 - Spark sessions are heavy and slow to start; the MCP server holds one alive
   across tool calls — that persistence is the whole product. Design startup,
   reset, and error recovery around a single long-lived session per server.
