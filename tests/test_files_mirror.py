@@ -182,3 +182,15 @@ def test_mount_registers_and_links(tmp_path):
     assert m.resolve(str(mp / "Files" / "q"), None) == m.mirror_dir("customer") / "q"
     with pytest.raises(LookupError):
         m.mount("abfss://ws@onelake.dfs.fabric.microsoft.com/unknown-id/Files", str(tmp_path / "mnt2"), None)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink semantics; the junction case is validated live on Windows")
+def test_dangling_default_link_is_replaced(tmp_path):
+    # the previous session's mirror dir is gone (temp cleanup); the stale link must be replaced, not reported as a conflict
+    m, _ = make(tmp_path)
+    (tmp_path / "lakehouse").mkdir()
+    link = tmp_path / "lakehouse" / "default"
+    link.symlink_to(tmp_path / "gone" / "lakehouse-dir")
+    rep = m.link_default("customer")
+    assert rep["linked"], rep
+    assert Path(os.path.realpath(link)) == m.mirror_dir("customer").parent.resolve()

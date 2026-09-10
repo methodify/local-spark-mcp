@@ -65,6 +65,11 @@ uvx --python 3.13 --from "local-spark-mcp[fabric-2.0] @ git+https://github.com/m
 The base package pins no Spark on purpose: an install without a profile extra
 fails at startup naming both extras.
 
+**Windows and `fabric-2.0`:** use `--python 3.11`. pyspark 4.1.1's Python
+workers crash on Windows under Python 3.12 and 3.13 (SPARK-53759, fixed in
+pyspark 4.1.2, which delta-spark 4.2.0 does not allow yet); startup refuses
+that combination with the same advice. Validated on Windows with Python 3.11.
+
 Runs on **Linux/WSL and Windows** (both validated end to end against live
 OneLake). Prerequisites on the host:
 

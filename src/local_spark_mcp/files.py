@@ -284,12 +284,15 @@ class FilesMirror:
         link = base_dir / "default"
         report["path"] = str(link)
         try:
-            if link.is_symlink() or (os.name == "nt" and link.exists() and _is_junction(link)):
-                if Path(os.path.realpath(link)) == target.resolve():
+            # A junction whose target was deleted (pytest temp cleanup, a purged
+            # session dir) still occupies the name: detect it by attributes, not
+            # by exists(), or mklink fails with "already exists".
+            if link.is_symlink() or (os.name == "nt" and _is_junction(link)):
+                if target.exists() and Path(os.path.realpath(link)) == target.resolve():
                     report["linked"] = True
                 else:
                     if os.name == "nt":
-                        os.rmdir(link)  # junctions are removed like directories
+                        os.rmdir(link)  # junctions (dangling or not) are removed like directories
                     else:
                         link.unlink()
             elif link.exists():
@@ -344,6 +347,8 @@ class FilesMirror:
             mp = Path(mount_point)
             if mp.is_symlink():
                 mp.unlink()
+            elif os.name == "nt" and _is_junction(mp):
+                os.rmdir(mp)
             if not mp.exists():
                 mp.parent.mkdir(parents=True, exist_ok=True)
                 if os.name == "nt":

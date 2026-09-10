@@ -55,3 +55,17 @@ def test_profile_config_and_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_SPARK_PROFILE", "Fabric-1.3")
     cfg = load_config(path)
     assert cfg.runtime.profile == "fabric-1.3" and cfg.origin("runtime.profile") == "LOCAL_SPARK_PROFILE"
+
+
+def test_windows_python_gate_for_spark_4():
+    v20 = {"pyspark": "4.1.1", "delta-spark": "4.2.0"}
+    _, _, errors = check_profile(None, versions=v20, python=(3, 13), windows=True)
+    assert errors and "SPARK-53759" in errors[0] and "--python 3.11" in errors[0]
+    _, _, errors = check_profile(None, versions=v20, python=(3, 12), windows=True)
+    assert errors
+    _, warnings, errors = check_profile(None, versions=v20, python=(3, 11), windows=True)
+    assert errors == [] and any("Python 3.11" in w for w in warnings)  # parity drift only
+    _, _, errors = check_profile(None, versions=v20, python=(3, 13), windows=False)
+    assert errors == []
+    _, _, errors = check_profile(None, versions={"pyspark": "3.5.9", "delta-spark": "3.2.0"}, python=(3, 13), windows=True)
+    assert errors == []  # 3.5.9 carries the fix

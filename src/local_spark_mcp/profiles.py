@@ -11,6 +11,7 @@ which Java majors, which Python the runtime uses.
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 
@@ -78,11 +79,26 @@ def detect_profile(versions: dict | None = None) -> Profile | None:
     return None
 
 
-def check_profile(declared: str | None, *, versions: dict | None = None, python=None) -> tuple[Profile, list[str], list[str]]:
+def _version_tuple(v: str | None) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in (v or "0").split(".")[:3])
+    except ValueError:
+        return (0,)
+
+
+# SPARK-53759: PySpark's Python workers crash on Windows under Python 3.12+
+# (WinError 10038 / "Python worker exited unexpectedly"). Fixed in pyspark
+# 3.5.9, 4.0.3, 4.1.2. delta-spark 4.2.0 pins pyspark <= 4.1.1, so on Windows
+# the fabric-2.0 profile needs Python 3.11 until Delta allows a newer pyspark.
+_WINDOWS_WORKER_FIX = {3: (3, 5, 9), 4: (4, 1, 2)}
+
+
+def check_profile(declared: str | None, *, versions: dict | None = None, python=None, windows: bool | None = None) -> tuple[Profile, list[str], list[str]]:
     """(profile, warnings, errors). Errors mean the installed stack cannot serve
     the declared profile; warnings are parity drift (patch versions, Python)."""
     versions = versions or installed_versions()
-    python = python or sys.version_info[:2]
+    python = tuple(python or sys.version_info[:2])
+    windows = os.name == "nt" if windows is None else windows
     warnings: list[str] = []
     errors: list[str] = []
     if declared is not None and declared not in PROFILES:
@@ -103,6 +119,16 @@ def check_profile(declared: str | None, *, versions: dict | None = None, python=
         )
         return detected, warnings, errors
     p = detected
+    spark_v = _version_tuple(versions.get("pyspark"))
+    fix = _WINDOWS_WORKER_FIX.get(p.spark_major)
+    if windows and python >= (3, 12) and fix and spark_v < fix:
+        errors.append(
+            f"pyspark {versions['pyspark']} Python workers crash on Windows under Python "
+            f"{python[0]}.{python[1]} (SPARK-53759; fixed in {'.'.join(map(str, fix))}, which the "
+            f"{p.name} Delta pin does not allow yet). Run this profile with Python 3.11 on Windows: "
+            "`uvx --python 3.11 ...`"
+        )
+        return p, warnings, errors
     if versions.get("pyspark") != p.pyspark:
         warnings.append(f"pyspark {versions['pyspark']} installed; {p.name} pins {p.pyspark}")
     if versions.get("delta-spark") != p.delta:

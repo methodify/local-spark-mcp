@@ -393,12 +393,15 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
 
 ## Cross-platform notes (Windows validated end to end)
 
-- **Python 3.11 is pinned** (`>=3.11,<3.12`). It matches Fabric Runtime 1.3
-  (Spark 3.5 / Delta 3.2 / Python 3.11), and pyspark 3.5.0's Python workers
-  **crashed on Windows under 3.12** ("Python worker exited unexpectedly") —
-  proven with vanilla pyspark, so it is not our bug. Linux tolerates 3.12;
-  Windows did not on 3.5.0 (not re-tested on 3.5.9). Don't raise this ceiling
-  without re-testing Windows `mapPartitions`.
+- **Python per profile, and a Windows gate.** `requires-python` is
+  `>=3.11,<3.14`; fabric-1.3 pairs with 3.11, fabric-2.0 with 3.13. PySpark's
+  Python workers **crash on Windows under Python 3.12+** (SPARK-53759, "Python
+  worker exited unexpectedly" / WinError 10038) unless pyspark is 3.5.9+,
+  4.0.3+, or 4.1.2+. fabric-1.3 (3.5.9) is fine on any Python; fabric-2.0 pins
+  pyspark 4.1.1 (delta-spark 4.2.0 allows nothing newer), so on Windows it must
+  run on **Python 3.11** — `check_profile` refuses 3.12+ on Windows with that
+  advice. Validated: Windows fabric-2.0 on 3.11 passes worker parity; 3.12 and
+  3.13 crash.
 - **The worker must not inherit the server's stdin** (`stdin=subprocess.DEVNULL`
   in `worker_client`). Under an MCP stdio server that handle is the client's
   pipe; inheriting it deadlocks the child during interpreter startup on Windows
