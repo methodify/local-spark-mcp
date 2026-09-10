@@ -134,10 +134,17 @@ def check_profile(declared: str | None, *, versions: dict | None = None, python=
     if versions.get("delta-spark") != p.delta:
         warnings.append(f"delta-spark {versions.get('delta-spark')} installed; {p.name} pins {p.delta}")
     if tuple(python) != p.python:
-        warnings.append(
-            f"Python {python[0]}.{python[1]} here; Fabric Runtime {p.fabric_runtime} uses "
-            f"{p.python[0]}.{p.python[1]} (works, but parity prefers `uvx --python {p.python[0]}.{p.python[1]}`)"
-        )
+        if windows and fix and spark_v < fix:
+            warnings.append(
+                f"Python {python[0]}.{python[1]} here; Fabric Runtime {p.fabric_runtime} uses "
+                f"{p.python[0]}.{p.python[1]}, but on Windows this profile needs 3.11 until pyspark "
+                f"{'.'.join(map(str, fix))} is allowed (SPARK-53759)"
+            )
+        else:
+            warnings.append(
+                f"Python {python[0]}.{python[1]} here; Fabric Runtime {p.fabric_runtime} uses "
+                f"{p.python[0]}.{p.python[1]} (works, but parity prefers `uvx --python {p.python[0]}.{p.python[1]}`)"
+            )
     return p, warnings, errors
 
 

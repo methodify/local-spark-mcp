@@ -23,14 +23,14 @@ def test_detect_by_spark_major():
 
 
 def test_check_profile_exact_match_is_silent():
-    p, warnings, errors = check_profile("fabric-2.0", versions={"pyspark": "4.1.1", "delta-spark": "4.2.0"}, python=(3, 13))
+    p, warnings, errors = check_profile("fabric-2.0", versions={"pyspark": "4.1.1", "delta-spark": "4.2.0"}, python=(3, 13), windows=False)
     assert p.name == "fabric-2.0" and warnings == [] and errors == []
 
 
 def test_check_profile_drift_warns_and_mismatch_errors():
-    _, warnings, errors = check_profile(None, versions={"pyspark": "3.5.7", "delta-spark": "3.2.0"}, python=(3, 12))
+    _, warnings, errors = check_profile(None, versions={"pyspark": "3.5.7", "delta-spark": "3.2.0"}, python=(3, 12), windows=False)
     assert errors == [] and any("pins 3.5.9" in w for w in warnings) and any("Python 3.12" in w for w in warnings)
-    _, _, errors = check_profile("fabric-2.0", versions={"pyspark": "3.5.9", "delta-spark": "3.2.0"}, python=(3, 11))
+    _, _, errors = check_profile("fabric-2.0", versions={"pyspark": "3.5.9", "delta-spark": "3.2.0"}, python=(3, 11), windows=False)
     assert errors and "install local-spark-mcp[fabric-2.0]" in errors[0]
     _, _, errors = check_profile(None, versions={"pyspark": None, "delta-spark": None})
     assert errors and "local-spark-mcp[fabric-1.3]" in errors[0]
@@ -64,7 +64,7 @@ def test_windows_python_gate_for_spark_4():
     _, _, errors = check_profile(None, versions=v20, python=(3, 12), windows=True)
     assert errors
     _, warnings, errors = check_profile(None, versions=v20, python=(3, 11), windows=True)
-    assert errors == [] and any("Python 3.11" in w for w in warnings)  # parity drift only
+    assert errors == [] and any("needs 3.11" in w for w in warnings)  # drift noted, with the Windows reason
     _, _, errors = check_profile(None, versions=v20, python=(3, 13), windows=False)
     assert errors == []
     _, _, errors = check_profile(None, versions={"pyspark": "3.5.9", "delta-spark": "3.2.0"}, python=(3, 13), windows=True)
