@@ -245,7 +245,10 @@ class SparkEngine:
         except ImportError:  # delta python API not installed — nothing to bridge
             return
         engine = self
-        original = DeltaTable.forName
+        # Wrap Delta's own forName, never a previous engine's bridge: the class is
+        # process-wide, and tests build several engines in one process.
+        original = getattr(DeltaTable, "_localspark_original_forName", None) or DeltaTable.forName
+        DeltaTable._localspark_original_forName = original
 
         def forName(cls, sparkSession, tableOrViewName):
             engine._refuse_if_readonly(tableOrViewName)

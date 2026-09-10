@@ -16,7 +16,20 @@ from pathlib import Path
 # GUID-based abfss paths. NOTE: name-based paths ("<lakehouse>.Lakehouse/...")
 # make OneLake return HTTP 400, so always address by workspace/lakehouse GUID:
 #   abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}
-HADOOP_AZURE_PACKAGE = "org.apache.hadoop:hadoop-azure:3.3.4"
+def _hadoop_azure_version() -> str:
+    """Match hadoop-azure to the Hadoop that the installed pyspark bundles:
+    Spark 3.5.x ships Hadoop 3.3.4, Spark 4.x ships Hadoop 3.4.1. A mismatch
+    collides with the bundled hadoop-common (3.3.6 on Spark 3.5 crashed in
+    AbfsThrottlingInterceptFactory)."""
+    try:
+        from importlib.metadata import version
+
+        return "3.4.1" if int(version("pyspark").split(".")[0]) >= 4 else "3.3.4"
+    except Exception:
+        return "3.3.4"
+
+
+HADOOP_AZURE_PACKAGE = f"org.apache.hadoop:hadoop-azure:{_hadoop_azure_version()}"
 PROVIDER_CLASS = "ch.fs.HttpTokenProvider"
 CATALOG_CLASS = "ch.fs.OneLakeCatalog"
 REQUIRED_CLASSES = (PROVIDER_CLASS, CATALOG_CLASS)
