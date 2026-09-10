@@ -35,13 +35,16 @@ def _b64url(data: bytes) -> str:
 def _classpath() -> str:
     import pyspark
 
-    jar = glob.glob(str(REPO / "token-provider/target/scala-2.12/*.jar"))
+    from local_spark_mcp.profiles import current_profile
+
+    prof = current_profile()  # the jar and hadoop-azure line follow the installed profile
+    jar = glob.glob(str(REPO / f"token-provider/target/scala-{prof.scala}/*.jar"))
     if not jar:
         pytest.skip("token provider jar not built (cd token-provider && sbt package)")
 
     azure = sorted(
-        glob.glob(os.path.expanduser("~/.cache/coursier/**/hadoop-azure-3.3.*.jar"), recursive=True)
-        + glob.glob(os.path.expanduser("~/.ivy2/**/hadoop-azure-3.3.*.jar"), recursive=True)
+        glob.glob(os.path.expanduser(f"~/.cache/coursier/**/hadoop-azure-{prof.hadoop_azure}.jar"), recursive=True)
+        + glob.glob(os.path.expanduser(f"~/.ivy2/**/hadoop-azure-{prof.hadoop_azure}.jar"), recursive=True)
     )
     if not azure:
         pytest.skip("hadoop-azure jar not found in build caches")

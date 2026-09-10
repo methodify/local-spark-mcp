@@ -46,7 +46,18 @@ def test_symlink_candidate_is_followed(isolated):
 def test_unsupported_major_is_rejected_with_reason(isolated):
     home = make_jdk(isolated, "jdk21", "21.0.2")
     with pytest.raises(JavaNotFoundError, match=r"Java 21; Spark 3.5 needs 8/11/17"):
-        resolve_java_home(str(home))
+        resolve_java_home(str(home), majors=(8, 11, 17), prefer=(17, 11, 8), spark="Spark 3.5")
+    # the fabric-2.0 profile accepts 21 and rejects 11
+    assert resolve_java_home(str(home), majors=(17, 21), prefer=(21, 17), spark="Spark 4.1") == str(home.resolve())
+    with pytest.raises(JavaNotFoundError, match=r"Java 11; Spark 4.1 needs 17/21"):
+        resolve_java_home(str(make_jdk(isolated, "jdk11", "11.0.16")), majors=(17, 21), prefer=(21, 17), spark="Spark 4.1")
+
+
+def test_vfox_preference_follows_profile(isolated, monkeypatch):
+    j17 = make_jdk(isolated, "v17"); j21 = make_jdk(isolated, "v21", "21.0.2")
+    monkeypatch.setattr(java_mod, "_vfox_candidates", lambda: [str(j21), str(j17)])
+    assert resolve_java_home(majors=(8, 11, 17), prefer=(17, 11, 8), spark="Spark 3.5") == str(j17.resolve())
+    assert resolve_java_home(majors=(17, 21), prefer=(21, 17), spark="Spark 4.1") == str(j21.resolve())
 
 
 def test_java8_release_format(isolated):
@@ -65,8 +76,8 @@ def test_java_home_env_then_path_fallback(isolated, monkeypatch):
     monkeypatch.setenv("JAVA_HOME", str(jdk21))
     launcher = jdk17 / "bin" / ("java.exe" if os.name == "nt" else "java")
     monkeypatch.setattr(java_mod.shutil, "which", lambda name: str(launcher))
-    # JAVA_HOME is Java 21 -> skipped; PATH java's grandparent is the home
-    assert resolve_java_home() == str(jdk17.resolve())
+    # JAVA_HOME is Java 21 -> skipped for the 1.3 profile; PATH java's grandparent is the home
+    assert resolve_java_home(majors=(8, 11, 17), prefer=(17, 11, 8), spark="Spark 3.5") == str(jdk17.resolve())
 
 
 def test_error_lists_every_candidate_and_source(isolated, monkeypatch):
@@ -74,7 +85,7 @@ def test_error_lists_every_candidate_and_source(isolated, monkeypatch):
     monkeypatch.setenv("JAVA_HOME", str(jdk21))
     monkeypatch.setattr(java_mod.shutil, "which", lambda name: str(isolated / "bin" / "java"))
     with pytest.raises(JavaNotFoundError) as exc:
-        resolve_java_home()
+        resolve_java_home(majors=(8, 11, 17), prefer=(17, 11, 8), spark="Spark 3.5")
     msg = str(exc.value)
     assert "vfox" in msg and "no match" in msg
     assert "JAVA_HOME:" in msg and "Java 21" in msg
@@ -85,4 +96,4 @@ def test_vfox_wins_over_java_home(isolated, monkeypatch):
     vfox = make_jdk(isolated, "vfox17")
     monkeypatch.setattr(java_mod, "_vfox_candidates", lambda: [str(vfox)])
     monkeypatch.setenv("JAVA_HOME", str(make_jdk(isolated, "other17")))
-    assert resolve_java_home() == str(vfox.resolve())
+    assert resolve_java_home(majors=(8, 11, 17), prefer=(17, 11, 8), spark="Spark 3.5") == str(vfox.resolve())

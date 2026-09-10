@@ -27,6 +27,12 @@ databases and their tables mount lazily. **Validated live end to end** against a
 real workspace: discovery (8 lakehouses, 63 tables), mount, and an `abfss://`
 Delta read/query (1.4M rows) through the full stack.
 
+**0.3.0: runtime profiles** — `local-spark-mcp[fabric-1.3]` and
+`local-spark-mcp[fabric-2.0]` extras (Spark 3.5 / Delta 3.2 vs Spark 4.1 /
+Delta 4.2), one bundled jar per Scala line, profile-aware Java and hadoop-azure,
+`LOCAL_SPARK_PROFILE` validation. Under `fabric-2.0`, deletion-vector tables get
+the full sandbox.
+
 **REQUEST-001 (notebook parity, from `~/src/claude-fabric`) shipped as 0.2.x**,
 validated live on Linux and Windows: `OneLakeCatalog` (tables resolve by name on
 first touch, no mount step), default lakehouse, the write policy (sandbox /
@@ -43,15 +49,17 @@ works; name-based paths (`{lakehouse}.Lakehouse/...`) make OneLake return HTTP
 ## Commands
 
 ```bash
-# Setup (Python 3.11 via uv — see cross-platform notes; pulls pyspark/delta, slow first time)
-uv venv --python 3.11
-uv pip install -e ".[dev]"
+# Setup: one venv per runtime profile (the extra pins pyspark/delta; the base package pins neither)
+uv venv --python 3.11 .venv   && uv pip install --python .venv/bin/python   -e ".[fabric-1.3,dev]"
+uv venv --python 3.13 .venv20 && uv pip install --python .venv20/bin/python -e ".[fabric-2.0,dev]"
+# Run any test command below with .venv20/bin/python to exercise the fabric-2.0 profile.
 
-# Build the Scala jar (ch.fs.HttpTokenProvider + ch.fs.OneLakeCatalog) AND bundle
-# it into the package (needs Java 17 + sbt). The bundled jar
-# (src/local_spark_mcp/jars/localsparkjars_*.jar) ships in the wheel so `uvx`/pip
-# installs from GitHub work without sbt — re-run and commit this whenever
-# anything under token-provider/src changes.
+# Build the Scala jar (ch.fs.HttpTokenProvider + ch.fs.OneLakeCatalog) for BOTH
+# profiles (2.12 for fabric-1.3, 2.13 for fabric-2.0; `sbt +package`) AND bundle
+# them (needs Java 17 + sbt). The bundled jars
+# (src/local_spark_mcp/jars/localsparkjars_2.1{2,3}-*.jar) ship in the wheel so
+# `uvx`/pip installs from GitHub work without sbt — re-run and commit whenever
+# anything under token-provider/src or build.sbt changes.
 JAVA_HOME=<jdk17> scripts/build_jar.sh
 
 # Fast tests (config + formatters + token server; no Spark)
@@ -97,12 +105,23 @@ server's **stderr**; stdout is reserved for the MCP transport.
   lib pip-installed into the server's env is importable on both; `[spark.env]`
   covers the data dirs / path. A driver-only runtime `sys.path` change does NOT
   reach workers — install into the env or use PYTHONPATH instead.
-- `java.py` — resolve a Spark-compatible `JAVA_HOME`: explicit → vfox Java
-  17/11 → `JAVA_HOME` → `java` on PATH. Every candidate is `realpath`'d (vfox
+- `profiles.py` — **runtime profiles**: `fabric-1.3` (pyspark 3.5.9 / delta
+  3.2.0 / Python 3.11 / Java 8-11-17 / Scala 2.12 jar / hadoop-azure 3.3.4) and
+  `fabric-2.0` (pyspark 4.1.1 / delta 4.2.0 / Python 3.13 / Java 17-21 / Scala
+  2.13 jar / hadoop-azure 3.4.1). The extra in `pyproject.toml` pins
+  pyspark/delta at install time; `detect_profile()` reads the installed pyspark
+  major; `check_profile(declared)` (from `[runtime] profile` /
+  `LOCAL_SPARK_PROFILE`) errors on a mismatch or a missing Spark stack and
+  warns on patch/Python drift; `validate_runtime` and the startup log use it.
+  Keep `PROFILES`, the extras, and `token-provider/build.sbt` in step
+  (`test_profiles.py` checks the extras).
+- `java.py` — resolve a `JAVA_HOME` for the profile's Spark: explicit → vfox
+  JDKs in the profile's preferred order (21 then 17 for 2.0; 17, 11, 8 for
+  1.3) → `JAVA_HOME` → `java` on PATH. Every candidate is `realpath`'d (vfox
   `current` junction, `/usr/lib/jvm/default`), a `bin/java[.exe]` path is
-  normalized to its home, and the `release` file's major must be 8/11/17 (system
-  Java 21 is rejected with the reason). The error lists each candidate and its
-  source. Accepts `bin/java` **or** `bin/java.exe`.
+  normalized to its home, and the `release` file's major must be in the
+  profile's set (the verdict names the rejected major). The error lists each
+  candidate and its source. Accepts `bin/java` **or** `bin/java.exe`.
 - `hadoop.py` — Windows only: resolve a HADOOP_HOME with `bin/winutils.exe`.
   Spark 3.5 **cannot start** on Windows without it (`Shell.<clinit>` throws
   "HADOOP_HOME and hadoop.home.dir are unset"). Order: `runtime.hadoop_home`
@@ -164,7 +183,10 @@ server's **stderr**; stdout is reserved for the MCP transport.
   test) as `serverInfo.version` instead of the mcp SDK's.
 - `token_server.py` — loopback OneLake token endpoint (DefaultAzureCredential,
   secret-guarded); owned by the server, outlives worker restarts.
-- `fabric.py` — token-provider jar discovery + OneLake Spark config builder +
+- `fabric.py` — jar discovery per profile (`default_jar_path(scala)`: in-repo
+  `target/scala-<line>/` build first, else the bundled
+  `jars/localsparkjars_<line>-*.jar`), hadoop-azure per profile, OneLake Spark
+  config builder +
   `validate_jar` (opens the zip; both `ch.fs.HttpTokenProvider` and
   `ch.fs.OneLakeCatalog` must be present, else a message naming the jar, its
   origin, and the missing class — a stale 0.1 jar in a project file caused a
@@ -407,15 +429,16 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
   "just works" portability.
 - **Build toolchain (for the token JAR):** `sbt` 1.9.8 and `scala` are
   installed via sdkman; `jq` is on PATH.
-- **Spark/Delta pinning:** match the Fabric runtime. Fabric Runtime 1.3 is
-  actually Spark **3.5.5** (Microsoft build `3.5.5.5.4.…`) with Delta **3.2.1**
-  (see `microsoft/synapse-spark-runtime`, `Fabric/Runtime 1.3/Components.json`),
-  so we pin `pyspark==3.5.9` (latest 3.5.x; binary-compatible with the jar and
-  with `delta-spark==3.2.0`). **Never go back to 3.5.0:** it loses rows when
-  joining persisted frames under AQE (SPARK-45592 / SPARK-45282, fixed in
-  3.5.1; `tests/test_cached_join_correctness.py` guards it). delta-spark stays
-  3.2.0 (3.2.1 exists only as Microsoft's build; a Delta minor bump needs a jar
-  rebuild).
+- **Spark/Delta pinning = runtime profiles.** Fabric Runtime 1.3 is Spark
+  **3.5.5** (Microsoft build) with Delta **3.2.1**; Runtime 2.0 is Spark
+  **4.1.1** with Delta **4.2.0**, Python 3.13, Java 21, Scala 2.13 (see
+  `microsoft/synapse-spark-runtime`, `Fabric/Runtime <n>/Components.json`).
+  Profiles pin `pyspark==3.5.9`/`delta-spark==3.2.0` and
+  `pyspark==4.1.1`/`delta-spark==4.2.0` (delta-spark 4.2.0 requires pyspark
+  <= 4.1.1). **Never 3.5.0:** it loses rows when joining persisted frames under
+  AQE (SPARK-45592 / SPARK-45282, fixed in 3.5.1;
+  `tests/test_cached_join_correctness.py` guards it). Any Delta minor bump needs
+  the jar rebuilt for that line.
 - **Auth:** `DefaultAzureCredential` / `az login` (the `az` CLI is installed).
   See the token-provider chain above for how this reaches Spark's ABFS layer.
 - **`fab` CLI (ms-fabric-cli) 1.6.1 is installed.** It's a filesystem-shaped

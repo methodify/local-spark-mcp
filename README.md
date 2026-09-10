@@ -20,32 +20,62 @@ architecture and the locked design decisions.
 ## Running it (via `uvx`, from GitHub)
 
 No clone or build needed — `uvx` installs and runs it in an ephemeral
-environment. Register it as an MCP server in Claude Code (`.mcp.json`):
+environment. Pick a **runtime profile** (the extra) that matches the Fabric
+runtime your workspace uses, and register it as an MCP server in Claude Code
+(`.mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "local-spark": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/methodify/local-spark-mcp", "local-spark-mcp"],
-      "env": { "LOCAL_SPARK_WORKSPACE_NAME": "Data Warehouse" }
+      "args": ["--python", "3.13", "--from", "local-spark-mcp[fabric-2.0] @ git+https://github.com/methodify/local-spark-mcp@v0.3.0", "local-spark-mcp"],
+      "env": { "LOCAL_SPARK_WORKSPACE_NAME": "Data Warehouse", "LOCAL_SPARK_PROFILE": "fabric-2.0" }
     }
   }
 }
 ```
 
+### Runtime profiles
+
+A profile is a version set that matches one Fabric Spark runtime. The extra
+pins pyspark and delta-spark; everything else version-specific (the catalog
+jar's Scala line, hadoop-azure, accepted Java majors) follows from what is
+installed. One install holds exactly one profile; a workspace on the other
+runtime gets a second server entry.
+
+| Profile | Fabric runtime | pyspark | delta-spark | Python | Java | Deletion-vector tables |
+|---|---|---|---|---|---|---|
+| `fabric-1.3` | 1.3 (Spark 3.5.5, Delta 3.2.1) | 3.5.9 | 3.2.0 | 3.11 | 8 / 11 / 17 | read-only live views |
+| `fabric-2.0` | 2.0 (Spark 4.1.1, Delta 4.2.0) | 4.1.1 | 4.2.0 | 3.13 | 17 / 21 | full sandbox (clone) |
+
+Runtime 2.0 writes deletion vectors by default (Delta reader 3 / writer 7), so
+tables written by 2.0 notebooks need the `fabric-2.0` profile to be writable
+locally. Set `LOCAL_SPARK_PROFILE` (or `[runtime] profile`) to declare the
+profile you intend; startup then fails with a clear message when the installed
+stack is a different one, and warns on parity drift (a different patch version,
+or a Python other than the runtime's). Without a declaration the installed
+stack decides. Install lines:
+
+```
+uvx --python 3.11 --from "local-spark-mcp[fabric-1.3] @ git+https://github.com/methodify/local-spark-mcp@v0.3.0" local-spark-mcp
+uvx --python 3.13 --from "local-spark-mcp[fabric-2.0] @ git+https://github.com/methodify/local-spark-mcp@v0.3.0" local-spark-mcp
+```
+
+The base package pins no Spark on purpose: an install without a profile extra
+fails at startup naming both extras.
+
 Runs on **Linux/WSL and Windows** (both validated end to end against live
 OneLake). Prerequisites on the host:
 
-- **Java 17** for Spark 3.5 (the server prefers a vfox-managed JDK 17, else
-  `JAVA_HOME`; or set `runtime.java_home` / `LOCAL_SPARK_JAVA_HOME`). System
-  Java 21 will not work.
+- **Java**: 17 for `fabric-1.3` (Spark 3.5 also accepts 8 and 11; 21 will not
+  work), 21 or 17 for `fabric-2.0`. The server prefers a vfox-managed JDK in the
+  profile's order, then `JAVA_HOME`, then `java` on `PATH`; or set
+  `runtime.java_home` / `LOCAL_SPARK_JAVA_HOME`.
 - **`az login`** — OneLake/Fabric auth is ambient via `DefaultAzureCredential`.
 - **Windows**: nothing extra. Hadoop's `winutils.exe`/`hadoop.dll` (required for
   Spark to start at all on Windows) ship inside the package; point
-  `runtime.hadoop_home` at your own Hadoop if you prefer. Python 3.11 is used on
-  every platform — it matches Fabric Runtime 1.3, and pyspark 3.5.0's Python
-  workers crash on Windows under 3.12.
+  `runtime.hadoop_home` at your own Hadoop if you prefer.
 
 The prebuilt OneLake token-provider jar ships inside the package, so Fabric mode
 works out of the box (no sbt needed). First run downloads PySpark/Delta jars and

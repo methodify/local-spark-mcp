@@ -22,7 +22,9 @@ pytestmark = pytest.mark.skipif(
 def worker():
     w = WorkerProcess(engine_kwargs={"driver_memory": "2g", "default_sql_limit": 5})
     info = w.start()
-    assert info["spark_version"].startswith("3.5")
+    from local_spark_mcp.profiles import current_profile
+
+    assert info["spark_version"].startswith(current_profile().pyspark.rsplit(".", 1)[0])
     yield w
     w.stop()
 

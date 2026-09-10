@@ -10,6 +10,7 @@ dist/
 
 # Virtual envs
 .venv/
+.venv*/
 venv/
 
 # uv

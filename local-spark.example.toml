@@ -57,6 +57,11 @@ driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
 # "spark.sql.shuffle.partitions" = "8"
 
 [runtime]
+# Runtime profile you intend: "fabric-1.3" (Spark 3.5 / Delta 3.2, Python 3.11)
+# or "fabric-2.0" (Spark 4.1 / Delta 4.2, Python 3.13). The profile is chosen at
+# install time by the extra (local-spark-mcp[fabric-2.0]); declaring it here
+# makes startup fail when the installed stack is a different one.
+# profile = "fabric-2.0"   # env: LOCAL_SPARK_PROFILE
 default_sql_limit = 100   # default row cap for the run_sql tool; env: LOCAL_SPARK_SQL_LIMIT
 # Write policy for lakehouse tables (env: LOCAL_SPARK_WRITE_MODE):
 #   sandbox (default): nothing reaches OneLake. A table you write becomes a local

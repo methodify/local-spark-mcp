@@ -1,16 +1,16 @@
 [project]
 name = "local-spark-mcp"
-version = "0.2.6"
+version = "0.3.0"
 description = "MCP server giving an agent a stateful local Spark session for prototyping PySpark notebooks targeting Microsoft Fabric"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.11,<3.12"  # matches Fabric Runtime 1.3 (Spark 3.5, Delta 3.2, Python 3.11); pyspark 3.5.0 workers break on 3.12 (Windows)
+requires-python = ">=3.11,<3.14"  # fabric-1.3 profile matches Python 3.11, fabric-2.0 matches 3.13; see [project.optional-dependencies]
 authors = [{ name = "Bryon" }]
 dependencies = [
     "mcp>=1.2.0,<2.0.0",
-    "pyspark==3.5.9",  # 3.5.0 loses rows joining persisted frames under AQE (SPARK-45592/45282, fixed 3.5.1); Delta 3.2.0 + our jar unchanged
-    "delta-spark==3.2.0",
+    # pyspark/delta-spark come from a runtime profile extra (below); the base
+    # package deliberately pins neither, so one install can't mix the two sets.
     "ipython>=8.18",
     "azure-identity>=1.25.1",
     "azure-keyvault-secrets>=4.8",
@@ -22,6 +22,18 @@ dependencies = [
 local-spark-mcp = "local_spark_mcp.server:main"
 
 [project.optional-dependencies]
+# Runtime profiles: version sets that match a Fabric Spark runtime. Pick ONE:
+#   uvx --python 3.11 --from "local-spark-mcp[fabric-1.3] @ git+https://github.com/methodify/local-spark-mcp@vX" local-spark-mcp
+#   uvx --python 3.13 --from "local-spark-mcp[fabric-2.0] @ git+https://github.com/methodify/local-spark-mcp@vX" local-spark-mcp
+# Keep in step with src/local_spark_mcp/profiles.py and token-provider/build.sbt.
+"fabric-1.3" = [
+    "pyspark==3.5.9",  # Runtime 1.3 = Spark 3.5.5; never 3.5.0 (SPARK-45592 loses rows joining persisted frames)
+    "delta-spark==3.2.0",
+]
+"fabric-2.0" = [
+    "pyspark==4.1.1",  # Runtime 2.0 = Spark 4.1.1; delta-spark 4.2.0 requires pyspark <= 4.1.1
+    "delta-spark==4.2.0",
+]
 dev = [
     "pytest>=8.0",
 ]

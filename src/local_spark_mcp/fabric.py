@@ -16,24 +16,20 @@ from pathlib import Path
 # GUID-based abfss paths. NOTE: name-based paths ("<lakehouse>.Lakehouse/...")
 # make OneLake return HTTP 400, so always address by workspace/lakehouse GUID:
 #   abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/{table}
-def _hadoop_azure_version() -> str:
-    """Match hadoop-azure to the Hadoop that the installed pyspark bundles:
-    Spark 3.5.x ships Hadoop 3.3.4, Spark 4.x ships Hadoop 3.4.1. A mismatch
-    collides with the bundled hadoop-common (3.3.6 on Spark 3.5 crashed in
-    AbfsThrottlingInterceptFactory)."""
-    try:
-        from importlib.metadata import version
+def hadoop_azure_package() -> str:
+    """hadoop-azure matched to the Hadoop line the installed pyspark bundles
+    (Spark 3.5 -> 3.3.4, Spark 4.1 -> 3.4.1). A mismatch collides with the
+    bundled hadoop-common (3.3.6 on Spark 3.5 crashed in AbfsThrottlingInterceptFactory)."""
+    from .profiles import current_profile
 
-        return "3.4.1" if int(version("pyspark").split(".")[0]) >= 4 else "3.3.4"
-    except Exception:
-        return "3.3.4"
+    return f"org.apache.hadoop:hadoop-azure:{current_profile().hadoop_azure}"
 
 
-HADOOP_AZURE_PACKAGE = f"org.apache.hadoop:hadoop-azure:{_hadoop_azure_version()}"
+HADOOP_AZURE_PACKAGE = hadoop_azure_package()
 PROVIDER_CLASS = "ch.fs.HttpTokenProvider"
 CATALOG_CLASS = "ch.fs.OneLakeCatalog"
 REQUIRED_CLASSES = (PROVIDER_CLASS, CATALOG_CLASS)
-_JAR_GLOB = "token-provider/target/scala-2.12/*.jar"
+_JAR_GLOB = "token-provider/target/scala-{scala}/*.jar"
 
 
 def repo_root() -> Path:
@@ -46,17 +42,22 @@ def _packaged_jar_dir() -> Path:
     return Path(__file__).resolve().parent / "jars"
 
 
-def default_jar_path() -> str | None:
-    """Locate the HttpTokenProvider jar.
+def default_jar_path(scala: str | None = None) -> str | None:
+    """Locate the catalog/token-provider jar for the active profile's Scala
+    line (2.12 for Spark 3.5, 2.13 for Spark 4.x; one jar per profile because
+    the jar is not binary-compatible across Spark/Delta minors).
 
-    Prefer a fresh in-repo `sbt package` build (dev/editable installs), then fall
-    back to the jar bundled inside the installed package (so `uvx`/pip installs
-    from GitHub work without sbt). Returns None if neither is present.
+    Prefer a fresh in-repo `sbt +package` build (dev/editable installs), then
+    fall back to the jar bundled inside the installed package (so `uvx`/pip
+    installs from GitHub work without sbt). Returns None if neither is present.
     """
-    dev = sorted(glob.glob(str(repo_root() / _JAR_GLOB)))
+    from .profiles import current_profile
+
+    scala = scala or current_profile().scala
+    dev = sorted(glob.glob(str(repo_root() / _JAR_GLOB.format(scala=scala))))
     if dev:
         return dev[-1]
-    packaged = sorted(glob.glob(str(_packaged_jar_dir() / "*.jar")))
+    packaged = sorted(glob.glob(str(_packaged_jar_dir() / f"localsparkjars_{scala}-*.jar")))
     return packaged[-1] if packaged else None
 
 

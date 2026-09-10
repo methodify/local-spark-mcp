@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 import traceback as _tb
 from concurrent.futures import ThreadPoolExecutor
@@ -143,6 +144,7 @@ class SparkEngine:
         if onelake and lakehouses:
             catalog = {
                 "dv_strategy": self.dv_strategy,
+            "profile": _profile_label(),
                 "workspace_id": workspace_id,
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
@@ -745,6 +747,7 @@ class SparkEngine:
             "shadows": [f"{t['lakehouse']}.{t['table']}" for t in self._shadow_tables()],
             "deletion_vector_tables": [f"{t['lakehouse']}.{t['table']}" for t in self._dv_tables()],
             "dv_strategy": self.dv_strategy,
+            "profile": _profile_label(),
             "files_root": (self.files_link or {}).get("files_root"),
             "files_link": self.files_link,
             "files_sync": self.files_sync_report,
@@ -895,6 +898,14 @@ _WRITE_TARGET = re.compile(
 def _sql_write_target(sql: str) -> str | None:
     m = _WRITE_TARGET.match(sql)
     return m.group(1) if m else None
+
+
+def _profile_label() -> str:
+    from .profiles import current_profile, installed_versions
+
+    p = current_profile()
+    v = installed_versions()
+    return f"{p.name} (Fabric Runtime {p.fabric_runtime}; pyspark {v.get('pyspark')}, delta-spark {v.get('delta-spark')}, python {sys.version.split()[0]})"
 
 
 def _dv_strategy() -> str:

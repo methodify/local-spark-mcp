@@ -138,11 +138,21 @@ class ServerState:
         the offending value. Returns what resolved."""
         from .hadoop import HadoopNotFoundError, resolve_hadoop_home
         from .java import JavaNotFoundError, resolve_java_home
+        from .profiles import check_profile
 
         rt = self.config.runtime
         resolved = {}
+        profile, warnings, errors = check_profile(rt.profile)
+        if errors:
+            raise ConfigError("; ".join(errors) + (f" [runtime.profile from {self.config.origin('runtime.profile')}]" if rt.profile else ""))
+        for w in warnings:
+            print(f"local-spark-mcp: profile {profile.name}: {w}", file=sys.stderr)
+        resolved["profile"] = profile.name
         try:
-            resolved["java_home"] = resolve_java_home(rt.java_home, origin=self.config.origin("runtime.java_home"))
+            resolved["java_home"] = resolve_java_home(
+                rt.java_home, origin=self.config.origin("runtime.java_home"),
+                majors=profile.java_majors, prefer=profile.java_preferred, spark=f"Spark {profile.pyspark.rsplit('.', 1)[0]}",
+            )
         except JavaNotFoundError as exc:
             raise ConfigError(str(exc)) from exc
         try:
@@ -375,6 +385,8 @@ def format_info(info: dict) -> str:
         lines.append(f"  shadowed tables ({len(shadows)}): {', '.join(shadows) if shadows else '(none)'}")
         if dv := info.get("deletion_vector_tables"):
             lines.append(f"  deletion-vector tables, read-only here ({len(dv)}): {', '.join(dv)}")
+        if info.get("profile"):
+            lines.append(f"  profile: {info['profile']}")
         link = info.get("files_link")
         if link:
             state = f"-> {link['path']}" if link.get("linked") else f"NOT linked: {link.get('reason')}"
@@ -667,6 +679,15 @@ def log_startup(config: Config) -> None:
             print(f"  {key} = {value}  [{config.origin(key)}]", file=sys.stderr)
     ws = config.workspace
     print(f"  workspace: {ws.name or ws.id or '(none — local-only mode)'}  write_mode={rt.write_mode}", file=sys.stderr)
+    from .profiles import check_profile
+
+    profile, warnings, errors = check_profile(rt.profile)
+    if errors:
+        print(f"  profile: ERROR {'; '.join(errors)}", file=sys.stderr)
+    else:
+        print(f"  profile: {profile.describe()}" + (f"  [declared via {config.origin('runtime.profile')}]" if rt.profile else "  [detected]"), file=sys.stderr)
+        for w in warnings:
+            print(f"    warning: {w}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> None:

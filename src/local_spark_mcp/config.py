@@ -74,6 +74,9 @@ class RuntimeConfig:
     # them under <state_root>/lakehouses/<workspace-id>/shadow across sessions.
     persist_shadow: bool = False
     state_root: str = "~/.local-spark"  # per-session warehouse, shadows, mirrors
+    # Declared runtime profile ("fabric-1.3" | "fabric-2.0"). Optional: the
+    # installed stack decides; declaring it makes startup fail when they differ.
+    profile: str | None = None
 
 
 @dataclass
@@ -248,6 +251,7 @@ def _parse_file(path: Path) -> Config:
             write_mode=(_require_str(runtime, "write_mode", "runtime") or "sandbox").lower(),
             persist_shadow=persist_shadow,
             state_root=_require_str(runtime, "state_root", "runtime") or "~/.local-spark",
+            profile=_require_str(runtime, "profile", "runtime"),
         ),
         source_path=path,
     )
@@ -308,6 +312,9 @@ def _apply_env_overrides(config: Config) -> None:
     if (root := env.get(f"{ENV_PREFIX}STATE_ROOT")) is not None:
         config.runtime.state_root = root
 
+    if (profile := env.get(f"{ENV_PREFIX}PROFILE")) is not None:
+        config.runtime.profile = profile.strip().lower() or None
+
     if (nb_root := env.get(f"{ENV_PREFIX}NOTEBOOKS_ROOT")) is not None:
         config.notebooks.root = nb_root or None
 
@@ -332,6 +339,7 @@ _ENV_KEYS = {
     f"{ENV_PREFIX}WRITE_MODE": "runtime.write_mode",
     f"{ENV_PREFIX}PERSIST_SHADOW": "runtime.persist_shadow",
     f"{ENV_PREFIX}STATE_ROOT": "runtime.state_root",
+    f"{ENV_PREFIX}PROFILE": "runtime.profile",
     f"{ENV_PREFIX}NOTEBOOKS_ROOT": "notebooks.root",
     f"{ENV_PREFIX}FILES_SYNC": "files.sync",
     f"{ENV_PREFIX}MIRROR_ROOT": "files.mirror_root",
