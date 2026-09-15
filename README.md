@@ -139,7 +139,10 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   `df.write.csv("Files/out")`) resolves against the default lakehouse's mirror,
   as it resolves against the default lakehouse on Fabric; `session_info` shows
   the working directory. Python's own cwd is unchanged: use
-  `/lakehouse/default/Files/...` for `open()`.
+  `/lakehouse/default/Files/...` for `open()`. Spark file readers skip files
+  whose names start with `_` or `.` (Hadoop treats them as hidden, on Fabric
+  too), so `spark.read.text("Files/_dwlib_hydrate_options.txt")` returns no
+  rows by either path; read marker files with plain Python `open()`.
 - **Table names are case-insensitive**, as on Fabric: `dataverse.chtMotifTable`
   resolves however you spell it and reaches the OneLake-cased path.
 - **`restore_shadow(table, version=0)`** rewinds one shadow to a Delta version
