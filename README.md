@@ -46,7 +46,7 @@ runtime gets a second server entry.
 
 | Profile | Fabric runtime | pyspark | delta-spark | Python | Java | Deletion-vector tables |
 |---|---|---|---|---|---|---|
-| `fabric-1.3` | 1.3 (Spark 3.5.5, Delta 3.2.1) | 3.5.9 | 3.2.0 | 3.11 | 8 / 11 / 17 | read-only live views |
+| `fabric-1.3` | 1.3 (Spark 3.5.5, Delta 3.2.1) | 3.5.5 | 3.2.0 | 3.11 | 8 / 11 / 17 | read-only live views |
 | `fabric-2.0` | 2.0 (Spark 4.1.1, Delta 4.2.0) | 4.1.1 | 4.2.0 | 3.13 | 17 / 21 | full sandbox (clone) |
 
 Runtime 2.0 writes deletion vectors by default (Delta reader 3 / writer 7), so
@@ -65,10 +65,11 @@ uvx --python 3.13 --from "local-spark-mcp[fabric-2.0] @ git+https://github.com/m
 The base package pins no Spark on purpose: an install without a profile extra
 fails at startup naming both extras.
 
-**Windows and `fabric-2.0`:** use `--python 3.11`. pyspark 4.1.1's Python
-workers crash on Windows under Python 3.12 and 3.13 (SPARK-53759, fixed in
-pyspark 4.1.2, which delta-spark 4.2.0 does not allow yet); startup refuses
-that combination with the same advice. Validated on Windows with Python 3.11.
+**Windows:** use `--python 3.11` for both profiles. PySpark's Python workers
+crash on Windows under Python 3.12 and 3.13 unless pyspark is 3.5.9+ or 4.1.2+
+(SPARK-53759), and neither profile can use those (Delta 3.2 needs Spark 3.5.5
+or older; delta-spark 4.2.0 pins pyspark 4.1.1). Startup refuses the crashing
+combination with the same advice. Validated on Windows with Python 3.11.
 
 Runs on **Linux/WSL and Windows** (both validated end to end against live
 OneLake). Prerequisites on the host:
@@ -149,9 +150,18 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   of its local log (default: the snapshot as first cloned) without touching
   OneLake, for same-snapshot A/Bs. `RESTORE TABLE` cannot do this on a shallow
   clone.
-- **Session confs follow the runtime.** Under `fabric-2.0` the session runs
-  `spark.sql.ansi.enabled=false`, as a Runtime 2.0 production session does
-  (Spark 4's own default is `true`). `[spark.extra_configs]` still overrides.
+- **Session confs follow the runtime.** Each profile applies the confs where a
+  real Fabric session differs from Spark's default (taken from production
+  session event logs): session time zone `UTC`, Kryo serializer, 25 MB
+  broadcast threshold, cost-based optimizer on, Arrow for `toPandas`,
+  Parquet timestamps as `TIMESTAMP_MICROS`, and under `fabric-2.0` ANSI off,
+  `sources.default=delta` (so an untyped `CREATE TABLE` and `df.write.save`
+  mean Delta), and deletion vectors on for new tables. Under `fabric-1.3`,
+  `sources.default` stays parquet: on upstream Spark 3.5 / Delta 3.2 the Delta
+  default breaks `mode("overwrite").saveAsTable` into a new table, so name the
+  format explicitly there when it matters. Fabric-only engines and committers are
+  not copied. `[spark.extra_configs]` still overrides. Python's own time zone
+  stays the machine's.
 - **Snapshot semantics.** A shallow clone is frozen at the OneLake table
   version current when the session first touched the table, so every read of it
   in the session sees the same rows, and two sessions started at different times

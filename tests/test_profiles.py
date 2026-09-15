@@ -29,7 +29,7 @@ def test_check_profile_exact_match_is_silent():
 
 def test_check_profile_drift_warns_and_mismatch_errors():
     _, warnings, errors = check_profile(None, versions={"pyspark": "3.5.7", "delta-spark": "3.2.0"}, python=(3, 12), windows=False)
-    assert errors == [] and any("pins 3.5.9" in w for w in warnings) and any("Python 3.12" in w for w in warnings)
+    assert errors == [] and any("pins 3.5.5" in w for w in warnings) and any("Python 3.12" in w for w in warnings)
     _, _, errors = check_profile("fabric-2.0", versions={"pyspark": "3.5.9", "delta-spark": "3.2.0"}, python=(3, 11), windows=False)
     assert errors and "install local-spark-mcp[fabric-2.0]" in errors[0]
     _, _, errors = check_profile(None, versions={"pyspark": None, "delta-spark": None})
@@ -69,3 +69,5 @@ def test_windows_python_gate_for_spark_4():
     assert errors == []
     _, _, errors = check_profile(None, versions={"pyspark": "3.5.9", "delta-spark": "3.2.0"}, python=(3, 13), windows=True)
     assert errors == []  # 3.5.9 carries the fix
+    _, _, errors = check_profile(None, versions={"pyspark": "3.5.5", "delta-spark": "3.2.0"}, python=(3, 12), windows=True)
+    assert errors and "--python 3.11" in errors[0]  # the pinned 1.3 Spark predates the fix

@@ -43,19 +43,51 @@ class Profile:
                 f"Java {'/'.join(map(str, self.java_majors))}, Scala {self.scala} jar")
 
 
+# Session confs where a Fabric production session differs from Spark's own
+# default. Taken from the SparkListenerEnvironmentUpdate events of real Runtime
+# 1.3 and 2.0 sessions (2026-09-14); Fabric-only classes (Gluten cost
+# evaluator, cloud committers, RocksDB state store, native Parquet writer,
+# V-Order) are deliberately not copied. [spark.extra_configs] overrides these.
+_FABRIC_COMMON_CONFS = {
+    "spark.sql.session.timeZone": "UTC",  # Fabric JVMs run with user.timezone=UTC
+    "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+    "spark.sql.autoBroadcastJoinThreshold": "26214400",  # 25 MB (Spark: 10 MB)
+    "spark.sql.cbo.enabled": "true",
+    "spark.sql.cbo.joinReorder.enabled": "true",
+    "spark.sql.execution.arrow.pyspark.enabled": "true",
+    "spark.sql.execution.arrow.pyspark.fallback.enabled": "true",
+    "spark.sql.legacy.createHiveTableByDefault": "false",
+    "spark.sql.legacy.replaceDatabricksSparkAvro.enabled": "false",
+    "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly": "false",
+    "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",
+    "spark.sql.statistics.fallBackToHdfs": "true",
+    "spark.databricks.delta.vacuum.parallelDelete.enabled": "true",
+}
+
 PROFILES: dict[str, Profile] = {
     "fabric-1.3": Profile(
-        name="fabric-1.3", fabric_runtime="1.3", pyspark="3.5.9", delta="3.2.0", python=(3, 11),
+        name="fabric-1.3", fabric_runtime="1.3", pyspark="3.5.5", delta="3.2.0", python=(3, 11),
         java_majors=(8, 11, 17), java_preferred=(17, 11, 8), scala="2.12", hadoop_azure="3.3.4", spark_major=3,
-        session_confs={},
+        # Not spark.sql.sources.default=delta here: on Spark 3.5 / Delta 3.2 it
+        # breaks df.write.mode("overwrite").saveAsTable(<new table>) ("does not
+        # support truncate in batch mode"), even with format("delta"). Fabric's
+        # 3.5 build evidently carries a fix; upstream 3.5.9 does not. Residual:
+        # untyped CREATE TABLE / df.write.save() are parquet locally under 1.3.
+        session_confs={**_FABRIC_COMMON_CONFS, "spark.databricks.delta.optimizeWrite.enabled": "true"},
     ),
     "fabric-2.0": Profile(
         name="fabric-2.0", fabric_runtime="2.0", pyspark="4.1.1", delta="4.2.0", python=(3, 13),
         java_majors=(17, 21), java_preferred=(21, 17), scala="2.13", hadoop_azure="3.4.1", spark_major=4,
-        # Spark 4 flipped ANSI on; a Runtime 2.0 production session runs it off
-        # (SparkListenerEnvironmentUpdate, ADO #286). Notebooks that cast '' to
-        # bigint fail locally otherwise.
-        session_confs={"spark.sql.ansi.enabled": "false"},
+        session_confs={
+            **_FABRIC_COMMON_CONFS,
+            # Spark 4 flipped ANSI on; a Runtime 2.0 production session runs it off
+            # (ADO #286): notebooks that cast '' to bigint fail locally otherwise.
+            "spark.sql.ansi.enabled": "false",
+            "spark.sql.unionOutputPartitioning": "false",
+            "spark.sql.sources.default": "delta",  # untyped CREATE TABLE / df.write.save mean Delta
+            # Runtime 2.0 creates tables with deletion vectors by default.
+            "spark.databricks.delta.properties.defaults.enableDeletionVectors": "true",
+        },
     ),
 }
 DEFAULT_PROFILE = "fabric-1.3"
@@ -97,8 +129,9 @@ def _version_tuple(v: str | None) -> tuple[int, ...]:
 
 # SPARK-53759: PySpark's Python workers crash on Windows under Python 3.12+
 # (WinError 10038 / "Python worker exited unexpectedly"). Fixed in pyspark
-# 3.5.9, 4.0.3, 4.1.2. delta-spark 4.2.0 pins pyspark <= 4.1.1, so on Windows
-# the fabric-2.0 profile needs Python 3.11 until Delta allows a newer pyspark.
+# 3.5.9, 4.0.3, 4.1.2. Neither profile can use those: Delta 3.2 breaks on Spark
+# 3.5.6+ (V2 overwrite needs TRUNCATE, delta-io/delta#4671) and delta-spark
+# 4.2.0 pins pyspark <= 4.1.1. On Windows both profiles run on Python 3.11.
 _WINDOWS_WORKER_FIX = {3: (3, 5, 9), 4: (4, 1, 2)}
 
 
@@ -133,8 +166,8 @@ def check_profile(declared: str | None, *, versions: dict | None = None, python=
     if windows and python >= (3, 12) and fix and spark_v < fix:
         errors.append(
             f"pyspark {versions['pyspark']} Python workers crash on Windows under Python "
-            f"{python[0]}.{python[1]} (SPARK-53759; fixed in {'.'.join(map(str, fix))}, which the "
-            f"{p.name} Delta pin does not allow yet). Run this profile with Python 3.11 on Windows: "
+            f"{python[0]}.{python[1]} (SPARK-53759; fixed in {'.'.join(map(str, fix))}, which this "
+            f"profile's Delta cannot run on). Run {p.name} with Python 3.11 on Windows: "
             "`uvx --python 3.11 ...`"
         )
         return p, warnings, errors

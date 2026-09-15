@@ -105,7 +105,7 @@ server's **stderr**; stdout is reserved for the MCP transport.
   lib pip-installed into the server's env is importable on both; `[spark.env]`
   covers the data dirs / path. A driver-only runtime `sys.path` change does NOT
   reach workers — install into the env or use PYTHONPATH instead.
-- `profiles.py` — **runtime profiles**: `fabric-1.3` (pyspark 3.5.9 / delta
+- `profiles.py` — **runtime profiles**: `fabric-1.3` (pyspark 3.5.5 / delta
   3.2.0 / Python 3.11 / Java 8-11-17 / Scala 2.12 jar / hadoop-azure 3.3.4) and
   `fabric-2.0` (pyspark 4.1.1 / delta 4.2.0 / Python 3.13 / Java 17-21 / Scala
   2.13 jar / hadoop-azure 3.4.1). The extra in `pyproject.toml` pins
@@ -115,8 +115,21 @@ server's **stderr**; stdout is reserved for the MCP transport.
   warns on patch/Python drift; `validate_runtime` and the startup log use it.
   Keep `PROFILES`, the extras, and `token-provider/build.sbt` in step
   (`test_profiles.py` checks the extras). `session_confs` carry runtime parity
-  where Spark's default differs: fabric-2.0 sets `spark.sql.ansi.enabled=false`
-  (a Runtime 2.0 production session runs ANSI off; Spark 4 defaults it on).
+  where a Fabric production session differs from Spark's default, taken from
+  the `SparkListenerEnvironmentUpdate` events in
+  `~/src/fabric-data-warehouse/spark-logs/` (Runtime 2.0 and 1.3 sessions):
+  UTC session time zone, Kryo, 25 MB broadcast threshold, CBO, Arrow,
+  `createHiveTableByDefault=false`, TIMESTAMP_MICROS, `fallBackToHdfs`; 1.3
+  adds `optimizeWrite`; 2.0 adds ANSI off, `unionOutputPartitioning=false`,
+  `sources.default=delta`, deletion vectors on by default. **Not
+  `sources.default=delta` on 1.3:** with upstream Spark 3.5.9 / Delta 3.2.0 it
+  makes `df.write.mode("overwrite").saveAsTable(<new>)` fail with "does not
+  support truncate in batch mode" (plain `DeltaCatalog` reproduces it; explicit
+  `format("delta")` doesn't help; 2.0 is fine). Fabric-only
+  classes (Gluten, cloud committers, RocksDB state store, native Parquet
+  writer, V-Order) are not copied. To re-diff after a runtime update: extract
+  the event's "Spark Properties" and compare with `spark.conf.get(key)` (no
+  fallback argument, or you get the fallback instead of Spark's default).
 - `java.py` — resolve a `JAVA_HOME` for the profile's Spark: explicit → vfox
   JDKs in the profile's preferred order (21 then 17 for 2.0; 17, 11, 8 for
   1.3) → `JAVA_HOME` → `java` on PATH. Every candidate is `realpath`'d (vfox
@@ -464,12 +477,16 @@ Delta tables fetched to disk) when over-the-wire reads aren't wanted at all.
   **3.5.5** (Microsoft build) with Delta **3.2.1**; Runtime 2.0 is Spark
   **4.1.1** with Delta **4.2.0**, Python 3.13, Java 21, Scala 2.13 (see
   `microsoft/synapse-spark-runtime`, `Fabric/Runtime <n>/Components.json`).
-  Profiles pin `pyspark==3.5.9`/`delta-spark==3.2.0` and
+  Profiles pin `pyspark==3.5.5`/`delta-spark==3.2.0` and
   `pyspark==4.1.1`/`delta-spark==4.2.0` (delta-spark 4.2.0 requires pyspark
-  <= 4.1.1). **Never 3.5.0:** it loses rows when joining persisted frames under
-  AQE (SPARK-45592 / SPARK-45282, fixed in 3.5.1;
-  `tests/test_cached_join_correctness.py` guards it). Any Delta minor bump needs
-  the jar rebuilt for that line.
+  <= 4.1.1). **1.3 is boxed in on both sides:** not 3.5.0 (SPARK-45592 loses
+  rows joining persisted frames under AQE, fixed 3.5.1;
+  `tests/test_cached_join_correctness.py` guards it) and not 3.5.6+ (Spark's V2
+  overwrite now requires the TRUNCATE capability, which Delta 3.2's
+  `StagedDeltaTableV2` lacks, so `df.write.mode("overwrite").saveAsTable(<new>)`
+  fails with "does not support truncate in batch mode"; delta-io/delta#4671;
+  `tests/test_session_confs_live.py` guards it). 3.5.5 is also exactly Fabric's
+  Spark. Any Delta minor bump needs the jar rebuilt for that line.
 - **Auth:** `DefaultAzureCredential` / `az login` (the `az` CLI is installed).
   See the token-provider chain above for how this reaches Spark's ABFS layer.
 - **`fab` CLI (ms-fabric-cli) 1.6.1 is installed.** It's a filesystem-shaped

@@ -83,5 +83,13 @@ def test_formatters_never_keyerror():
 
 
 def test_profile_session_confs():
-    assert PROFILES["fabric-2.0"].session_confs == {"spark.sql.ansi.enabled": "false"}
-    assert PROFILES["fabric-1.3"].session_confs == {}
+    c20, c13 = PROFILES["fabric-2.0"].session_confs, PROFILES["fabric-1.3"].session_confs
+    for c in (c20, c13):  # evidence: SparkListenerEnvironmentUpdate of real Fabric sessions
+        assert c["spark.sql.session.timeZone"] == "UTC"
+        assert c["spark.sql.legacy.createHiveTableByDefault"] == "false"
+        assert c["spark.sql.autoBroadcastJoinThreshold"] == "26214400"
+        assert c["spark.sql.parquet.outputTimestampType"] == "TIMESTAMP_MICROS"
+    assert c20["spark.sql.ansi.enabled"] == "false" and "spark.sql.ansi.enabled" not in c13
+    assert c20["spark.sql.sources.default"] == "delta" and "spark.sql.sources.default" not in c13  # Delta 3.2 quirk
+    assert c20["spark.databricks.delta.properties.defaults.enableDeletionVectors"] == "true"
+    assert c13["spark.databricks.delta.optimizeWrite.enabled"] == "true"
