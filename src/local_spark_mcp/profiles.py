@@ -28,6 +28,10 @@ class Profile:
     scala: str  # binary version of the bundled jar
     hadoop_azure: str
     spark_major: int
+    # Session confs that make the local session behave like the Fabric runtime's
+    # production session where Spark's own default differs. [spark.extra_configs]
+    # still wins over these.
+    session_confs: dict = None  # type: ignore[assignment]
 
     @property
     def extra(self) -> str:
@@ -43,10 +47,15 @@ PROFILES: dict[str, Profile] = {
     "fabric-1.3": Profile(
         name="fabric-1.3", fabric_runtime="1.3", pyspark="3.5.9", delta="3.2.0", python=(3, 11),
         java_majors=(8, 11, 17), java_preferred=(17, 11, 8), scala="2.12", hadoop_azure="3.3.4", spark_major=3,
+        session_confs={},
     ),
     "fabric-2.0": Profile(
         name="fabric-2.0", fabric_runtime="2.0", pyspark="4.1.1", delta="4.2.0", python=(3, 13),
         java_majors=(17, 21), java_preferred=(21, 17), scala="2.13", hadoop_azure="3.4.1", spark_major=4,
+        # Spark 4 flipped ANSI on; a Runtime 2.0 production session runs it off
+        # (SparkListenerEnvironmentUpdate, ADO #286). Notebooks that cast '' to
+        # bigint fail locally otherwise.
+        session_confs={"spark.sql.ansi.enabled": "false"},
     ),
 }
 DEFAULT_PROFILE = "fabric-1.3"

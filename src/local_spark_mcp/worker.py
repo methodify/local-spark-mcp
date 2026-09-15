@@ -17,6 +17,23 @@ import traceback
 from .protocol import recv_msg, send_msg
 
 
+def _is_fatal(exc: BaseException) -> bool:
+    """The JVM is gone (driver OOM, killed): every later call would fail the
+    same way, so tell the server to respawn instead of returning errors."""
+    names = {type(e).__name__ for e in _chain(exc)}
+    msgs = " ".join(str(e) for e in _chain(exc))
+    return bool(names & {"Py4JNetworkError", "ConnectionRefusedError", "ConnectionResetError", "BrokenPipeError"}) \
+        or "Java gateway process exited" in msgs or "Answer from Java side is empty" in msgs
+
+
+def _chain(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
 def _handle(engine, method: str, params: dict):
     """Dispatch one request. Returns (result, engine) — engine may be created."""
     from .engine import SparkEngine
@@ -50,6 +67,8 @@ def _handle(engine, method: str, params: dict):
         ), engine
     if method == "sync_files":
         return engine.sync_files(params.get("paths"), params.get("direction", "pull"), params.get("lakehouse")), engine
+    if method == "restore_shadow":
+        return engine.restore_shadow(params["table"], int(params.get("version", 0))), engine
     if method == "shadow_status":
         return engine.shadow_status(), engine
     if method == "discard_shadow":
@@ -86,6 +105,7 @@ def run_worker(port: int) -> int:
                         "ok": False,
                         "error": f"{type(exc).__name__}: {exc}",
                         "traceback": traceback.format_exc(),
+                        "fatal": _is_fatal(exc),
                     },
                 )
     finally:

@@ -135,6 +135,32 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   lakehouse, and `LOCAL_SPARK_FILES_ROOT` names it for code that avoids the
   global path.
 
+- **Relative paths.** A relative `Files/...` in Spark (`spark.read.csv("Files/x")`,
+  `df.write.csv("Files/out")`) resolves against the default lakehouse's mirror,
+  as it resolves against the default lakehouse on Fabric; `session_info` shows
+  the working directory. Python's own cwd is unchanged: use
+  `/lakehouse/default/Files/...` for `open()`.
+- **Table names are case-insensitive**, as on Fabric: `dataverse.chtMotifTable`
+  resolves however you spell it and reaches the OneLake-cased path.
+- **`restore_shadow(table, version=0)`** rewinds one shadow to a Delta version
+  of its local log (default: the snapshot as first cloned) without touching
+  OneLake, for same-snapshot A/Bs. `RESTORE TABLE` cannot do this on a shallow
+  clone.
+- **Session confs follow the runtime.** Under `fabric-2.0` the session runs
+  `spark.sql.ansi.enabled=false`, as a Runtime 2.0 production session does
+  (Spark 4's own default is `true`). `[spark.extra_configs]` still overrides.
+- **Snapshot semantics.** A shallow clone is frozen at the OneLake table
+  version current when the session first touched the table, so every read of it
+  in the session sees the same rows, and two sessions started at different times
+  can see different versions. `discard_shadow` re-clones at the current version;
+  `persist_shadow = true` keeps the frozen version across sessions.
+  Deletion-vector views (`fabric-1.3`) and `writethrough` tables are live.
+- **Robustness.** `session_info` never waits on a busy kernel (it reports what
+  is running and the last known state). Cells, SQL, and notebooks have no
+  server-side timeout. A dead driver (an OOM, a kill) is detected on the next
+  call, reported, and replaced by a fresh session; raise `[spark] driver_memory`
+  for wide joins.
+
 ### The `/lakehouse` path
 
 The link is one global path per machine, so a lockfile records which session

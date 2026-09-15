@@ -52,7 +52,7 @@ def test_deletion_vector_table_reads_as_live_view_and_refuses_writes(tmp_path):
             assert not r.ok and "deletion vectors" in r.stdout, r.stdout
 
         # protocol scan for the doctor
-        feats = eng.table_features(LH, [TABLE])
+        feats = eng.table_features(LH, [TABLE])["tables"]
         assert feats[TABLE]["deletion_vectors"] is True and "deletionVectors" in feats[TABLE]["features"]
 
         # copying it out is the documented escape hatch: a plain local table in the shadow

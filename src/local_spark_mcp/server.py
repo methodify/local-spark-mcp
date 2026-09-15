@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -81,6 +82,17 @@ def _base_engine_kwargs(config: Config) -> dict:
 PROGRESS_INTERVAL = 2.0
 
 
+async def _acquire_with_progress(lock: asyncio.Lock, on_wait, note=None) -> None:
+    """Take the worker lock, pinging while another call holds it."""
+    while True:
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
+            if on_wait is not None:
+                await on_wait(note() if note else None)
+
+
 async def _await_with_progress(awaitable, on_wait, interval: float = PROGRESS_INTERVAL):
     """Await ``awaitable``, invoking ``on_wait`` (~every ``interval`` s) while it
     is still pending. Lets a tool emit MCP progress throughout a long worker/REST
@@ -111,6 +123,8 @@ class ServerState:
         self._cred = None
         self._workspace_id: str | None = None
         self._lakehouses = None  # list[LakehouseInfo] | None (None = not discovered)
+        self.busy: tuple[str, float] | None = None  # (method, started) while a worker call runs
+        self.last_info: dict | None = None
 
     def _fabric_enabled(self) -> bool:
         return bool(self.config.workspace.name or self.config.workspace.id)
@@ -226,6 +240,17 @@ class ServerState:
             await asyncio.to_thread(self._worker.stop)  # drop any half-started worker
         self._worker = WorkerProcess(engine_kwargs=self._engine_kwargs())
         await asyncio.to_thread(self._worker.start)
+        self.last_info = self._worker.info
+        # Self-check: in Fabric mode the lakehouses must have registered as databases.
+        if self._fabric_enabled() and self._lakehouses:
+            dbs = {d.lower() for d in (self._worker.info or {}).get("databases", [])}
+            missing = [lh.name for lh in self._lakehouses if lh.name.lower() not in dbs]
+            if missing:
+                self._drop_worker()
+                raise WorkerError(
+                    f"worker started but {len(missing)} lakehouse database(s) did not register ({', '.join(missing[:5])}); "
+                    "the session was discarded — check the server's stderr for the worker's traceback and call again"
+                )
 
     async def ensure_ready(self, on_wait=None) -> None:
         """Bring the worker up (once), awaiting an in-flight start if another
@@ -259,10 +284,45 @@ class ServerState:
 
     async def call(self, method: str, *args, on_wait=None):
         await self.ensure_ready(on_wait=on_wait)
-        async with self.lock:
-            return await _await_with_progress(
-                asyncio.to_thread(getattr(self._worker, method), *args), on_wait
-            )
+        await _acquire_with_progress(self.lock, on_wait, lambda: self.busy_note())
+        try:
+            self.busy = (method, time.monotonic())
+            try:
+                result = await _await_with_progress(
+                    asyncio.to_thread(getattr(self._worker, method), *args), on_wait
+                )
+            finally:
+                self.busy = None
+        except WorkerError as exc:
+            if exc.fatal:
+                self._drop_worker()
+                raise WorkerError(
+                    f"{exc}\n\nThe runtime was unusable (driver crashed or a call hung) and has been discarded; "
+                    "the next call starts a fresh session. Session state (variables, shadows) is lost. "
+                    "A driver OOM is the usual cause: raise [spark] driver_memory / LOCAL_SPARK_DRIVER_MEMORY.",
+                    exc.traceback_str,
+                ) from exc
+            raise
+        finally:
+            self.lock.release()
+        if method == "get_info":
+            self.last_info = result
+        return result
+
+    def _drop_worker(self) -> None:
+        w, self._worker = self._worker, None
+        self._start_task = None
+        if w is not None:
+            try:
+                w.stop()
+            except Exception:
+                pass
+
+    def busy_note(self) -> str | None:
+        if not self.busy:
+            return None
+        method, since = self.busy
+        return f"worker busy: {method} running for {int(time.monotonic() - since)}s"
 
     async def list_lakehouses(self, on_wait=None) -> list:
         await self._ensure_discovered(on_wait=on_wait)
@@ -331,7 +391,7 @@ def format_exec_result(res: dict) -> str:
     if res.get("ok"):
         return "\n".join(parts) if parts else "(ok — no output)"
     # error path: prefer the full traceback, fall back to the one-line summary
-    detail = (res.get("traceback") or "").rstrip("\n") or res.get("error") or "error"
+    detail = (res.get("traceback") or "").rstrip("\n") or res.get("error") or f"error (no detail from the worker; raw result: {res!r})"
     parts.append(detail)
     return "\n".join(parts)
 
@@ -387,6 +447,8 @@ def format_info(info: dict) -> str:
             lines.append(f"  deletion-vector tables, read-only here ({len(dv)}): {', '.join(dv)}")
         if info.get("profile"):
             lines.append(f"  profile: {info['profile']}")
+        if info.get("spark_working_dir"):
+            lines.append(f"  spark working dir: {info['spark_working_dir']}  (relative Files/... resolves here, like the default lakehouse on Fabric)")
         link = info.get("files_link")
         if link:
             state = f"-> {link['path']}" if link.get("linked") else f"NOT linked: {link.get('reason')}"
@@ -398,7 +460,7 @@ def format_info(info: dict) -> str:
 
 
 def format_sync(res: dict) -> str:
-    lines = [f"{res['direction']} {res['lakehouse']} {res.get('paths')}: {res.get('transferred', 0)} transferred "
+    lines = [f"{res.get('direction', '?')} {res.get('lakehouse', '?')} {res.get('paths')}: {res.get('transferred', 0)} transferred "
              f"({res.get('bytes', 0):,} bytes), {res.get('skipped', 0)} unchanged"]
     lines += [f"  error: {e}" for e in res.get("errors", [])[:20]]
     return "\n".join(lines)
@@ -450,12 +512,16 @@ def format_shadow(res: dict) -> str:
     return "\n".join(lines)
 
 
-def format_table_features(lakehouse: str, tables: list[str], feats: dict) -> str:
+def format_table_features(lakehouse: str, tables: list[str], result: dict) -> str:
+    feats = result.get("tables", result)
+    clone = result.get("dv_strategy") == "clone"
     dv = [t for t in tables if (feats.get(t) or {}).get("deletion_vectors")]
-    lines = [f"{lakehouse} ({len(tables)} tables; {len(dv)} with deletion vectors -> read-only views in sandbox/readonly):"]
+    how = ("cloned like any other table under this profile" if clone
+           else "read-only views in sandbox/readonly under this profile (Delta 3.2 cannot clone them)")
+    lines = [f"{lakehouse} ({len(tables)} tables; {len(dv)} with deletion vectors -> {how}):"]
     for t in tables:
         f = feats.get(t) or {}
-        tag = "  [deletionVectors: read-only here]" if f.get("deletion_vectors") else ""
+        tag = ("  [deletionVectors]" if clone else "  [deletionVectors: read-only here]") if f.get("deletion_vectors") else ""
         err = f"  (protocol unreadable: {f['error']})" if f.get("error") else ""
         lines.append(f"  {t}{tag}{err}")
     return "\n".join(lines)
@@ -483,10 +549,10 @@ def _pinger(ctx: Context, label: str = "working"):
     start and the operation itself (e.g. a query that lazily mounts a table)."""
     counter = {"n": 0}
 
-    async def ping():
+    async def ping(note: str | None = None):
         counter["n"] += 1
         try:
-            await ctx.report_progress(progress=counter["n"], total=None, message=f"{label}…")
+            await ctx.report_progress(progress=counter["n"], total=None, message=f"{label}…" + (f" ({note})" if note else ""))
         except Exception:
             pass  # no progress token / client doesn't support it — ignore
 
@@ -535,7 +601,9 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def session_info(ctx: Context) -> str:
-        """Show the live Spark session: version, master, current database, the catalog databases, and any Fabric lakehouses registered this session."""
+        """Show the live Spark session: version, master, current database, the catalog databases, and any Fabric lakehouses registered this session. Never waits on a busy kernel: while a long cell runs, it returns the last known state plus what is running."""
+        if state.lock.locked() and state.last_info is not None:
+            return f"{state.busy_note() or 'worker busy'} — last known state:\n\n" + format_info(state.last_info)
         info = await state.call("get_info", on_wait=_pinger(ctx, "starting session"))
         return format_info(info)
 
@@ -604,6 +672,19 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         res = await state.call("discard_shadow", only, on_wait=_pinger(ctx, "discarding shadow"))
         names = ", ".join(f"{t['lakehouse']}.{t['table']}" for t in res.get("tables", []))
         return f"Discarded {res.get('discarded', 0)} shadowed table(s){': ' + names if names else ''}."
+
+    @mcp.tool()
+    async def restore_shadow(table: str, ctx: Context, version: int = 0) -> str:
+        """Rewind one shadowed table (`lakehouse.table`) to a Delta version of its local shadow — default 0, the snapshot as first cloned — by truncating the shadow's log. No OneLake reads, so it is exact and fast; use it for same-snapshot A/Bs. RESTORE TABLE cannot do this on a shallow clone."""
+        if note := _local_only_note():
+            return note
+        try:
+            res = await state.call("restore_shadow", table, version, on_wait=_pinger(ctx, "restoring shadow"))
+        except WorkerError as exc:
+            return f"restore_shadow failed: {exc}"
+        return (f"{res['lakehouse']}.{res['table']} restored to version {res['restored_to']} "
+                f"({res['removed_commits']} commit(s) and {res['removed_files']} local data file(s) discarded); "
+                f"state now {res['state']}, v{res['version']}.")
 
     @mcp.tool()
     async def list_lakehouses(ctx: Context) -> str:

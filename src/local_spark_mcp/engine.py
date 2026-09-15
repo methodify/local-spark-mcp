@@ -101,6 +101,7 @@ class SparkEngine:
         self.files: "FilesMirror | None" = None
         self.files_link: dict | None = None
         self.files_sync_report: list[dict] = []
+        self.spark_working_dir: str | None = None
         self._notebook_index: dict | None = None
         self._cred = None
         self._fabric_client = None
@@ -171,12 +172,28 @@ class SparkEngine:
         """Point /lakehouse/default at this lakehouse's mirror and pull the
         configured Files/ subtrees (cached: unchanged files are skipped)."""
         self.files_link = self.files.link_default(lakehouse)
+        self._set_spark_working_dir(Path(self.files_link["files_root"]).parent)
         for rel in self.files_sync:
             try:
                 self.files_sync_report.append(self.files.pull(lakehouse, [rel]).to_dict())
             except Exception as exc:  # keep the session usable; report instead
                 self.files_sync_report.append({"direction": "pull", "lakehouse": lakehouse, "paths": [rel],
                                                "errors": [f"{type(exc).__name__}: {exc}"]})
+
+    def _set_spark_working_dir(self, lakehouse_dir: Path) -> None:
+        """On Fabric a relative `Files/x` resolves against the default lakehouse.
+        Locally the default filesystem is file:/// with the JVM's cwd as its
+        working directory; point that working directory at the lakehouse mirror
+        dir (<...>/<lakehouse-id>, whose Files/ is the mirror) so
+        spark.read.csv("Files/x") and df.write...("Files/out") land there too."""
+        try:
+            jvm = self.spark._jvm
+            fs = jvm.org.apache.hadoop.fs.FileSystem.getLocal(self.spark._jsc.hadoopConfiguration())
+            fs.setWorkingDirectory(jvm.org.apache.hadoop.fs.Path(str(lakehouse_dir)))
+            self.spark_working_dir = str(lakehouse_dir)
+        except Exception as exc:  # pragma: no cover - best effort
+            self.spark_working_dir = None
+            print(f"local-spark: could not set the Spark working directory: {exc}", file=sys.stderr)
 
     def sync_files(self, paths: list[str] | None = None, direction: str = "pull", lakehouse: str | None = None) -> dict:
         if self.files is None:
@@ -260,6 +277,39 @@ class SparkEngine:
             return original(sparkSession, tableOrViewName)
 
         DeltaTable.forName = classmethod(forName)
+
+        # DeltaTable.create*(spark).tableName("lh.t").execute() consults the V1
+        # catalog too (dwlib's ChangeMgr does this): touch the table first so an
+        # untouched OneLake table is materialized under the write policy.
+        try:
+            from delta.tables import DeltaTableBuilder
+        except ImportError:  # pragma: no cover
+            return
+        orig_table_name = getattr(DeltaTableBuilder, "_localspark_original_tableName", None) or DeltaTableBuilder.tableName
+        orig_execute = getattr(DeltaTableBuilder, "_localspark_original_execute", None) or DeltaTableBuilder.execute
+        DeltaTableBuilder._localspark_original_tableName = orig_table_name
+        DeltaTableBuilder._localspark_original_execute = orig_execute
+
+        def tableName(self_, identifier):
+            self_._localspark_table = identifier
+            return orig_table_name(self_, identifier)
+
+        def execute(self_):
+            name = getattr(self_, "_localspark_table", None)
+            if name:
+                engine._touch_table(name)
+            return orig_execute(self_)
+
+        DeltaTableBuilder.tableName = tableName
+        DeltaTableBuilder.execute = execute
+
+    def _touch_table(self, name: str) -> None:
+        """Resolve a lakehouse table through OneLakeCatalog (materializing it on
+        first touch); a table that does not exist yet is not an error here."""
+        try:
+            self.spark.table(name)
+        except Exception:
+            pass
 
     def _refuse_if_readonly(self, table_name: str) -> None:
         if self.write_mode != "readonly" or not getattr(self, "lakehouses", None):
@@ -380,7 +430,7 @@ class SparkEngine:
                 return table, {"features": [], "deletion_vectors": None, "error": f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"}
 
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
-            return dict(pool.map(one, tables))
+            return {"tables": dict(pool.map(one, tables)), "dv_strategy": self.dv_strategy}
 
     def _exec(self, code: str) -> tuple[ExecResult, BaseException | None]:
         """Run a cell; also return the raised exception (the runner needs to
@@ -393,6 +443,8 @@ class SparkEngine:
         error = None
         tb = None
         exc = result.error_before_exec or result.error_in_exec
+        if exc is not None and not str(exc):
+            error = repr(exc)
         if exc is not None:
             error = f"{type(exc).__name__}: {exc}"
             # IPython's captured stderr is unreliable for tracebacks; format from
@@ -749,6 +801,7 @@ class SparkEngine:
             "dv_strategy": self.dv_strategy,
             "profile": _profile_label(),
             "files_root": (self.files_link or {}).get("files_root"),
+            "spark_working_dir": self.spark_working_dir,
             "files_link": self.files_link,
             "files_sync": self.files_sync_report,
             "execution_count": self.shell.execution_count,
@@ -825,6 +878,35 @@ class SparkEngine:
             "tables": self._shadow_tables(),
             "deletion_vector_tables": self._dv_tables(),
         }
+
+    def restore_shadow(self, table: str, version: int = 0) -> dict:
+        """Rewind one shadow to a Delta version by truncating its local
+        `_delta_log` (default: version 0, the clone commit = the OneLake snapshot
+        as first touched). Metadata only, no OneLake reads; local data files added
+        by the discarded commits are deleted. RESTORE TABLE cannot do this on a
+        shallow clone (its files live on another filesystem: "Wrong FS")."""
+        parts = [p.strip("`") for p in table.split(".")]
+        if len(parts) == 1 and self.default_lakehouse:
+            parts = [self.default_lakehouse, parts[0]]
+        if len(parts) != 2:
+            raise ValueError(f"table must be <lakehouse>.<table> (got {table!r})")
+        match = [t for t in self._shadow_tables()
+                 if t["lakehouse"].lower() == parts[0].lower() and t["table"].lower() == parts[1].lower()]
+        if not match:
+            raise LookupError(f"{parts[0]}.{parts[1]} has no shadow this session (nothing to restore)")
+        shadow = match[0]
+        removed = _truncate_delta_log(Path(shadow["path"]), version)
+        try:
+            self.spark._jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+        except Exception:
+            pass
+        try:
+            self.spark.catalog.refreshTable(f"{self._q(shadow['lakehouse'])}.{self._q(shadow['table'])}")
+        except Exception:
+            pass
+        state, latest = _shadow_state(Path(shadow["path"]))
+        return {"lakehouse": shadow["lakehouse"], "table": shadow["table"], "restored_to": version,
+                "removed_commits": removed["commits"], "removed_files": removed["files"], "state": state, "version": latest}
 
     def discard_shadow(self, only: str | None = None) -> dict:
         """Drop shadowed tables from the catalog and delete their files, so the
@@ -922,6 +1004,48 @@ def _dv_strategy() -> str:
         return "clone" if (major, minor) >= (3, 3) else "view"
     except Exception:
         return "view"
+
+
+def _truncate_delta_log(table_dir: Path, version: int) -> dict:
+    """Drop every commit after `version` from a local Delta table: later commit
+    JSONs, later checkpoints, `_last_checkpoint`, and the data files those
+    commits added. Returns counts. Raises if `version` is beyond the log."""
+    log = table_dir / "_delta_log"
+    versions = sorted(int(p.stem) for p in log.glob("*.json") if p.stem.isdigit())
+    if not versions or version < versions[0] or version > versions[-1]:
+        raise ValueError(f"version {version} is not in this shadow's log ({versions[0] if versions else '?'}..{versions[-1] if versions else '?'})")
+    removed_commits, removed_files = 0, 0
+    for v in versions:
+        if v <= version:
+            continue
+        commit = log / f"{v:020d}.json"
+        for line in commit.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                action = json.loads(line)
+            except ValueError:
+                continue
+            add = action.get("add")
+            if add and add.get("path") and "://" not in add["path"]:
+                f = table_dir / add["path"]
+                if f.is_file():
+                    f.unlink()
+                    removed_files += 1
+        commit.unlink()
+        removed_commits += 1
+    for cp in log.glob("*.checkpoint*.parquet"):
+        try:
+            if int(cp.name.split(".")[0]) > version:
+                cp.unlink()
+        except ValueError:
+            pass
+    for extra in ("_last_checkpoint",):
+        if (log / extra).exists():
+            (log / extra).unlink()
+    for crc in log.glob("*.crc"):
+        stem = crc.name.lstrip(".").split(".")[0]
+        if stem.isdigit() and int(stem) > version:
+            crc.unlink()
+    return {"commits": removed_commits, "files": removed_files}
 
 
 def _shadow_state(table_dir: Path) -> tuple[str, int]:

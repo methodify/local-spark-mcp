@@ -114,7 +114,9 @@ server's **stderr**; stdout is reserved for the MCP transport.
   `LOCAL_SPARK_PROFILE`) errors on a mismatch or a missing Spark stack and
   warns on patch/Python drift; `validate_runtime` and the startup log use it.
   Keep `PROFILES`, the extras, and `token-provider/build.sbt` in step
-  (`test_profiles.py` checks the extras).
+  (`test_profiles.py` checks the extras). `session_confs` carry runtime parity
+  where Spark's default differs: fabric-2.0 sets `spark.sql.ansi.enabled=false`
+  (a Runtime 2.0 production session runs ANSI off; Spark 4 defaults it on).
 - `java.py` — resolve a `JAVA_HOME` for the profile's Spark: explicit → vfox
   JDKs in the profile's preferred order (21 then 17 for 2.0; 17, 11, 8 for
   1.3) → `JAVA_HOME` → `java` on PATH. Every candidate is `realpath`'d (vfox
@@ -141,6 +143,10 @@ server's **stderr**; stdout is reserved for the MCP transport.
   (Delta is a `StagingTableCatalog`, so CTAS/`saveAsTable` bypass `createTable`).
   A `ThreadLocal` reentrancy guard keeps the nested `CREATE TABLE` from
   re-entering the resolver. Only OneLake existence checks are cached.
+  **Case-insensitive names** (Fabric's catalog is; OneLake paths are not):
+  on an exact-path miss the catalog lists the lakehouse's `Tables/` once
+  (cached 60 s) and matches the name case-insensitively, then materializes
+  the OneLake-cased path under Spark's (lowercased) identifier.
   **Deletion-vector tables** (Link-to-Fabric mirrors such as `dataverse_l2f`;
   protocol feature `deletionVectors`): Delta 3.2 cannot SHALLOW CLONE them
   (`DELTA_ADDING_DELETION_VECTORS_DISALLOWED`, and forcing the feature trips
@@ -167,6 +173,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
   `forName` bridge refuses with `dv_refusal()`; cell errors from writes against
   such a view are annotated (`annotate_error`); `table_features()` reads
   protocols per table for `list_tables(features=True)`.
+  `_activate_files` also points the Hadoop local filesystem's working
+  directory at the lakehouse mirror dir (`_set_spark_working_dir`), so a
+  relative `Files/x` in Spark resolves there, like the default lakehouse on
+  Fabric. The `DeltaTableBuilder` bridge (`tableName`/`execute`) touches the
+  target table first so `DeltaTable.createIfNotExists(...).tableName("lh.t")`
+  materializes an untouched OneLake table (dwlib's ChangeMgr).
   `run_notebook(path, cells, stop_on_error, default_lakehouse, parameters)`
   runs a parsed notebook cell by cell in the same namespace: markdown skipped,
   `%%sql` via `run_sql`, line magics stripped and reported, `USE` of the
@@ -176,7 +188,14 @@ server's **stderr**; stdout is reserved for the MCP transport.
   alongside the `ExecResult`).
 - `protocol.py` / `worker.py` / `worker_client.py` — length-prefixed JSON over a
   dedicated localhost socket; worker process holds the engine; `WorkerProcess`
-  spawns/handshakes/proxies and `restart()` = reset.
+  spawns/handshakes/proxies and `restart()` = reset. Long methods (`run_code`,
+  `run_sql`, `run_notebook`, `mount_tables`, `sync_files`, `table_features`)
+  have **no socket timeout** (MCP pings cover the wait; a timeout would desync
+  the socket); cheap calls keep 600 s. A worker error whose cause is a dead
+  JVM (`Py4JNetworkError`, connection refused/reset, "Java gateway process
+  exited") is flagged `fatal`; the server drops the worker, reports it, and the
+  next call starts a fresh session. After start, the server checks that every
+  lakehouse registered as a database and discards the worker otherwise.
 - `server.py` — FastMCP stdio server; one serialized worker; lazy startup;
   blocking IPC offloaded to a thread; Fabric mode auto-enabled by `[workspace]`.
   Reports the package version (`__version__`, pinned to `pyproject.toml` by a
@@ -254,7 +273,13 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - **sync_files** — pull `Files/` subtrees into the mirror behind
   `/lakehouse/default/Files` (or push, in writethrough only).
 - **list_tables(features=True)** — per-table Delta protocol scan flagging
-  deletion-vector tables (read-only here on Delta 3.2).
+  deletion-vector tables (read-only under fabric-1.3, cloned under fabric-2.0).
+- **restore_shadow(table, version=0)** — truncate a shadow's local `_delta_log`
+  back to a version (default the clone commit) without re-reading OneLake
+  (`_truncate_delta_log`; RESTORE TABLE fails on a shallow clone with "Wrong
+  FS"). Clears Delta's log cache and refreshes the table.
+- **session_info never blocks**: while a call holds the worker lock it returns
+  the last known info plus "worker busy: <method> running for Ns".
 
 ## Locked design decisions
 

@@ -21,7 +21,8 @@ from .protocol import recv_msg, send_msg
 # throughout, and a worker that dies is caught at once by the accept loop, so
 # a generous ceiling costs nothing but avoids spurious startup failures.
 DEFAULT_STARTUP_TIMEOUT = 600.0
-DEFAULT_CALL_TIMEOUT = 600.0
+DEFAULT_CALL_TIMEOUT = 600.0  # cheap calls; cells/SQL/notebooks run unbounded (MCP pings cover the wait)
+LONG_METHODS = {"run_code", "run_sql", "run_notebook", "mount_tables", "sync_files", "table_features"}
 
 
 def _worker_spawn() -> tuple[str, dict]:
@@ -50,11 +51,13 @@ def _worker_spawn() -> tuple[str, dict]:
 
 
 class WorkerError(Exception):
-    """A request failed in the worker (carries the remote error/traceback)."""
+    """A request failed in the worker (carries the remote error/traceback).
+    ``fatal`` means the worker/JVM is unusable and must be respawned."""
 
-    def __init__(self, message: str, traceback_str: str | None = None):
+    def __init__(self, message: str, traceback_str: str | None = None, *, fatal: bool = False):
         super().__init__(message)
         self.traceback_str = traceback_str
+        self.fatal = fatal
 
 
 class WorkerProcess:
@@ -145,18 +148,24 @@ class WorkerProcess:
         self._id += 1
         req_id = self._id
         send_msg(self._conn, {"id": req_id, "method": method, "params": params or {}})
-        self._conn.settimeout(timeout if timeout is not None else self.call_timeout)
+        if timeout is None:
+            timeout = None if method in LONG_METHODS else self.call_timeout
+        self._conn.settimeout(timeout)
         try:
             resp = recv_msg(self._conn)
         except socket.timeout as exc:
-            raise WorkerError(f"worker call '{method}' timed out") from exc
+            # the reply will arrive later on this socket, out of step with the next
+            # request: the connection is unusable from here on
+            raise WorkerError(f"worker call '{method}' timed out after {timeout}s; the runtime must be reset", fatal=True) from exc
+        except OSError as exc:
+            raise WorkerError(f"worker connection lost during '{method}': {exc}", fatal=True) from exc
         if resp is None:
             raise WorkerError(
                 f"worker closed connection during '{method}'"
                 + (f" (exit code {self._proc.poll()})" if self._proc else "")
             )
         if not resp.get("ok"):
-            raise WorkerError(resp.get("error", "unknown worker error"), resp.get("traceback"))
+            raise WorkerError(resp.get("error", "unknown worker error"), resp.get("traceback"), fatal=bool(resp.get("fatal")))
         return resp["result"]
 
     # --- proxied engine operations ---
@@ -187,6 +196,9 @@ class WorkerProcess:
 
     def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:
         return self._call("sync_files", {"paths": paths, "direction": direction, "lakehouse": lakehouse})
+
+    def restore_shadow(self, table: str, version: int = 0) -> dict:
+        return self._call("restore_shadow", {"table": table, "version": version})
 
     def shadow_status(self) -> dict:
         return self._call("shadow_status")

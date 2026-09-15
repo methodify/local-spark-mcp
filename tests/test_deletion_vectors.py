@@ -48,12 +48,15 @@ def test_annotate_error_only_for_dv_view_writes():
 
 
 def test_format_table_features_and_shadow_dv():
-    out = format_table_features("dataverse_l2f", ["custtable", "plain", "broken"], {
+    feats = {
         "custtable": {"features": ["deletionVectors"], "deletion_vectors": True, "error": None},
         "plain": {"features": [], "deletion_vectors": False, "error": None},
         "broken": {"features": [], "deletion_vectors": None, "error": "X: y"},
-    })
+    }
+    out = format_table_features("dataverse_l2f", ["custtable", "plain", "broken"], {"tables": feats, "dv_strategy": "view"})
     assert "1 with deletion vectors" in out and "custtable  [deletionVectors: read-only here]" in out
+    out2 = format_table_features("dataverse_l2f", ["custtable"], {"tables": feats, "dv_strategy": "clone"})
+    assert "cloned like any other table" in out2 and "read-only" not in out2
     assert "broken  (protocol unreadable: X: y)" in out and "\n  plain\n" in out + "\n"
     out = format_shadow({"write_mode": "sandbox", "shadow_root": "/s", "persistent": False, "tables": [],
                          "deletion_vector_tables": [{"lakehouse": "dataverse_l2f", "table": "custtable"}]})

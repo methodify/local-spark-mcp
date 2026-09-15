@@ -88,7 +88,10 @@ def build_spark(
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
 
-    configs = dict(extra_configs or {})
+    from .profiles import current_profile
+
+    configs = dict(current_profile().session_confs or {})  # runtime parity first...
+    configs.update(extra_configs or {})  # ...then the user's [spark.extra_configs]
     for key, value in user_env.items():
         configs.setdefault(f"spark.executorEnv.{key}", value)
     extra_packages: list[str] = []
