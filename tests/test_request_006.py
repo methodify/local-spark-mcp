@@ -90,6 +90,6 @@ def test_profile_session_confs():
         assert c["spark.sql.autoBroadcastJoinThreshold"] == "26214400"
         assert c["spark.sql.parquet.outputTimestampType"] == "TIMESTAMP_MICROS"
     assert c20["spark.sql.ansi.enabled"] == "false" and "spark.sql.ansi.enabled" not in c13
-    assert c20["spark.sql.sources.default"] == "delta" and "spark.sql.sources.default" not in c13  # Delta 3.2 quirk
+    assert c20["spark.sql.sources.default"] == "delta" and c13["spark.sql.sources.default"] == "delta"
     assert c20["spark.databricks.delta.properties.defaults.enableDeletionVectors"] == "true"
     assert c13["spark.databricks.delta.optimizeWrite.enabled"] == "true"

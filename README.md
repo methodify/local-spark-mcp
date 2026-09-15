@@ -154,12 +154,9 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   real Fabric session differs from Spark's default (taken from production
   session event logs): session time zone `UTC`, Kryo serializer, 25 MB
   broadcast threshold, cost-based optimizer on, Arrow for `toPandas`,
-  Parquet timestamps as `TIMESTAMP_MICROS`, and under `fabric-2.0` ANSI off,
-  `sources.default=delta` (so an untyped `CREATE TABLE` and `df.write.save`
-  mean Delta), and deletion vectors on for new tables. Under `fabric-1.3`,
-  `sources.default` stays parquet: on upstream Spark 3.5 / Delta 3.2 the Delta
-  default breaks `mode("overwrite").saveAsTable` into a new table, so name the
-  format explicitly there when it matters. Fabric-only engines and committers are
+  Parquet timestamps as `TIMESTAMP_MICROS`, `sources.default=delta` (so an
+  untyped `CREATE TABLE` and `df.write.save` mean Delta), and under
+  `fabric-2.0` ANSI off and deletion vectors on for new tables. Fabric-only engines and committers are
   not copied. `[spark.extra_configs]` still overrides. Python's own time zone
   stays the machine's.
 - **Snapshot semantics.** A shallow clone is frozen at the OneLake table

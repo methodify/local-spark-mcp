@@ -60,6 +60,7 @@ _FABRIC_COMMON_CONFS = {
     "spark.sql.legacy.replaceDatabricksSparkAvro.enabled": "false",
     "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly": "false",
     "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",
+    "spark.sql.sources.default": "delta",  # untyped CREATE TABLE / df.write.save mean Delta (both runtimes)
     "spark.sql.statistics.fallBackToHdfs": "true",
     "spark.databricks.delta.vacuum.parallelDelete.enabled": "true",
 }
@@ -68,11 +69,9 @@ PROFILES: dict[str, Profile] = {
     "fabric-1.3": Profile(
         name="fabric-1.3", fabric_runtime="1.3", pyspark="3.5.5", delta="3.2.0", python=(3, 11),
         java_majors=(8, 11, 17), java_preferred=(17, 11, 8), scala="2.12", hadoop_azure="3.3.4", spark_major=3,
-        # Not spark.sql.sources.default=delta here: on Spark 3.5 / Delta 3.2 it
-        # breaks df.write.mode("overwrite").saveAsTable(<new table>) ("does not
-        # support truncate in batch mode"), even with format("delta"). Fabric's
-        # 3.5 build evidently carries a fix; upstream 3.5.9 does not. Residual:
-        # untyped CREATE TABLE / df.write.save() are parquet locally under 1.3.
+        # pyspark must stay <= 3.5.5 here: Spark 3.5.6+ makes any Delta
+        # mode("overwrite").saveAsTable(<new table>) fail on Delta 3.2
+        # ("does not support truncate in batch mode", delta-io/delta#4671).
         session_confs={**_FABRIC_COMMON_CONFS, "spark.databricks.delta.optimizeWrite.enabled": "true"},
     ),
     "fabric-2.0": Profile(
@@ -84,7 +83,6 @@ PROFILES: dict[str, Profile] = {
             # (ADO #286): notebooks that cast '' to bigint fail locally otherwise.
             "spark.sql.ansi.enabled": "false",
             "spark.sql.unionOutputPartitioning": "false",
-            "spark.sql.sources.default": "delta",  # untyped CREATE TABLE / df.write.save mean Delta
             # Runtime 2.0 creates tables with deletion vectors by default.
             "spark.databricks.delta.properties.defaults.enableDeletionVectors": "true",
         },

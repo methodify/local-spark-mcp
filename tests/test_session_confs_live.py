@@ -25,9 +25,9 @@ def test_profile_confs_apply(tmp_path):
         # overwrite into a NEW table must keep working (Spark 3.5 / Delta 3.2 break it under sources.default=delta)
         out = _run(eng, f"spark.range(2).write.mode('overwrite').saveAsTable('{LH}.lsm_conf_probe'); spark.range(3).write.mode('overwrite').saveAsTable('{LH}.lsm_conf_probe'); print('N', spark.table('{LH}.lsm_conf_probe').count())")
         assert "N 3" in out, out
-        if "spark.sql.sources.default" in prof.session_confs:  # fabric-2.0: untyped tables are Delta
-            out = _run(eng, f"spark.sql('CREATE TABLE {LH}.lsm_conf_plain (id INT)'); print('FMT', spark.sql('DESCRIBE DETAIL {LH}.lsm_conf_plain').select('format').first()[0])")
-            assert "FMT delta" in out, out
+        # sources.default=delta on both profiles: an untyped CREATE TABLE is Delta
+        out = _run(eng, f"spark.sql('CREATE TABLE {LH}.lsm_conf_plain (id INT)'); print('FMT', spark.sql('DESCRIBE DETAIL {LH}.lsm_conf_plain').select('format').first()[0])")
+        assert "FMT delta" in out, out
     finally:
         eng.stop()
         srv.stop()

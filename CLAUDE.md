@@ -119,13 +119,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
   the `SparkListenerEnvironmentUpdate` events in
   `~/src/fabric-data-warehouse/spark-logs/` (Runtime 2.0 and 1.3 sessions):
   UTC session time zone, Kryo, 25 MB broadcast threshold, CBO, Arrow,
-  `createHiveTableByDefault=false`, TIMESTAMP_MICROS, `fallBackToHdfs`; 1.3
-  adds `optimizeWrite`; 2.0 adds ANSI off, `unionOutputPartitioning=false`,
-  `sources.default=delta`, deletion vectors on by default. **Not
-  `sources.default=delta` on 1.3:** with upstream Spark 3.5.9 / Delta 3.2.0 it
-  makes `df.write.mode("overwrite").saveAsTable(<new>)` fail with "does not
-  support truncate in batch mode" (plain `DeltaCatalog` reproduces it; explicit
-  `format("delta")` doesn't help; 2.0 is fine). Fabric-only
+  `createHiveTableByDefault=false`, `sources.default=delta`, TIMESTAMP_MICROS,
+  `fallBackToHdfs`; 1.3 adds `optimizeWrite`; 2.0 adds ANSI off,
+  `unionOutputPartitioning=false`, deletion vectors on by default. (An earlier
+  note blamed `sources.default=delta` for the 1.3 overwrite failure; the
+  culprit was pyspark 3.5.6+, see the pin note below, and `sources.default`
+  had been set in `build_spark` since day one anyway.) Fabric-only
   classes (Gluten, cloud committers, RocksDB state store, native Parquet
   writer, V-Order) are not copied. To re-diff after a runtime update: extract
   the event's "Spark Properties" and compare with `spark.conf.get(key)` (no

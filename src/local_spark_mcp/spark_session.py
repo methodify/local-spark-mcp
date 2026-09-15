@@ -122,7 +122,6 @@ def build_spark(
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", catalog_class)
         .config("spark.driver.memory", driver_memory)
-        .config("spark.sql.sources.default", "delta")
     )
     for key, value in configs.items():
         builder = builder.config(key, value)
