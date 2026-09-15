@@ -193,8 +193,11 @@ server's **stderr**; stdout is reserved for the MCP transport.
   have **no socket timeout** (MCP pings cover the wait; a timeout would desync
   the socket); cheap calls keep 600 s. A worker error whose cause is a dead
   JVM (`Py4JNetworkError`, connection refused/reset, "Java gateway process
-  exited") is flagged `fatal`; the server drops the worker, reports it, and the
-  next call starts a fresh session. After start, the server checks that every
+  exited") is flagged `fatal`, and so is any failed cell/SQL result after which
+  a one-call JVM liveness probe fails (a dead gateway surfaces as a bare
+  `Py4JError` that text alone can't classify); the server drops the worker,
+  reports it, and the next call starts a fresh session
+  (`tests/test_dead_driver_recovery.py`). After start, the server checks that every
   lakehouse registered as a database and discards the worker otherwise.
 - `server.py` — FastMCP stdio server; one serialized worker; lazy startup;
   blocking IPC offloaded to a thread; Fabric mode auto-enabled by `[workspace]`.

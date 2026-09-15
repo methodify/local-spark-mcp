@@ -166,6 +166,10 @@ class WorkerProcess:
             )
         if not resp.get("ok"):
             raise WorkerError(resp.get("error", "unknown worker error"), resp.get("traceback"), fatal=bool(resp.get("fatal")))
+        if resp.get("fatal"):  # the call completed, but its result says the JVM is gone
+            result = resp.get("result") or {}
+            raise WorkerError(result.get("error") or "the Spark driver is no longer reachable",
+                              result.get("traceback") or result.get("stdout"), fatal=True)
         return resp["result"]
 
     # --- proxied engine operations ---

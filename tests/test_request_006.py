@@ -49,6 +49,15 @@ def test_truncate_keeps_files_of_kept_commits_and_rejects_bad_versions(tmp_path)
         _truncate_delta_log(t, 5)
 
 
+def test_result_level_fatal_detection():
+    from local_spark_mcp.worker import _result_is_fatal
+
+    assert _result_is_fatal({"ok": False, "error": "Py4JNetworkError: An error occurred while trying to connect"})
+    assert _result_is_fatal({"ok": False, "error": "RuntimeError", "traceback": "... Java gateway process exited ..."})
+    assert not _result_is_fatal({"ok": False, "error": "AnalysisException: column x not found"})
+    assert not _result_is_fatal({"ok": True, "stdout": "fine"})
+
+
 def test_fatal_detection():
     class Py4JNetworkError(Exception):
         pass

@@ -17,6 +17,31 @@ import traceback
 from .protocol import recv_msg, send_msg
 
 
+_FATAL_MARKERS = ("Py4JNetworkError", "Java gateway process exited", "Answer from Java side is empty",
+                  "ConnectionRefusedError", "Connection refused", "ConnectionResetError")
+
+
+def _result_is_fatal(result, engine=None) -> bool:
+    """A cell/SQL result whose error is the dead JVM talking (the cell itself
+    ran, so no exception reached the dispatcher). Text markers first; then,
+    for any failed result, one trivial JVM call as a liveness probe — a dead
+    gateway raises a bare Py4JError that no text marker can tell apart from a
+    protocol hiccup."""
+    if not isinstance(result, dict) or result.get("ok", True) and "error" not in result:
+        return False
+    text = f"{result.get('error') or ''}\n{result.get('traceback') or ''}\n{result.get('stdout') or ''}"
+    if any(m in text for m in _FATAL_MARKERS):
+        return True
+    spark = getattr(engine, "spark", None)
+    if spark is None:
+        return False
+    try:
+        spark._jvm.java.lang.System.currentTimeMillis()
+        return False
+    except Exception:
+        return True
+
+
 def _is_fatal(exc: BaseException) -> bool:
     """The JVM is gone (driver OOM, killed): every later call would fail the
     same way, so tell the server to respawn instead of returning errors."""
@@ -96,7 +121,7 @@ def run_worker(port: int) -> int:
 
             try:
                 result, engine = _handle(engine, method, params)
-                send_msg(sock, {"id": rid, "ok": True, "result": result})
+                send_msg(sock, {"id": rid, "ok": True, "result": result, "fatal": _result_is_fatal(result, engine)})
             except Exception as exc:  # report, keep serving
                 send_msg(
                     sock,
