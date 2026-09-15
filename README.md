@@ -167,9 +167,16 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   Deletion-vector views (`fabric-1.3`) and `writethrough` tables are live.
 - **Robustness.** `session_info` never waits on a busy kernel (it reports what
   is running and the last known state). Cells, SQL, and notebooks have no
-  server-side timeout. A dead driver (an OOM, a kill) is detected on the next
-  call, reported, and replaced by a fresh session; raise `[spark] driver_memory`
-  for wide joins.
+  server-side timeout, and there is **no idle timeout**: a session lives until
+  `reset_runtime`, the server exits, or the process dies. A dead driver (an
+  OOM, a kill) is detected on the failing call and replaced by a fresh session;
+  a worker that died *between* calls is reported at the top of the next result
+  (`notice: runtime restarted: … exited after Ns idle (killed by SIGKILL, the
+  OS out-of-memory killer's signal) …`). Raise `[spark] driver_memory` for wide
+  joins.
+- **First-touch cost is visible.** When a cell or query materializes a table
+  for the first time, the result leads with `notice: mounted <lakehouse>.<table>
+  in N s (shallow clone)`, so the mount never hides inside your own timing.
 
 ### The `/lakehouse` path
 

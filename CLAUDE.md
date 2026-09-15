@@ -295,6 +295,14 @@ server's **stderr**; stdout is reserved for the MCP transport.
   FS"). Clears Delta's log cache and refreshes the table.
 - **session_info never blocks**: while a call holds the worker lock it returns
   the last known info plus "worker busy: <method> running for Ns".
+- **Notices** (REQUEST-007): `OneLakeCatalog.materialize` times each
+  materialization into a JVM queue; `engine.drain_mount_notices()` empties it
+  after every cell / query / notebook cell and the formatters print
+  `notice: mounted <lh>.<t> in N s (<how>)` first. `ServerState.ensure_ready`
+  detects a worker that died between calls (`info` set, `running` false),
+  queues `runtime restarted: … exited after Ns idle (<exit reason>) …`, and
+  every tool prepends pending notices via `state.with_notices()`. There is no
+  idle timeout anywhere in the server.
 
 ## Locked design decisions
 

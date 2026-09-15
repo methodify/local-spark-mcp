@@ -35,6 +35,7 @@ class ExecResult:
     error: str | None = None  # "ExceptionType: message" when the cell raised
     traceback: str | None = None  # full formatted traceback when available
     execution_count: int | None = None
+    notices: list[str] = field(default_factory=list)  # e.g. first-touch mounts during this cell
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -49,6 +50,7 @@ class SqlResult:
     row_count: int = 0
     truncated: bool = False
     limit: int = 0
+    notices: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -498,7 +500,26 @@ class SparkEngine:
 
     def run_code(self, code: str) -> ExecResult:
         """Run a cell of Python against the persistent namespace."""
-        return self._exec(code)[0]
+        res = self._exec(code)[0]
+        res.notices.extend(self.drain_mount_notices())
+        return res
+
+    def drain_mount_notices(self) -> list[str]:
+        """Tables OneLakeCatalog materialized since the last drain, as
+        "mounted <lakehouse>.<table> in N s (<how>)" lines, so first-touch cost
+        is visible next to the cell's output instead of hidden in its timing."""
+        try:
+            items = list(self.spark._jvm.ch.fs.OneLakeCatalog.drainMaterialized())
+        except Exception:
+            return []
+        out = []
+        for item in items:
+            try:
+                name, millis, how = str(item).split("\t")
+                out.append(f"mounted {name} in {float(millis) / 1000:.1f} s ({how})")
+            except ValueError:
+                out.append(f"mounted {item}")
+        return out
 
     # ---- notebook runner ----
 
@@ -579,6 +600,7 @@ class SparkEngine:
                 entry = {"index": cell.index, "kind": cell.kind, "language": cell.language, "line": cell.line}
                 if cell.kind == "markdown":
                     entry["status"] = "skipped"
+                    entry["notices"] = self.drain_mount_notices()
                     results.append(entry)
                     continue
                 # Parameters override the parameters cell (as a pipeline run does);
@@ -775,6 +797,7 @@ class SparkEngine:
             row_count=len(rows),
             truncated=truncated,
             limit=limit,
+            notices=self.drain_mount_notices(),
         )
 
     def info(self) -> dict:

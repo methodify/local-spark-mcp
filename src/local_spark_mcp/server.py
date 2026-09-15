@@ -82,6 +82,24 @@ def _base_engine_kwargs(config: Config) -> dict:
 PROGRESS_INTERVAL = 2.0
 
 
+def _exit_reason(code: int | None) -> str:
+    if code is None:
+        return "exit status unknown"
+    if code < 0:
+        sig = -code
+        name = {9: "SIGKILL", 15: "SIGTERM", 6: "SIGABRT", 11: "SIGSEGV"}.get(sig)
+        if name is None:
+            try:
+                import signal
+
+                name = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                name = f"signal {sig}"
+        hint = ", the OS out-of-memory killer's signal" if sig == 9 else ""
+        return f"killed by {name}{hint}"
+    return f"exit code {code}"
+
+
 async def _acquire_with_progress(lock: asyncio.Lock, on_wait, note=None) -> None:
     """Take the worker lock, pinging while another call holds it."""
     while True:
@@ -125,6 +143,8 @@ class ServerState:
         self._lakehouses = None  # list[LakehouseInfo] | None (None = not discovered)
         self.busy: tuple[str, float] | None = None  # (method, started) while a worker call runs
         self.last_info: dict | None = None
+        self.last_call_at: float | None = None
+        self.pending_notices: list[str] = []  # surfaced at the top of the next tool result
 
     def _fabric_enabled(self) -> bool:
         return bool(self.config.workspace.name or self.config.workspace.id)
@@ -261,6 +281,19 @@ class ServerState:
         connection + Spark init complete."""
         if self._worker is not None and self._worker.ready:
             return
+        if self._worker is not None and self._worker.info is not None and not self._worker.running:
+            # A session that was up died between calls (no call saw it fail).
+            # Say so in the next result instead of silently starting over.
+            code = self._worker._proc.returncode if self._worker._proc is not None else None
+            idle = f" after {int(time.monotonic() - self.last_call_at)}s idle" if self.last_call_at else ""
+            why = _exit_reason(code)
+            self.pending_notices.append(
+                f"runtime restarted: the previous session's worker process exited{idle} ({why}); "
+                "all variables, imports, and session shadows are gone. There is no idle timeout in "
+                "local-spark-mcp; an unrequested exit usually means the OS killed it for memory "
+                "(raise [spark] driver_memory / free RAM) or something outside killed the process."
+            )
+            self._drop_worker()
         if self._start_task is None or self._start_task.done():
             self._start_task = asyncio.ensure_future(self._do_start())
         task = self._start_task
@@ -305,9 +338,22 @@ class ServerState:
             raise
         finally:
             self.lock.release()
+        self.last_call_at = time.monotonic()
         if method == "get_info":
             self.last_info = result
         return result
+
+    def take_notices(self) -> list[str]:
+        out, self.pending_notices = self.pending_notices, []
+        return out
+
+    def with_notices(self, text: str) -> str:
+        """Prepend pending server-side notices (a restart noticed late, …) to a
+        tool result, before the tool's own output."""
+        notices = self.take_notices()
+        if not notices:
+            return text
+        return "\n".join(f"notice: {n}" for n in notices) + "\n\n" + text
 
     def _drop_worker(self) -> None:
         w, self._worker = self._worker, None
@@ -384,7 +430,7 @@ def _cell(value) -> str:
 
 
 def format_exec_result(res: dict) -> str:
-    parts: list[str] = []
+    parts: list[str] = [f"notice: {n}" for n in (res.get("notices") or [])]
     stdout = (res.get("stdout") or "").rstrip("\n")
     if stdout:
         parts.append(stdout)
@@ -397,6 +443,11 @@ def format_exec_result(res: dict) -> str:
 
 
 def format_sql_result(res: dict) -> str:
+    prefix = "".join(f"notice: {n}\n" for n in (res.get("notices") or []))
+    return prefix + _format_sql_body(res)
+
+
+def _format_sql_body(res: dict) -> str:
     columns = res.get("columns") or []
     rows = res.get("rows") or []
     if not columns:
@@ -478,6 +529,8 @@ def format_notebook_result(res: dict, *, max_stdout: int = 1500) -> str:
         if c.get("status") == "skipped":
             continue
         lines.append(f"[{c['index']}] {c['language']} {c['status']} (line {c['line']})")
+        for n in c.get("notices") or []:
+            lines.append(f"    notice: {n}")
         for m in c.get("unsupported", []):
             lines.append(f"    unsupported, not run: {m}")
         out = (c.get("stdout") or "").rstrip()
@@ -588,7 +641,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
     async def run_code(code: str, ctx: Context) -> str:
         """Run a cell of Python/PySpark against the persistent session. State persists across calls; `spark`, `sc`, `F`, `T`, `Window` are pre-imported. Returns captured stdout and the last-expression echo, or the traceback if the cell raised."""
         res = await state.call("run_code", code, on_wait=_pinger(ctx, "running cell"))
-        return format_exec_result(res)
+        return state.with_notices(format_exec_result(res))
 
     @mcp.tool()
     async def run_sql(sql: str, ctx: Context, limit: int | None = None) -> str:
@@ -597,7 +650,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
             res = await state.call("run_sql", sql, limit, on_wait=_pinger(ctx, "running query"))
         except WorkerError as exc:
             return f"SQL error: {exc}"
-        return format_sql_result(res)
+        return state.with_notices(format_sql_result(res))
 
     @mcp.tool()
     async def session_info(ctx: Context) -> str:
@@ -605,7 +658,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         if state.lock.locked() and state.last_info is not None:
             return f"{state.busy_note() or 'worker busy'} — last known state:\n\n" + format_info(state.last_info)
         info = await state.call("get_info", on_wait=_pinger(ctx, "starting session"))
-        return format_info(info)
+        return state.with_notices(format_info(info))
 
     @mcp.tool()
     async def reset_runtime(ctx: Context) -> str:
@@ -635,7 +688,7 @@ def build_server(state: ServerState | None = None) -> FastMCP:
             "run_notebook", path, cells, stop_on_error, default_lakehouse, parameters,
             on_wait=_pinger(ctx, "running notebook"),
         )
-        return format_notebook_result(res)
+        return state.with_notices(format_notebook_result(res))
 
     @mcp.tool()
     async def sync_files(
