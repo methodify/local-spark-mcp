@@ -25,3 +25,11 @@ def test_exit_reason_names_signals():
     assert _exit_reason(1) == "exit code 1"
     assert "SIGKILL" in _exit_reason(-9) and "out-of-memory" in _exit_reason(-9)
     assert "SIGTERM" in _exit_reason(-15) and "out-of-memory" not in _exit_reason(-15)
+
+
+def test_info_shows_kernel_start():
+    import time
+    from local_spark_mcp.server import format_info
+
+    out = format_info({"spark_version": "4.1.1", "master": "local[*]", "databases": [], "started_at": time.time() - 90, "uptime_s": 90})
+    assert "kernel started: " in out and "(90s ago)" in out

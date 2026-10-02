@@ -485,6 +485,11 @@ def format_info(info: dict) -> str:
     ):
         if key in info:
             lines.append(f"  {key}: {info[key]}")
+    if info.get("started_at"):
+        import datetime as _dt
+
+        when = _dt.datetime.fromtimestamp(info["started_at"]).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        lines.append(f"  kernel started: {when} ({info.get('uptime_s', 0)}s ago)")
     dbs = info.get("databases") or []
     lines.append(f"  databases ({len(dbs)}): {', '.join(dbs) if dbs else '(none)'}")
     lhs = info.get("lakehouses") or []

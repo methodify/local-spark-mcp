@@ -104,6 +104,7 @@ class SparkEngine:
         self.files_link: dict | None = None
         self.files_sync_report: list[dict] = []
         self.spark_working_dir: str | None = None
+        self.started_at = time.time()  # kernel start, for session_info (ADO #302)
         self._notebook_index: dict | None = None
         self._cred = None
         self._fabric_client = None
@@ -148,6 +149,8 @@ class SparkEngine:
             catalog = {
                 "dv_strategy": self.dv_strategy,
             "profile": _profile_label(),
+            "started_at": self.started_at,
+            "uptime_s": int(time.time() - self.started_at),
                 "workspace_id": workspace_id,
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
@@ -823,6 +826,8 @@ class SparkEngine:
             "deletion_vector_tables": [f"{t['lakehouse']}.{t['table']}" for t in self._dv_tables()],
             "dv_strategy": self.dv_strategy,
             "profile": _profile_label(),
+            "started_at": self.started_at,
+            "uptime_s": int(time.time() - self.started_at),
             "files_root": (self.files_link or {}).get("files_root"),
             "spark_working_dir": self.spark_working_dir,
             "files_link": self.files_link,

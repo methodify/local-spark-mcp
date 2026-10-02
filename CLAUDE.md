@@ -155,6 +155,24 @@ server's **stderr**; stdout is reserved for the MCP transport.
   (Delta is a `StagingTableCatalog`, so CTAS/`saveAsTable` bypass `createTable`).
   A `ThreadLocal` reentrancy guard keeps the nested `CREATE TABLE` from
   re-entering the resolver. Only OneLake existence checks are cached.
+  **One clone per table under concurrency** (ADO #301): `loadTable` takes a
+  per-table monitor (`materializeLocks`) around the first-touch materialization
+  and re-checks `tableExists` inside it, so N threads touching an untouched
+  table get one clone, not N racing `CREATE TABLE … SHALLOW CLONE` commits
+  (DELTA_CONCURRENT_WRITE, or a corrupt `00000000000000000000.json`).
+  **REPLACE on a partitioned shadow** (ADO #300): Delta's post-commit
+  `UpdateCatalog` hook stores the new data schema via
+  `ExternalCatalog.alterTableDataSchema`, and Spark's `InMemoryCatalog` asserts
+  the entry's partition columns are the trailing schema columns, which after
+  one replace of a partitioned table they are not — so the next
+  `mode("overwrite").saveAsTable` commits and then throws `[INTERNAL_ERROR]
+  Eagerly executed replace failed / Corrupted table metadata`. Upstream (vanilla
+  `DeltaCatalog` on Spark 4.1.1 / Delta 4.2.0, 4.3.1, and 4.2.0 / Delta 4.4.0
+  all reproduce; Hive-backed catalogs such as Fabric's don't assert).
+  `resetCatalogEntryForReplace` runs before every `stageReplace` /
+  `stageCreateOrReplace` and resets the existing Delta entry to empty schema +
+  no partition columns, the shape Delta registers for a fresh table (the entry's
+  schema is cosmetic: Delta reads it from the log).
   **Case-insensitive names** (Fabric's catalog is; OneLake paths are not):
   on an exact-path miss the catalog lists the lakehouse's `Tables/` once
   (cached 60 s) and matches the name case-insensitively, then materializes
@@ -295,6 +313,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   FS"). Clears Delta's log cache and refreshes the table.
 - **session_info never blocks**: while a call holds the worker lock it returns
   the last known info plus "worker busy: <method> running for Ns".
+- **session_info `kernel started: <time> (Ns ago)`** (ADO #302) from
+  `engine.started_at`.
 - **Notices** (REQUEST-007): `OneLakeCatalog.materialize` times each
   materialization into a JVM queue; `engine.drain_mount_notices()` empties it
   after every cell / query / notebook cell and the formatters print

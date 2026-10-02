@@ -172,8 +172,13 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
   OOM, a kill) is detected on the failing call and replaced by a fresh session;
   a worker that died *between* calls is reported at the top of the next result
   (`notice: runtime restarted: … exited after Ns idle (killed by SIGKILL, the
-  OS out-of-memory killer's signal) …`). Raise `[spark] driver_memory` for wide
-  joins.
+  OS out-of-memory killer's signal) …`), and `session_info` shows `kernel
+  started: <time> (Ns ago)`. Raise `[spark] driver_memory` for wide joins.
+- **Concurrent first touch is safe.** Threads that touch an untouched table at
+  the same time share one clone: the first materializes, the rest wait.
+- **Repeated partitioned overwrites work.** `mode("overwrite").saveAsTable` on
+  a partitioned shadow can be repeated (upstream Delta 4.x / Spark in-memory
+  catalog would otherwise fail the second one after committing).
 - **First-touch cost is visible.** When a cell or query materializes a table
   for the first time, the result leads with `notice: mounted <lakehouse>.<table>
   in N s (shallow clone)`, so the mount never hides inside your own timing.
