@@ -169,6 +169,8 @@ server's **stderr**; stdout is reserved for the MCP transport.
   Eagerly executed replace failed / Corrupted table metadata`. Upstream (vanilla
   `DeltaCatalog` on Spark 4.1.1 / Delta 4.2.0, 4.3.1, and 4.2.0 / Delta 4.4.0
   all reproduce; Hive-backed catalogs such as Fabric's don't assert).
+  Upstream report: delta-io/delta#4855 (open since 2025-06, no maintainer
+  reply; our mechanism write-up is drafted in the exchange folder).
   `resetCatalogEntryForReplace` runs before every `stageReplace` /
   `stageCreateOrReplace` and resets the existing Delta entry to empty schema +
   no partition columns, the shape Delta registers for a fresh table (the entry's
