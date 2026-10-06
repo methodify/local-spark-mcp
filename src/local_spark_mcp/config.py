@@ -41,6 +41,11 @@ class LakehouseConfig:
     # Unqualified table names resolve here (USE <default> at session init), the
     # way a Fabric notebook's default lakehouse works.
     default: str | None = None
+    # Lakehouses whose tables are materialized eagerly in the background right
+    # after the session starts (names, or ["all"]). Progress shows in
+    # session_info; a notice reports completion. Default: none (lazy first touch).
+    preload: list[str] = field(default_factory=list)
+    preload_workers: int = 32
 
 
 @dataclass
@@ -54,6 +59,11 @@ class SparkConfig:
     # (JAGEOCODER_DB2_DIR, LIBPOSTAL_DATA_DIR, …) and PYTHONPATH so distributed
     # (mapPartitions/UDF) code can import + init the same libs as the driver.
     env: dict[str, str] = field(default_factory=dict)
+    # Extra jars (paths) merged into spark.jars, and extra Maven coordinates
+    # appended to spark.jars.packages (Ivy resolves transitives). A package that
+    # drags in another Hadoop or Jackson line can break the session.
+    jars: list[str] = field(default_factory=list)
+    packages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -206,6 +216,18 @@ def _parse_file(path: Path) -> Config:
     exclude = lh.get("exclude", [])
     if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
         raise ConfigError("lakehouses.exclude must be a list of strings.")
+    preload = lh.get("preload", [])
+    if isinstance(preload, str):
+        preload = [preload]
+    if not isinstance(preload, list) or not all(isinstance(x, str) for x in preload):
+        raise ConfigError("lakehouses.preload must be a list of lakehouse names (or [\"all\"]).")
+    preload_workers = lh.get("preload_workers", 32)
+    if not isinstance(preload_workers, int) or preload_workers < 1:
+        raise ConfigError("lakehouses.preload_workers must be a positive integer.")
+    for key in ("jars", "packages"):
+        v = spark.get(key, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise ConfigError(f"spark.{key} must be a list of strings.")
 
     extra = spark.get("extra_configs", {})
     if not isinstance(extra, dict) or not all(
@@ -236,11 +258,15 @@ def _parse_file(path: Path) -> Config:
         lakehouses=LakehouseConfig(
             exclude=list(exclude),
             default=_require_str(lh, "default", "lakehouses"),
+            preload=list(preload),
+            preload_workers=preload_workers,
         ),
         spark=SparkConfig(
             driver_memory=_require_str(spark, "driver_memory", "spark") or "8g",
             extra_configs=dict(extra),
             env=dict(spark_env),
+            jars=list(spark.get("jars", [])),
+            packages=list(spark.get("packages", [])),
         ),
         runtime=RuntimeConfig(
             default_sql_limit=int(runtime.get("default_sql_limit", 100)),
@@ -278,6 +304,21 @@ def _apply_env_overrides(config: Config) -> None:
 
     if (exclude := env.get(f"{ENV_PREFIX}LAKEHOUSE_EXCLUDE")) is not None:
         config.lakehouses.exclude = [s.strip() for s in exclude.split(",") if s.strip()]
+
+    if (preload := env.get(f"{ENV_PREFIX}PRELOAD")) is not None:
+        config.lakehouses.preload = [s.strip() for s in preload.split(",") if s.strip()]
+
+    if (pw := env.get(f"{ENV_PREFIX}PRELOAD_WORKERS")) is not None:
+        try:
+            config.lakehouses.preload_workers = int(pw)
+        except ValueError as exc:
+            raise ConfigError(f"{ENV_PREFIX}PRELOAD_WORKERS must be an integer.") from exc
+
+    if (jars := env.get(f"{ENV_PREFIX}JARS")) is not None:
+        config.spark.jars = [s.strip() for s in jars.split(",") if s.strip()]
+
+    if (pkgs := env.get(f"{ENV_PREFIX}PACKAGES")) is not None:
+        config.spark.packages = [s.strip() for s in pkgs.split(",") if s.strip()]
 
     if (mem := env.get(f"{ENV_PREFIX}DRIVER_MEMORY")) is not None:
         config.spark.driver_memory = mem
@@ -329,6 +370,10 @@ _ENV_KEYS = {
     f"{ENV_PREFIX}WORKSPACE_NAME": "workspace.name",
     f"{ENV_PREFIX}WORKSPACE_ID": "workspace.id",
     f"{ENV_PREFIX}LAKEHOUSE_EXCLUDE": "lakehouses.exclude",
+    f"{ENV_PREFIX}PRELOAD": "lakehouses.preload",
+    f"{ENV_PREFIX}PRELOAD_WORKERS": "lakehouses.preload_workers",
+    f"{ENV_PREFIX}JARS": "spark.jars",
+    f"{ENV_PREFIX}PACKAGES": "spark.packages",
     f"{ENV_PREFIX}DEFAULT_LAKEHOUSE": "lakehouses.default",
     f"{ENV_PREFIX}DRIVER_MEMORY": "spark.driver_memory",
     f"{ENV_PREFIX}SQL_LIMIT": "runtime.default_sql_limit",

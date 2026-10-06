@@ -179,6 +179,16 @@ runtime `sys.path.append` only affects the driver — workers won't see it.)
 - **Repeated partitioned overwrites work.** `mode("overwrite").saveAsTable` on
   a partitioned shadow can be repeated (upstream Delta 4.x / Spark in-memory
   catalog would otherwise fail the second one after committing).
+- **Eager catalog population.** `[lakehouses] preload = ["dataverse"]` (or
+  `["all"]`; env `LOCAL_SPARK_PRELOAD`) materializes every table of those
+  lakehouses in the background right after the session starts, many at a time
+  (`preload_workers`, default 32), so no read pays a first-touch mount later.
+  Startup returns immediately; `session_info` shows progress, the next result
+  after completion carries a notice, and `preload_lakehouses` starts one on
+  demand. Each table is one shallow clone (a Spark job that reads the table's
+  Delta log), so expect roughly 1.5 to 2 s per table of throughput on a
+  20-core laptop (mostly OneLake I/O waits): a 350-table lakehouse takes
+  about 10 minutes.
 - **First-touch cost is visible.** When a cell or query materializes a table
   for the first time, the result leads with `notice: mounted <lakehouse>.<table>
   in N s (shallow clone)`, so the mount never hides inside your own timing.
@@ -198,6 +208,17 @@ still works).
 - **Windows:** `C:\lakehouse\default` is a directory junction, created without
   elevation. A path beginning with `/` resolves against the current drive, so
   `/lakehouse/default/Files` works when the session runs from `C:`.
+
+## Embedding the worker
+
+Hosts other than Claude Code can drive the Spark worker directly over its
+localhost socket protocol (Cobalt SQL Works does): see `docs/PROTOCOL.md`.
+`profiles.json` at the repo root is the machine-readable runtime manifest
+(`python -m local_spark_mcp.profiles --json` prints the installed package's),
+`python -m local_spark_mcp.healthcheck` checks an environment without starting
+Spark, and `python -m local_spark_mcp.warm` pre-resolves the Spark packages.
+`[spark] jars` and `[spark] packages` (env `LOCAL_SPARK_JARS`,
+`LOCAL_SPARK_PACKAGES`) add your own jars and Maven coordinates to the session.
 
 ## Configuration
 

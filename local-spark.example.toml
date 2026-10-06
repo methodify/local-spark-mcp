@@ -35,6 +35,12 @@ exclude = []
 # Default lakehouse: unqualified table names resolve here (USE <default> at
 # session init), like a Fabric notebook's default lakehouse.
 # default = "dataverse"   # env: LOCAL_SPARK_DEFAULT_LAKEHOUSE
+# Eager catalog population in the background right after the session starts:
+# lakehouse names, or ["all"]. Each table is a shallow clone (a Spark job), run
+# preload_workers at a time; roughly 2-3 s per table of throughput. Progress in
+# session_info; a notice reports completion. Default: none (lazy first touch).
+# preload = ["dataverse"]         # env: LOCAL_SPARK_PRELOAD="dataverse,silver" or "all"
+# preload_workers = 32            # env: LOCAL_SPARK_PRELOAD_WORKERS
 
 [spark]
 driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
@@ -51,6 +57,12 @@ driver_memory = "8g"   # env override: LOCAL_SPARK_DRIVER_MEMORY
 # JAGEOCODER_DB2_DIR = "/lakehouse/default/Files/lib/jageocoder"
 # LIBPOSTAL_DATA_DIR = "/lakehouse/default/Files/lib/libpostal_senzing"
 # PYTHONPATH = "/lakehouse/default/Files/lib"
+
+# Extra jars (paths) merged into spark.jars, and extra Maven coordinates
+# resolved through Ivy with their transitive dependencies. A package that pulls
+# in another Hadoop or Jackson line can break the session.
+# jars = ["/opt/libs/my-udfs.jar"]            # env: LOCAL_SPARK_JARS (comma-separated)
+# packages = ["org.example:connector:1.2.0"]  # env: LOCAL_SPARK_PACKAGES
 
 # Arbitrary extra Spark configs (string -> string).
 [spark.extra_configs]

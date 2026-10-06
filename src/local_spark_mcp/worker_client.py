@@ -22,7 +22,7 @@ from .protocol import recv_msg, send_msg
 # a generous ceiling costs nothing but avoids spurious startup failures.
 DEFAULT_STARTUP_TIMEOUT = 600.0
 DEFAULT_CALL_TIMEOUT = 600.0  # cheap calls; cells/SQL/notebooks run unbounded (MCP pings cover the wait)
-LONG_METHODS = {"run_code", "run_sql", "run_notebook", "mount_tables", "sync_files", "table_features"}
+LONG_METHODS = {"run_code", "run_sql", "run_notebook", "mount_tables", "sync_files", "table_features", "wait_preload"}
 
 
 def _worker_spawn() -> tuple[str, dict]:
@@ -201,14 +201,24 @@ class WorkerProcess:
     def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:
         return self._call("sync_files", {"paths": paths, "direction": direction, "lakehouse": lakehouse})
 
+    def preload(self, lakehouses=None, workers: int | None = None) -> dict:
+        return self._call("preload", {"lakehouses": lakehouses, "workers": workers})
+
+    def preload_status(self) -> dict:
+        return self._call("preload_status", timeout=30.0)
+
+    def wait_preload(self, timeout: float | None = None) -> dict:
+        return self._call("wait_preload", {"timeout": timeout}, timeout=None)
+
+    def discard_shadow(self, only: str | None = None, table: str | None = None) -> dict:
+        return self._call("discard_shadow", {"only": only, "table": table})
+
     def restore_shadow(self, table: str, version: int = 0) -> dict:
         return self._call("restore_shadow", {"table": table, "version": version})
 
     def shadow_status(self) -> dict:
         return self._call("shadow_status")
 
-    def discard_shadow(self, only: str | None = None) -> dict:
-        return self._call("discard_shadow", {"only": only})
 
     def ping(self) -> dict:
         return self._call("ping", timeout=10.0)

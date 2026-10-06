@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import sys
 import time
 import traceback as _tb
@@ -96,6 +97,10 @@ class SparkEngine:
         notebooks_root: str | None = None,
         files_sync: list[str] | None = None,
         mirror_root: str | None = None,
+        preload: list[str] | None = None,
+        preload_workers: int = 32,
+        extra_jars: list[str] | None = None,
+        extra_packages: list[str] | None = None,
     ):
         self.default_sql_limit = default_sql_limit
         self.notebooks_root = notebooks_root
@@ -105,6 +110,16 @@ class SparkEngine:
         self.files_sync_report: list[dict] = []
         self.spark_working_dir: str | None = None
         self.started_at = time.time()  # kernel start, for session_info (ADO #302)
+        self._notice_lock = threading.Lock()
+        self._stray_notices: list[str] = []  # mount notices that belong to a user cell, drained by a background thread
+        self._claimed_mounts: set[str] = set()  # lowercased "lh.table" being mounted by preload / mount_tables: not the user's notice
+        self._pending_notices: list[str] = []  # engine-level notices for the next result
+        self._preload_thread: threading.Thread | None = None
+        self.preload_state: dict = {"state": "idle", "lakehouses": {}, "started_at": None, "finished_at": None,
+                                    "workers": preload_workers, "tables_total": 0, "tables_done": 0, "tables_failed": 0}
+        self.preload_workers = preload_workers
+        self.extra_jars = list(extra_jars or [])
+        self.extra_packages = list(extra_packages or [])
         self._notebook_index: dict | None = None
         self._cred = None
         self._fabric_client = None
@@ -148,15 +163,14 @@ class SparkEngine:
         if onelake and lakehouses:
             catalog = {
                 "dv_strategy": self.dv_strategy,
-            "profile": _profile_label(),
-            "started_at": self.started_at,
-            "uptime_s": int(time.time() - self.started_at),
                 "workspace_id": workspace_id,
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
                 "shadow_root": self.shadow_root.as_posix(),
             }
         self.spark = build_spark(
+            extra_jars=self.extra_jars,
+            extra_packages=self.extra_packages,
             driver_memory=driver_memory,
             extra_configs=extra_configs,
             java_home=java_home,
@@ -172,6 +186,8 @@ class SparkEngine:
         self._bootstrap_namespace()
         if self.files is not None and self.default_lakehouse:
             self._activate_files(self.default_lakehouse)
+        if preload and getattr(self, "lakehouses", None):
+            self.start_preload(preload)
 
     def _activate_files(self, lakehouse: str) -> None:
         """Point /lakehouse/default at this lakehouse's mirror and pull the
@@ -388,7 +404,8 @@ class SparkEngine:
                 f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}"
             )
         self.spark.table(f"{self._q(info.name)}.{self._q(table)}")
-        self._mounted.setdefault(info.name, set()).add(table)
+        with self._notice_lock:
+            self._mounted.setdefault(info.name, set()).add(table)
         return {
             "lakehouse": info.name,
             "table": table,
@@ -396,25 +413,143 @@ class SparkEngine:
             "write_mode": self.write_mode,
         }
 
-    def mount_tables(self, lakehouse: str, tables: list[str], workers: int = 8) -> dict:
+    def mount_tables(self, lakehouse: str, tables: list[str], workers: int | None = None) -> dict:
         """Materialize several tables in parallel; each is an independent Delta
-        log read from OneLake. Per-table errors are captured, not fatal."""
+        log read from OneLake. Per-table errors are captured, not fatal. The
+        mount notices these produce are consumed here (the result lists them),
+        not left for the next cell."""
+        workers = workers or self.preload_workers
+        timings: dict[str, float] = {}
+        lh_name = self._resolve_lakehouse(lakehouse).name if self._resolve_lakehouse(lakehouse) else lakehouse
+        claimed = {f"{lh_name}.{t}".lower() for t in tables}
+        with self._notice_lock:
+            self._claimed_mounts |= claimed
 
         def one(table: str):
+            t0 = time.time()
             try:
                 self.mount_table(lakehouse, table)
-                return table, None
+                return table, None, time.time() - t0
             except Exception as exc:  # keep going; report per-table
-                return table, f"{type(exc).__name__}: {exc}"
+                return table, f"{type(exc).__name__}: {exc}", time.time() - t0
 
         mounted, failed = [], []
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
-            for table, error in pool.map(one, tables):
-                if error is None:
-                    mounted.append(table)
-                else:
-                    failed.append({"table": table, "error": error})
-        return {"lakehouse": lakehouse, "mounted": mounted, "failed": failed}
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
+                for table, error, secs in pool.map(one, tables):
+                    timings[table] = round(secs, 2)
+                    if error is None:
+                        mounted.append(table)
+                    else:
+                        failed.append({"table": table, "error": error})
+        finally:
+            self._consume_mount_notices(claimed)
+        return {"lakehouse": lakehouse, "mounted": mounted, "failed": failed, "seconds": timings}
+
+    # ---- eager catalog population (preload) ----
+
+    def start_preload(self, lakehouses: list[str] | None = None, workers: int | None = None) -> dict:
+        """Materialize every table of the given lakehouses (names, or ["all"]) in
+        a background thread, `workers` tables at a time. Returns the status
+        immediately; the next result after completion carries a notice. A second
+        call while one runs returns the running status unchanged."""
+        if self._preload_thread is not None and self._preload_thread.is_alive():
+            return self.preload_status()
+        names = list(lakehouses or []) or ["all"]
+        if any(n.lower() == "all" for n in names):
+            targets = sorted(self.lakehouses)
+        else:
+            targets = []
+            for n in names:
+                info = self._resolve_lakehouse(n)
+                if info is None:
+                    raise ValueError(f"unknown lakehouse {n!r}; known: {sorted(self.lakehouses)}")
+                targets.append(info.name)
+        workers = workers or self.preload_workers
+        self.preload_state = {"state": "running", "lakehouses": {n: {"state": "pending"} for n in targets},
+                              "started_at": time.time(), "finished_at": None, "workers": workers,
+                              "tables_total": 0, "tables_done": 0, "tables_failed": 0}
+        self._preload_thread = threading.Thread(target=self._run_preload, args=(targets, workers), name="lsm-preload", daemon=True)
+        self._preload_thread.start()
+        return self.preload_status()
+
+    def _run_preload(self, targets: list[str], workers: int) -> None:
+        st = self.preload_state
+        try:
+            client = self.fabric_client()
+            for name in targets:
+                info = self._resolve_lakehouse(name)
+                entry = st["lakehouses"][name]
+                entry.update({"state": "listing"})
+                t0 = time.time()
+                try:
+                    tables = client.list_tables(info.workspace_id, info.id)
+                except Exception as exc:
+                    entry.update({"state": "failed", "error": f"{type(exc).__name__}: {exc}", "seconds": round(time.time() - t0, 1)})
+                    continue
+                already = self._mounted.get(info.name, set())
+                todo = [t for t in tables if t not in already]
+                with self._notice_lock:
+                    self._claimed_mounts |= {f"{info.name}.{t}".lower() for t in todo}
+                entry.update({"state": "mounting", "total": len(tables), "done": len(tables) - len(todo), "failed": 0})
+                st["tables_total"] += len(tables)
+                st["tables_done"] += len(tables) - len(todo)
+
+                def one(table: str, _info=info, _entry=entry):
+                    try:
+                        self.spark.table(f"{self._q(_info.name)}.{self._q(table)}")
+                        with self._notice_lock:
+                            self._mounted.setdefault(_info.name, set()).add(table)
+                        return None
+                    except Exception as exc:
+                        return f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
+                    finally:
+                        self._consume_mount_notices({f"{_info.name}.{table}".lower()})
+
+                errors = {}
+                with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo) or 1)), thread_name_prefix="lsm-preload") as pool:
+                    for table, err in zip(todo, pool.map(one, todo)):
+                        entry["done"] += 1
+                        st["tables_done"] += 1
+                        if err:
+                            errors[table] = err
+                            entry["failed"] += 1
+                            st["tables_failed"] += 1
+                entry.update({"state": "done", "seconds": round(time.time() - t0, 1), "errors": errors})
+            st["state"] = "done"
+        except Exception as exc:  # pragma: no cover - defensive
+            st["state"] = "failed"
+            st["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            st["finished_at"] = time.time()
+            secs = st["finished_at"] - (st["started_at"] or st["finished_at"])
+            failed = f", {st['tables_failed']} failed" if st["tables_failed"] else ""
+            with self._notice_lock:
+                self._pending_notices.append(
+                    f"preloaded {st['tables_done'] - st['tables_failed']} tables across {len(targets)} lakehouse(s) "
+                    f"in {secs:.0f} s ({st['workers']} workers{failed}); every table now resolves without a first-touch mount"
+                )
+
+    def preload_status(self) -> dict:
+        st = dict(self.preload_state)
+        if st.get("started_at"):
+            st["elapsed_s"] = round((st.get("finished_at") or time.time()) - st["started_at"], 1)
+        return st
+
+    def wait_preload(self, timeout: float | None = None) -> dict:
+        if self._preload_thread is not None:
+            self._preload_thread.join(timeout)
+        return self.preload_status()
+
+    def _consume_mount_notices(self, own: set[str]) -> None:
+        """A background/explicit mount of `own` tables finished: drain the JVM's
+        mount queue, drop our own entries, park the others (a user cell may have
+        materialized them meanwhile) for that cell's result, release the claims."""
+        with self._notice_lock:
+            for n in self._drain_jvm_mounts():
+                if _notice_table(n) not in self._claimed_mounts:
+                    self._stray_notices.append(n)
+            self._claimed_mounts -= own
 
     def table_features(self, lakehouse: str, tables: list[str], workers: int = 8) -> dict:
         """Delta protocol features per table, read from OneLake without
@@ -508,9 +643,18 @@ class SparkEngine:
         return res
 
     def drain_mount_notices(self) -> list[str]:
-        """Tables OneLakeCatalog materialized since the last drain, as
-        "mounted <lakehouse>.<table> in N s (<how>)" lines, so first-touch cost
-        is visible next to the cell's output instead of hidden in its timing."""
+        """Notices for the result being built: tables OneLakeCatalog materialized
+        since the last drain ("mounted <lakehouse>.<table> in N s (<how>)", so
+        first-touch cost is visible next to the cell's output instead of hidden
+        in its timing), plus anything a background thread parked for us."""
+        with self._notice_lock:
+            # entries claimed by a preload / explicit mount in flight are not this cell's
+            fresh = [n for n in self._drain_jvm_mounts() if _notice_table(n) not in self._claimed_mounts]
+            out = self._stray_notices + fresh + self._pending_notices
+            self._stray_notices, self._pending_notices = [], []
+        return out
+
+    def _drain_jvm_mounts(self) -> list[str]:
         try:
             items = list(self.spark._jvm.ch.fs.OneLakeCatalog.drainMaterialized())
         except Exception:
@@ -828,6 +972,14 @@ class SparkEngine:
             "profile": _profile_label(),
             "started_at": self.started_at,
             "uptime_s": int(time.time() - self.started_at),
+            "java_home": os.environ.get("JAVA_HOME"),
+            "python": sys.executable,
+            "hadoop_home": os.environ.get("HADOOP_HOME") if os.name == "nt" else None,
+            "ivy_dir": _ivy_dir(self.spark),
+            "extra_jars": self.extra_jars,
+            "extra_packages": self.extra_packages,
+            "preload": self.preload_status(),
+            "protocol_version": PROTOCOL_VERSION,
             "files_root": (self.files_link or {}).get("files_root"),
             "spark_working_dir": self.spark_working_dir,
             "files_link": self.files_link,
@@ -936,11 +1088,24 @@ class SparkEngine:
         return {"lakehouse": shadow["lakehouse"], "table": shadow["table"], "restored_to": version,
                 "removed_commits": removed["commits"], "removed_files": removed["files"], "state": state, "version": latest}
 
-    def discard_shadow(self, only: str | None = None) -> dict:
+    def discard_shadow(self, only: str | None = None, table: str | None = None) -> dict:
         """Drop shadowed tables from the catalog and delete their files, so the
         next touch re-clones from OneLake. OneLake is not affected. `only` limits
-        it to the "read" (materialized by a read, unchanged) or "written" ones."""
-        tables = [t for t in self._shadow_tables() if only is None or t["state"] == only]
+        it to the "read" (materialized by a read, unchanged) or "written" ones;
+        `table` ("lakehouse.table", or unqualified under the default) to one."""
+        want = None
+        if table:
+            parts = [p.strip("`") for p in table.split(".")]
+            if len(parts) == 1 and self.default_lakehouse:
+                parts = [self.default_lakehouse, parts[0]]
+            if len(parts) != 2:
+                raise ValueError(f"table must be <lakehouse>.<table> (got {table!r})")
+            want = (parts[0].lower(), parts[1].lower())
+        tables = [t for t in self._shadow_tables()
+                  if (only is None or t["state"] == only)
+                  and (want is None or (t["lakehouse"].lower(), t["table"].lower()) == want)]
+        if want and not tables:
+            raise LookupError(f"{want[0]}.{want[1]} has no shadow this session")
         for t in tables:
             try:
                 self.spark.sql(f"DROP TABLE IF EXISTS {self._q(t['lakehouse'])}.{self._q(t['table'])}")
@@ -948,7 +1113,7 @@ class SparkEngine:
                 pass
             shutil.rmtree(t["path"], ignore_errors=True)
             self._mounted.get(t["lakehouse"], set()).discard(t["table"])
-        if only is None:
+        if only is None and want is None:
             shutil.rmtree(self.shadow_root, ignore_errors=True)
             self.shadow_root.mkdir(parents=True, exist_ok=True)
             self._mounted = {}
@@ -1008,6 +1173,27 @@ _WRITE_TARGET = re.compile(
 def _sql_write_target(sql: str) -> str | None:
     m = _WRITE_TARGET.match(sql)
     return m.group(1) if m else None
+
+
+def _notice_table(notice: str) -> str:
+    """'mounted lh.t in N s (how)' -> 'lh.t' (lowercased)."""
+    return notice.split(" ", 2)[1].lower() if notice.startswith("mounted ") else ""
+
+
+PROTOCOL_VERSION = 1  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
+
+
+def _ivy_dir(spark) -> str | None:
+    try:
+        v = spark.conf.get("spark.jars.ivy", None)
+    except Exception:
+        v = None
+    if v:
+        return v
+    for cand in ("~/.ivy2.5.2", "~/.ivy2"):
+        if Path(cand).expanduser().is_dir():
+            return str(Path(cand).expanduser())
+    return None
 
 
 def _profile_label() -> str:

@@ -1,0 +1,76 @@
+# Worker protocol
+
+The MCP server runs a worker subprocess that holds the SparkSession and the
+Python namespace, and talks to it over a localhost TCP socket. Hosts other than
+the MCP server (Cobalt SQL Works embeds the worker this way) may use the same
+protocol. It is a supported interface from 0.3.5 on: the shape below is
+protocol version 1, and an incompatible change bumps `protocol_version` (which
+the `init` and `info` replies carry) and this document.
+
+## Transport
+
+Spawn `python -m local_spark_mcp.worker --port N` from an environment that has
+one runtime profile installed (`local-spark-mcp[fabric-2.0]`, say). The worker
+connects to `127.0.0.1:N`, so the host listens first. Give it no stdin
+(`DEVNULL`); its stdout and stderr carry Spark and JVM logs.
+
+Every frame is a 4-byte big-endian length followed by that many bytes of UTF-8
+JSON. Requests and replies are one frame each, strictly alternating: the worker
+handles one request at a time, in order, and a long cell blocks the socket until
+it finishes. (Interrupts and streaming events arrive in protocol version 2.)
+
+Request:
+
+```json
+{"id": 7, "method": "run_code", "params": {"code": "print(1)"}}
+```
+
+Reply:
+
+```json
+{"id": 7, "ok": true, "result": {...}, "fatal": false}
+{"id": 7, "ok": false, "error": "ValueError: ...", "traceback": "...", "fatal": false}
+```
+
+`fatal: true` means the JVM is gone (driver out of memory, killed, or a cell
+whose failure a liveness probe confirmed): discard the worker and spawn a new
+one. The MCP server does exactly that and reports it on the next result.
+
+## Methods
+
+| Method | Params | Result |
+|---|---|---|
+| `healthcheck` | `profile?` | Works before `init`: versions, profile verdict, JDK and winutils resolution, jar validity (`healthcheck.healthcheck()` shape). |
+| `init` | `SparkEngine` keyword arguments (below) plus `profile?` | The `info` dict plus `profile_warnings`. Runs `check_profile` first and fails with its message when the installed stack cannot serve the declared profile or would crash its Python workers on this platform. |
+| `ping` | | `{}` |
+| `run_code` | `code` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices` |
+| `run_sql` | `sql`, `limit?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices` |
+| `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?` | per-cell results (see `engine.run_notebook`) |
+| `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
+| `mount_table` | `lakehouse`, `table` | materialize one table now |
+| `mount_tables` | `lakehouse`, `tables` | materialize many in parallel; `mounted`, `failed`, `seconds` per table |
+| `preload` | `lakehouses?` (names or `["all"]`), `workers?` | start background eager population; returns status at once |
+| `preload_status` | | `state` (`idle` / `running` / `done` / `failed`), per-lakehouse progress, counts, `elapsed_s` |
+| `wait_preload` | `timeout?` | block until done (or timeout); returns status |
+| `table_features` | `lakehouse`, `tables` | Delta protocol features per table |
+| `sync_files` | `paths?`, `direction?`, `lakehouse?` | Files mirror pull/push |
+| `shadow_status` | | write mode and shadowed tables with `state` and `version` |
+| `discard_shadow` | `only?` (`read` / `written`), `table?` | drop shadows |
+| `restore_shadow` | `table`, `version?` | rewind one shadow's local log |
+| `shutdown` | | reply `{}` then exit |
+
+`init` keyword arguments (all optional): `driver_memory`, `extra_configs`,
+`env`, `java_home`, `hadoop_home`, `onelake` (`{endpoint, secret, jar_path}`:
+the host must run a token endpoint, see `token_server.py`), `lakehouses`
+(`[{name, id, workspace_id}]`), `default_lakehouse`, `write_mode`,
+`persist_shadow`, `state_root`, `notebooks_root`, `files_sync`, `mirror_root`,
+`default_sql_limit`, `preload` (list of lakehouse names or `["all"]`),
+`preload_workers` (default 32), `extra_jars`, `extra_packages`.
+
+## Versions and profiles
+
+`profiles.json` at the repo root (and `python -m local_spark_mcp.profiles
+--json` for the installed package) describes every runtime profile: pins,
+Python per platform, Java majors and preference, Scala line, hadoop-azure,
+session confs. `python -m local_spark_mcp.warm [--ivy DIR]` resolves a
+profile's Spark packages ahead of the first session.

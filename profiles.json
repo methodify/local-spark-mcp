@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "package": "local-spark-mcp",
+  "version": "0.3.5",
+  "default_profile": "fabric-1.3",
+  "profiles": {
+    "fabric-1.3": {
+      "fabric_runtime": "1.3",
+      "extra": "fabric-1.3",
+      "pyspark": "3.5.5",
+      "delta": "3.2.0",
+      "python": "3.11",
+      "python_windows": "3.11",
+      "java_majors": [
+        8,
+        11,
+        17
+      ],
+      "java_preferred": [
+        17,
+        11,
+        8
+      ],
+      "scala": "2.12",
+      "hadoop_azure": "3.3.4",
+      "spark_major": 3,
+      "session_confs": {
+        "spark.sql.session.timeZone": "UTC",
+        "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+        "spark.sql.autoBroadcastJoinThreshold": "26214400",
+        "spark.sql.cbo.enabled": "true",
+        "spark.sql.cbo.joinReorder.enabled": "true",
+        "spark.sql.execution.arrow.pyspark.enabled": "true",
+        "spark.sql.execution.arrow.pyspark.fallback.enabled": "true",
+        "spark.sql.legacy.createHiveTableByDefault": "false",
+        "spark.sql.legacy.replaceDatabricksSparkAvro.enabled": "false",
+        "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly": "false",
+        "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",
+        "spark.sql.sources.default": "delta",
+        "spark.sql.statistics.fallBackToHdfs": "true",
+        "spark.databricks.delta.vacuum.parallelDelete.enabled": "true",
+        "spark.databricks.delta.optimizeWrite.enabled": "true"
+      }
+    },
+    "fabric-2.0": {
+      "fabric_runtime": "2.0",
+      "extra": "fabric-2.0",
+      "pyspark": "4.1.1",
+      "delta": "4.2.0",
+      "python": "3.13",
+      "python_windows": "3.11",
+      "java_majors": [
+        17,
+        21
+      ],
+      "java_preferred": [
+        21,
+        17
+      ],
+      "scala": "2.13",
+      "hadoop_azure": "3.4.1",
+      "spark_major": 4,
+      "session_confs": {
+        "spark.sql.session.timeZone": "UTC",
+        "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+        "spark.sql.autoBroadcastJoinThreshold": "26214400",
+        "spark.sql.cbo.enabled": "true",
+        "spark.sql.cbo.joinReorder.enabled": "true",
+        "spark.sql.execution.arrow.pyspark.enabled": "true",
+        "spark.sql.execution.arrow.pyspark.fallback.enabled": "true",
+        "spark.sql.legacy.createHiveTableByDefault": "false",
+        "spark.sql.legacy.replaceDatabricksSparkAvro.enabled": "false",
+        "spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly": "false",
+        "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",
+        "spark.sql.sources.default": "delta",
+        "spark.sql.statistics.fallBackToHdfs": "true",
+        "spark.databricks.delta.vacuum.parallelDelete.enabled": "true",
+        "spark.sql.ansi.enabled": "false",
+        "spark.sql.unionOutputPartitioning": "false",
+        "spark.databricks.delta.properties.defaults.enableDeletionVectors": "true"
+      }
+    }
+  }
+}

@@ -63,11 +63,31 @@ def _handle(engine, method: str, params: dict):
     """Dispatch one request. Returns (result, engine) — engine may be created."""
     from .engine import SparkEngine
 
+    if method == "healthcheck":  # works before init: no Spark needed
+        from .healthcheck import healthcheck
+
+        return healthcheck(params.get("profile")), engine
     if method == "init":
         if engine is not None:
             engine.stop()
+        from .profiles import check_profile
+
+        # Hosts that spawn the worker directly skip the server's checks: refuse
+        # a stack that cannot serve the declared profile (or will crash its
+        # Python workers on this platform) here, with the same message.
+        prof, warnings, errors = check_profile(params.pop("profile", None))
+        if errors:
+            raise RuntimeError("; ".join(errors))
         engine = SparkEngine(**params)
-        return engine.info(), engine
+        info = engine.info()
+        info["profile_warnings"] = warnings
+        return info, engine
+    if method == "preload":
+        return engine.start_preload(params.get("lakehouses"), params.get("workers")), engine
+    if method == "preload_status":
+        return engine.preload_status(), engine
+    if method == "wait_preload":
+        return engine.wait_preload(params.get("timeout")), engine
     if method == "ping":
         return {"pong": True}, engine
     if engine is None:
@@ -97,7 +117,7 @@ def _handle(engine, method: str, params: dict):
     if method == "shadow_status":
         return engine.shadow_status(), engine
     if method == "discard_shadow":
-        return engine.discard_shadow(params.get("only")), engine
+        return engine.discard_shadow(params.get("only"), params.get("table")), engine
     if method == "info":
         return engine.info(), engine
     raise ValueError(f"unknown method: {method!r}")

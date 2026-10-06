@@ -74,6 +74,11 @@ def _base_engine_kwargs(config: Config) -> dict:
         "files_sync": config.files.sync,
         "mirror_root": config.files.mirror_root,
         "default_sql_limit": config.runtime.default_sql_limit,
+        "preload": config.lakehouses.preload,
+        "preload_workers": config.lakehouses.preload_workers,
+        "extra_jars": config.spark.jars,
+        "extra_packages": config.spark.packages,
+        "profile": config.runtime.profile,
     }
 
 
@@ -501,8 +506,13 @@ def format_info(info: dict) -> str:
         lines.append(f"  shadowed tables ({len(shadows)}): {', '.join(shadows) if shadows else '(none)'}")
         if dv := info.get("deletion_vector_tables"):
             lines.append(f"  deletion-vector tables, read-only here ({len(dv)}): {', '.join(dv)}")
+        if (pl := info.get("preload")) and pl.get("state") != "idle":
+            lines.append("  " + format_preload(pl).splitlines()[0])
         if info.get("profile"):
             lines.append(f"  profile: {info['profile']}")
+        for key in ("java_home", "python", "hadoop_home", "ivy_dir"):
+            if info.get(key):
+                lines.append(f"  {key}: {info[key]}")
         if info.get("spark_working_dir"):
             lines.append(f"  spark working dir: {info['spark_working_dir']}  (relative Files/... resolves here, like the default lakehouse on Fabric)")
         link = info.get("files_link")
@@ -582,6 +592,26 @@ def format_table_features(lakehouse: str, tables: list[str], result: dict) -> st
         tag = ("  [deletionVectors]" if clone else "  [deletionVectors: read-only here]") if f.get("deletion_vectors") else ""
         err = f"  (protocol unreadable: {f['error']})" if f.get("error") else ""
         lines.append(f"  {t}{tag}{err}")
+    return "\n".join(lines)
+
+
+def format_preload(st: dict) -> str:
+    if not st or st.get("state") == "idle":
+        return "preload: idle (nothing requested)"
+    head = (f"preload: {st.get('state')} — {st.get('tables_done', 0)}/{st.get('tables_total', 0)} tables"
+            f"{', ' + str(st['tables_failed']) + ' failed' if st.get('tables_failed') else ''}"
+            f" ({st.get('workers')} workers, {st.get('elapsed_s', 0)}s)")
+    lines = [head]
+    for name, e in (st.get("lakehouses") or {}).items():
+        if e.get("state") in ("mounting", "done"):
+            lines.append(f"  {name}: {e.get('done', 0)}/{e.get('total', 0)}{', ' + str(e['failed']) + ' failed' if e.get('failed') else ''}"
+                         f" {e.get('state')}{' in ' + str(e['seconds']) + 's' if e.get('seconds') is not None else ''}")
+            for t, err in list((e.get("errors") or {}).items())[:5]:
+                lines.append(f"    {t}: {err}")
+        else:
+            lines.append(f"  {name}: {e.get('state')}{' — ' + e['error'] if e.get('error') else ''}")
+    if st.get("error"):
+        lines.append(f"  error: {st['error']}")
     return "\n".join(lines)
 
 
@@ -721,13 +751,16 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         return format_shadow(res)
 
     @mcp.tool()
-    async def discard_shadow(ctx: Context, only: str | None = None) -> str:
-        """Drop local shadow tables for this session so the next touch re-reads from OneLake. Does not affect OneLake. `only="read"` drops just the read-materialized clones (keeps your writes); `only="written"` drops just the tables you wrote; default drops all."""
+    async def discard_shadow(ctx: Context, only: str | None = None, table: str | None = None) -> str:
+        """Drop local shadow tables for this session so the next touch re-reads from OneLake. Does not affect OneLake. `table="lakehouse.table"` drops one; `only="read"` drops just the read-materialized clones (keeps your writes); `only="written"` drops just the tables you wrote; default drops all."""
         if note := _local_only_note():
             return note
         if only not in (None, "read", "written"):
             return "discard_shadow: `only` must be \"read\", \"written\", or omitted."
-        res = await state.call("discard_shadow", only, on_wait=_pinger(ctx, "discarding shadow"))
+        try:
+            res = await state.call("discard_shadow", only, table, on_wait=_pinger(ctx, "discarding shadow"))
+        except WorkerError as exc:
+            return f"discard_shadow failed: {exc}"
         names = ", ".join(f"{t['lakehouse']}.{t['table']}" for t in res.get("tables", []))
         return f"Discarded {res.get('discarded', 0)} shadowed table(s){': ' + names if names else ''}."
 
@@ -783,6 +816,20 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         except ConfigError as exc:
             return str(exc)
         return format_mount(res)
+
+    @mcp.tool()
+    async def preload_lakehouses(ctx: Context, lakehouses: str | None = None, wait: bool = False) -> str:
+        """Materialize every table of the given lakehouses (comma-separated names; default: all) in the background, many at a time, so later reads have no first-touch mount. Returns immediately with the status unless `wait=True`; session_info shows progress and the next result after completion carries a notice. Also runs at startup when [lakehouses] preload is configured."""
+        if note := _local_only_note():
+            return note
+        names = [n.strip() for n in lakehouses.split(",") if n.strip()] if lakehouses else None
+        try:
+            res = await state.call("preload", names, None, on_wait=_pinger(ctx, "starting preload"))
+            if wait:
+                res = await state.call("wait_preload", None, on_wait=_pinger(ctx, "preloading"))
+        except WorkerError as exc:
+            return f"preload failed: {exc}"
+        return format_preload(res)
 
     @mcp.tool()
     async def mount_lakehouse(lakehouse: str, ctx: Context) -> str:

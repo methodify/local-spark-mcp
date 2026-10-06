@@ -47,6 +47,8 @@ def build_spark(
     hadoop_home: str | None = None,
     catalog: dict | None = None,
     warehouse_dir: str | None = None,
+    extra_jars: list[str] | None = None,
+    extra_packages: list[str] | None = None,
 ):
     """Create a Delta-enabled SparkSession.
 
@@ -94,12 +96,19 @@ def build_spark(
     configs.update(extra_configs or {})  # ...then the user's [spark.extra_configs]
     for key, value in user_env.items():
         configs.setdefault(f"spark.executorEnv.{key}", value)
-    extra_packages: list[str] = []
+    packages: list[str] = []
     if onelake:
         from .fabric import HADOOP_AZURE_PACKAGE, onelake_spark_configs
 
         configs.update(onelake_spark_configs(**onelake))
-        extra_packages.append(HADOOP_AZURE_PACKAGE)
+        packages.append(HADOOP_AZURE_PACKAGE)
+    packages += [p for p in (extra_packages or []) if p and p not in packages]
+    if extra_jars:
+        from .fabric import _as_file_uri
+
+        jars = [u for u in (configs.get("spark.jars") or "").split(",") if u]
+        jars += [_as_file_uri(j) for j in extra_jars if j]
+        configs["spark.jars"] = ",".join(jars)
 
     # With a Fabric catalog, swap Delta's session catalog for ours: DeltaCatalog
     # plus on-demand resolution of lakehouse tables and the write policy. The
@@ -126,6 +135,6 @@ def build_spark(
     for key, value in configs.items():
         builder = builder.config(key, value)
 
-    spark = configure_spark_with_delta_pip(builder, extra_packages=extra_packages).getOrCreate()
+    spark = configure_spark_with_delta_pip(builder, extra_packages=packages).getOrCreate()
     spark.sparkContext.setLogLevel(log_level)
     return spark

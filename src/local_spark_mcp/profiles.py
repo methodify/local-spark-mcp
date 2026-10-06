@@ -191,3 +191,64 @@ def check_profile(declared: str | None, *, versions: dict | None = None, python=
 def current_profile() -> Profile:
     """Best-effort profile for code paths that just need a version set."""
     return detect_profile() or PROFILES[DEFAULT_PROFILE]
+
+
+MANIFEST_SCHEMA = 1
+
+
+def manifest() -> dict:
+    """Machine-readable form of PROFILES for hosts that embed the worker (the
+    same document is committed as profiles.json at the repo root)."""
+    from . import __version__
+
+    profiles = {}
+    for name, p in PROFILES.items():
+        fix = _WINDOWS_WORKER_FIX.get(p.spark_major)
+        needs_311 = bool(fix and _version_tuple(p.pyspark) < fix)
+        profiles[name] = {
+            "fabric_runtime": p.fabric_runtime,
+            "extra": p.name,
+            "pyspark": p.pyspark,
+            "delta": p.delta,
+            "python": f"{p.python[0]}.{p.python[1]}",
+            # SPARK-53759: PySpark workers crash on Windows under Python 3.12+ unless
+            # pyspark carries the fix; pinned pysparks that predate it need 3.11.
+            "python_windows": "3.11" if needs_311 else f"{p.python[0]}.{p.python[1]}",
+            "java_majors": list(p.java_majors),
+            "java_preferred": list(p.java_preferred),
+            "scala": p.scala,
+            "hadoop_azure": p.hadoop_azure,
+            "spark_major": p.spark_major,
+            "session_confs": dict(p.session_confs or {}),
+        }
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "package": "local-spark-mcp",
+        "version": __version__,
+        "default_profile": DEFAULT_PROFILE,
+        "profiles": profiles,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m local_spark_mcp.profiles --json` prints the manifest for the
+    installed package; without --json, a short human summary."""
+    import argparse
+    import json
+
+    ap = argparse.ArgumentParser(prog="local_spark_mcp.profiles")
+    ap.add_argument("--json", action="store_true", help="print the runtime-profile manifest as JSON")
+    args = ap.parse_args(argv)
+    if args.json:
+        print(json.dumps(manifest(), indent=2))
+        return 0
+    detected = detect_profile()
+    for p in PROFILES.values():
+        mark = "*" if detected and detected.name == p.name else " "
+        print(f"{mark} {p.describe()}")
+    print("* = installed" if detected else "(no Spark stack installed)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
