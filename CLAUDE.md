@@ -332,8 +332,24 @@ server's **stderr**; stdout is reserved for the MCP transport.
   raced with the user's drain. Measured on `customer` (107 tables, 20-core box): 8 workers 187 s, 32
   workers 158 s — mounts are mostly OneLake I/O waits, so concurrency pays;
   ~1.5-2 s/table.
+- **Protocol v2 (0.4.0)**: framing unchanged; replies may announce
+  `"binary": [sizes]` followed by raw blobs (`protocol.send_reply` /
+  `recv_reply`; the engine leaves them in `blobs_out`); `run_code(stream=true)`
+  emits `{"event": "stdout"|"stderr", "text"}` frames from a `_Tee` that
+  replaces `sys.stdout`/`sys.stderr` around `run_cell` (flush per line / 4 KB);
+  a **control socket** (`--control-port`, second listener in `WorkerProcess`,
+  `_control_loop` thread in the worker) serves `interrupt` / `ping` / `status`
+  / `preload_status` while a cell runs. `engine.interrupt()` =
+  `cancelAllJobs()` + `_thread.interrupt_main()`; `ExecResult.interrupted`.
+  The main loop tolerates a stray `KeyboardInterrupt` between cells. Arrow:
+  `_arrow_from_df` (`toArrow` on Spark 4, `_collect_as_arrow` + `to_arrow_schema`
+  on 3.5; limit+1 rows for truncation) feeds `run_sql(arrow=True)` and the
+  namespace `display(df)` (`ExecResult.displays`). MCP: `interrupt` tool
+  (bypasses the worker lock via the control socket); `display` renders as a
+  text table in `run_code` output. `.github/workflows/publish.yml` publishes to
+  PyPI on `v*` tags via trusted publishing (one-time PyPI-side setup needed).
 - **Worker protocol is a supported interface** (`docs/PROTOCOL.md`,
-  `PROTOCOL_VERSION = 1` in `init`/`info`): Cobalt SQL Works spawns
+  `PROTOCOL_VERSION = 2` in `init`/`info`): Cobalt SQL Works spawns
   `python -m local_spark_mcp.worker` directly. `init` runs `check_profile`
   itself (hosts skip the server's checks). `healthcheck` works before `init`.
   Also: `profiles.json` (+ `python -m local_spark_mcp.profiles --json`,

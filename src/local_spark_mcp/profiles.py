@@ -221,10 +221,13 @@ def manifest() -> dict:
             "spark_major": p.spark_major,
             "session_confs": dict(p.session_confs or {}),
         }
+    from .engine import PROTOCOL_VERSION
+
     return {
         "schema": MANIFEST_SCHEMA,
         "package": "local-spark-mcp",
         "version": __version__,
+        "protocol_version": PROTOCOL_VERSION,
         "default_profile": DEFAULT_PROFILE,
         "profiles": profiles,
     }

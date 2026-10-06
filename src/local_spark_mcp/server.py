@@ -434,8 +434,30 @@ def _cell(value) -> str:
     return text
 
 
+def _render_displays(res: dict) -> list[str]:
+    """display(df) results: decode the Arrow blobs that rode along and print tables."""
+    out = []
+    blobs = res.get("blobs") or []
+    for i, meta in enumerate(res.get("displays") or []):
+        if meta.get("kind") != "arrow" or i >= len(blobs):
+            continue
+        try:
+            import pyarrow as pa
+
+            table = pa.ipc.open_stream(blobs[i]).read_all()
+            rows = [[v for v in row] for row in zip(*[col.to_pylist() for col in table.columns])] if table.num_columns else []
+            out.append(_format_sql_body({"columns": list(table.schema.names), "rows": rows, "row_count": meta.get("row_count"),
+                                         "truncated": meta.get("truncated"), "limit": meta.get("limit")}))
+        except Exception as exc:  # pragma: no cover
+            out.append(f"[display: {meta.get('row_count')} rows, could not render: {exc}]")
+    return out
+
+
 def format_exec_result(res: dict) -> str:
     parts: list[str] = [f"notice: {n}" for n in (res.get("notices") or [])]
+    if res.get("interrupted"):
+        parts.append("interrupted: the cell was stopped by interrupt (Spark jobs cancelled); session state is kept.")
+    parts += _render_displays(res)
     stdout = (res.get("stdout") or "").rstrip("\n")
     if stdout:
         parts.append(stdout)
@@ -677,6 +699,19 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         """Run a cell of Python/PySpark against the persistent session. State persists across calls; `spark`, `sc`, `F`, `T`, `Window` are pre-imported. Returns captured stdout and the last-expression echo, or the traceback if the cell raised."""
         res = await state.call("run_code", code, on_wait=_pinger(ctx, "running cell"))
         return state.with_notices(format_exec_result(res))
+
+    @mcp.tool()
+    async def interrupt(ctx: Context) -> str:
+        """Stop the cell or query that is running right now: cancels every Spark job and raises KeyboardInterrupt in the kernel. The interrupted call returns as an error marked interrupted; session state is kept. Does nothing when the kernel is idle."""
+        if state._worker is None or not state._worker.ready:
+            return "nothing running: no session yet"
+        try:
+            res = await asyncio.to_thread(state._worker.interrupt)
+        except WorkerError as exc:
+            return f"interrupt failed: {exc}"
+        if res.get("interrupted"):
+            return f"interrupt sent ({res.get('detail')}); the running call returns shortly as interrupted."
+        return f"nothing to interrupt ({res.get('reason')})"
 
     @mcp.tool()
     async def run_sql(sql: str, ctx: Context, limit: int | None = None) -> str:

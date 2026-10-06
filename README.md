@@ -209,6 +209,14 @@ still works).
   elevation. A path beginning with `/` resolves against the current drive, so
   `/lakehouse/default/Files` works when the session runs from `C:`.
 
+## Interrupt, streaming, Arrow (0.4.0)
+
+`interrupt` stops the cell or query that is running (cancels Spark jobs, raises
+`KeyboardInterrupt` in the kernel) and keeps the session's state. `display(df)`
+in a cell renders a DataFrame as a table (hosts embedding the worker receive it
+as Arrow). Hosts can also stream a cell's stdout as it is written and fetch SQL
+results as Arrow IPC; see `docs/PROTOCOL.md`.
+
 ## Embedding the worker
 
 Hosts other than Claude Code can drive the Spark worker directly over its

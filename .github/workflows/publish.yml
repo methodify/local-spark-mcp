@@ -1,0 +1,32 @@
+# Publish to PyPI on a version tag, with PyPI trusted publishing (no API token).
+# One-time setup on PyPI: project "local-spark-mcp" -> Publishing -> add a GitHub
+# publisher for methodify/local-spark-mcp, workflow publish.yml, environment pypi.
+name: publish
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - run: |
+          python3 - <<'PY'
+          import tomllib, pathlib, subprocess
+          v = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          tag = subprocess.check_output(["git", "describe", "--tags", "--exact-match"], text=True).strip()
+          assert tag == f"v{v}", f"tag {tag} != pyproject version {v}"
+          PY
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist/ }
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions: { id-token: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist/ }
+      - uses: pypa/gh-action-pypi-publish@release/v1

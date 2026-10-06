@@ -11,10 +11,11 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from .protocol import recv_msg, send_msg
+from .protocol import recv_msg, recv_reply, send_msg
 
 # Spark startup (JVM + Delta/hadoop-azure jar resolution) is slow on a cold
 # worker — markedly so on Windows first runs. Tool calls emit MCP progress
@@ -75,6 +76,9 @@ class WorkerProcess:
         self.call_timeout = call_timeout
         self._proc: subprocess.Popen | None = None
         self._conn: socket.socket | None = None
+        self._ctl: socket.socket | None = None
+        self._ctl_lock = threading.Lock()
+        self._ctl_id = 0
         self._id = 0
         self.info: dict | None = None
 
@@ -99,12 +103,17 @@ class WorkerProcess:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
+        ctl_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ctl_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ctl_listener.bind(("127.0.0.1", 0))
+        ctl_listener.listen(1)
+        ctl_port = ctl_listener.getsockname()[1]
         try:
             # Worker stdout/stderr go to OUR stderr — never the parent's stdout,
             # which the MCP stdio transport owns.
             exe, env = _worker_spawn()
             self._proc = subprocess.Popen(
-                [exe, "-m", "local_spark_mcp.worker", "--port", str(port)],
+                [exe, "-m", "local_spark_mcp.worker", "--port", str(port), "--control-port", str(ctl_port)],
                 # The worker must NOT inherit our stdin: under an MCP stdio server
                 # that handle is the client's pipe. On Windows inheriting it
                 # deadlocks the child during interpreter startup (it never reaches
@@ -134,15 +143,46 @@ class WorkerProcess:
                         raise WorkerError(
                             f"worker did not connect within {self.startup_timeout}s"
                         )
+            ctl_listener.settimeout(30.0)
+            try:
+                self._ctl, _ = ctl_listener.accept()
+            except socket.timeout:
+                self._ctl = None  # no control channel; interrupt() will say so
         finally:
             listener.close()
+            ctl_listener.close()
 
         self.info = self._call(
             "init", self.engine_kwargs, timeout=self.startup_timeout
         )
         return self.info
 
-    def _call(self, method: str, params: dict | None = None, *, timeout: float | None = None) -> dict:
+    # --- control channel (served by its own thread in the worker) ---
+    def control(self, method: str, params: dict | None = None, timeout: float = 30.0) -> dict:
+        if self._ctl is None:
+            raise WorkerError("no control channel to the worker")
+        with self._ctl_lock:
+            self._ctl_id += 1
+            send_msg(self._ctl, {"id": self._ctl_id, "method": method, "params": params or {}})
+            self._ctl.settimeout(timeout)
+            resp = recv_msg(self._ctl)
+        if resp is None:
+            raise WorkerError("control channel closed", fatal=True)
+        if not resp.get("ok"):
+            raise WorkerError(resp.get("error", "control call failed"))
+        return resp["result"]
+
+    def interrupt(self) -> dict:
+        """Stop the running cell (cancel Spark jobs + KeyboardInterrupt); safe while a call is in flight."""
+        return self.control("interrupt")
+
+    def status(self) -> dict:
+        return self.control("status", timeout=10.0)
+
+    def _call(self, method: str, params: dict | None = None, *, timeout: float | None = None, on_event=None) -> dict:
+        """Send one request and return its result. Binary blobs announced by the
+        reply are attached as ``result["blobs"]``; event frames (streaming
+        output) go to ``on_event(frame)`` as they arrive."""
         if self._conn is None:
             raise WorkerError("worker not started")
         self._id += 1
@@ -152,7 +192,12 @@ class WorkerProcess:
             timeout = None if method in LONG_METHODS else self.call_timeout
         self._conn.settimeout(timeout)
         try:
-            resp = recv_msg(self._conn)
+            while True:
+                resp, blobs = recv_reply(self._conn)
+                if resp is None or "event" not in resp:
+                    break
+                if on_event is not None:
+                    on_event(resp)
         except socket.timeout as exc:
             # the reply will arrive later on this socket, out of step with the next
             # request: the connection is unusable from here on
@@ -164,20 +209,28 @@ class WorkerProcess:
                 f"worker closed connection during '{method}'"
                 + (f" (exit code {self._proc.poll()})" if self._proc else "")
             )
+        if resp.get("id") != req_id:
+            # out-of-step reply: the connection can't be trusted any more
+            raise WorkerError(f"worker reply id {resp.get('id')} does not match request {req_id} ('{method}'); the runtime must be reset", fatal=True)
         if not resp.get("ok"):
             raise WorkerError(resp.get("error", "unknown worker error"), resp.get("traceback"), fatal=bool(resp.get("fatal")))
         if resp.get("fatal"):  # the call completed, but its result says the JVM is gone
             result = resp.get("result") or {}
             raise WorkerError(result.get("error") or "the Spark driver is no longer reachable",
                               result.get("traceback") or result.get("stdout"), fatal=True)
-        return resp["result"]
+        result = resp["result"]
+        if blobs and isinstance(result, dict):
+            result["blobs"] = blobs
+        return result
 
     # --- proxied engine operations ---
-    def run_code(self, code: str) -> dict:
-        return self._call("run_code", {"code": code})
+    def run_code(self, code: str, stream: bool = False, on_event=None) -> dict:
+        """``stream=True`` delivers stdout/stderr frames to ``on_event`` as the cell writes them."""
+        return self._call("run_code", {"code": code, "stream": stream}, on_event=on_event)
 
-    def run_sql(self, sql: str, limit: int | None = None) -> dict:
-        return self._call("run_sql", {"sql": sql, "limit": limit})
+    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False) -> dict:
+        """``arrow=True``: rows come back as one Arrow IPC stream in ``result["blobs"][0]``."""
+        return self._call("run_sql", {"sql": sql, "limit": limit, "arrow": arrow})
 
     def mount_table(self, lakehouse: str, table: str) -> dict:
         return self._call("mount_table", {"lakehouse": lakehouse, "table": table})
@@ -244,6 +297,12 @@ class WorkerProcess:
                 except OSError:
                     pass
                 self._conn = None
+        if self._ctl is not None:
+            try:
+                self._ctl.close()
+            except OSError:
+                pass
+            self._ctl = None
         self._kill_proc()
         self.info = None
 

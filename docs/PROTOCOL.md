@@ -3,9 +3,11 @@
 The MCP server runs a worker subprocess that holds the SparkSession and the
 Python namespace, and talks to it over a localhost TCP socket. Hosts other than
 the MCP server (Cobalt SQL Works embeds the worker this way) may use the same
-protocol. It is a supported interface from 0.3.5 on: the shape below is
-protocol version 1, and an incompatible change bumps `protocol_version` (which
-the `init` and `info` replies carry) and this document.
+protocol. It is a supported interface from 0.3.5 on. This document describes
+protocol version 2 (0.4.0); `protocol_version` is in the `init` and `info`
+replies and in `profiles.json`. Version 2 is a superset of version 1: the
+framing is unchanged, and a client that never asks for streaming or Arrow sees
+exactly the version-1 behavior.
 
 ## Transport
 
@@ -15,9 +17,21 @@ connects to `127.0.0.1:N`, so the host listens first. Give it no stdin
 (`DEVNULL`); its stdout and stderr carry Spark and JVM logs.
 
 Every frame is a 4-byte big-endian length followed by that many bytes of UTF-8
-JSON. Requests and replies are one frame each, strictly alternating: the worker
-handles one request at a time, in order, and a long cell blocks the socket until
-it finishes. (Interrupts and streaming events arrive in protocol version 2.)
+JSON. The worker handles one request at a time, in order; a long cell holds the
+data socket until it finishes. Version 2 adds three things on top:
+
+- **Binary payloads.** A reply whose JSON carries `"binary": [n1, n2, …]` is
+  followed immediately by that many raw blobs of those byte sizes. Used for
+  Arrow IPC streams (`run_sql` with `arrow: true`, and `display(df)` in a cell).
+- **Event frames.** A `run_code` request with `"stream": true` receives
+  `{"id", "event": "stdout" | "stderr", "text"}` frames as the cell writes (one
+  per line, or per 4 KB), then the normal reply. Frames with an `event` key and
+  no `ok` key are events; a client not streaming never sees them.
+- **A control socket.** Spawn the worker with `--control-port M` as well; it
+  connects to that port second. The control connection carries the same framing
+  and is served by its own thread, so it answers while a cell runs:
+  `interrupt`, `ping`, `status` (`{cell_running, initialized}`), and
+  `preload_status`. Replies never carry blobs or events.
 
 Request:
 
@@ -43,8 +57,8 @@ one. The MCP server does exactly that and reports it on the next result.
 | `healthcheck` | `profile?` | Works before `init`: versions, profile verdict, JDK and winutils resolution, jar validity (`healthcheck.healthcheck()` shape). |
 | `init` | `SparkEngine` keyword arguments (below) plus `profile?` | The `info` dict plus `profile_warnings`. Runs `check_profile` first and fails with its message when the installed stack cannot serve the declared profile or would crash its Python workers on this platform. |
 | `ping` | | `{}` |
-| `run_code` | `code` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices` |
-| `run_sql` | `sql`, `limit?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices` |
+| `run_code` | `code`, `stream?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", columns, row_count, truncated, limit, arrow_bytes}` per `display(df)`, blobs in the same order) |
+| `run_sql` | `sql`, `limit?`, `arrow?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
 | `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?` | per-cell results (see `engine.run_notebook`) |
 | `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
 | `mount_table` | `lakehouse`, `table` | materialize one table now |
@@ -66,6 +80,25 @@ the host must run a token endpoint, see `token_server.py`), `lakehouses`
 `persist_shadow`, `state_root`, `notebooks_root`, `files_sync`, `mirror_root`,
 `default_sql_limit`, `preload` (list of lakehouse names or `["all"]`),
 `preload_workers` (default 32), `extra_jars`, `extra_packages`.
+
+## Interrupt (control socket)
+
+`interrupt` cancels every Spark job (`SparkContext.cancelAllJobs`) and raises
+`KeyboardInterrupt` in the cell's thread. The in-flight `run_code` /
+`run_sql` then returns `ok: false`, `interrupted: true`, `error` starting with
+`KeyboardInterrupt`; session state (variables, shadows) is kept. When nothing is
+running the result is `{"interrupted": false, "reason": "idle: …"}`. Limits: a
+cell inside a long JVM call returns when its job is cancelled (seconds), and a
+tight loop inside a C extension cannot be interrupted at all.
+
+## Arrow
+
+`display(df)` is pre-bound in the namespace, as on Fabric: a DataFrame becomes
+an Arrow IPC stream attached to the cell result (up to `default_sql_limit` rows,
+or `display(df, limit=N)`); anything else is printed. `run_sql(arrow=true)`
+returns the result set the same way. Spark 4 uses `DataFrame.toArrow`; Spark 3.5
+uses `_collect_as_arrow`. Types survive (decimals, timestamps, nested types)
+where the JSON rows flatten them.
 
 ## Versions and profiles
 

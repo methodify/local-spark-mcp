@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import io
 import json
 import os
 import re
@@ -37,6 +38,8 @@ class ExecResult:
     traceback: str | None = None  # full formatted traceback when available
     execution_count: int | None = None
     notices: list[str] = field(default_factory=list)  # e.g. first-touch mounts during this cell
+    interrupted: bool = False  # the cell was stopped by `interrupt`
+    displays: list[dict] = field(default_factory=list)  # display(df) results: Arrow metadata; blobs ride alongside
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,6 +55,7 @@ class SqlResult:
     truncated: bool = False
     limit: int = 0
     notices: list[str] = field(default_factory=list)
+    arrow: dict | None = None  # when requested: {"arrow_bytes", "row_count", "truncated"}; the IPC stream rides alongside
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,6 +119,11 @@ class SparkEngine:
         self._claimed_mounts: set[str] = set()  # lowercased "lh.table" being mounted by preload / mount_tables: not the user's notice
         self._pending_notices: list[str] = []  # engine-level notices for the next result
         self._preload_thread: threading.Thread | None = None
+        self._cell_running = False
+        self._interrupt_requested = False
+        self._displays: list[dict] = []
+        self._blobs: list[bytes] = []
+        self.blobs_out: list[bytes] = []  # binary payloads for the worker to send after the next reply
         self.preload_state: dict = {"state": "idle", "lakehouses": {}, "started_at": None, "finished_at": None,
                                     "workers": preload_workers, "tables_total": 0, "tables_done": 0, "tables_failed": 0}
         self.preload_workers = preload_workers
@@ -253,6 +262,7 @@ class SparkEngine:
         )
         self._install_delta_forname_bridge()
         self._install_notebookutils()
+        self.shell.user_ns["display"] = self.display
 
     def _install_notebookutils(self) -> None:
         """Make ``import notebookutils`` / ``import mssparkutils`` resolve to the
@@ -572,13 +582,34 @@ class SparkEngine:
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
             return {"tables": dict(pool.map(one, tables)), "dv_strategy": self.dv_strategy}
 
-    def _exec(self, code: str) -> tuple[ExecResult, BaseException | None]:
+    def _exec(self, code: str, on_output=None) -> tuple[ExecResult, BaseException | None]:
         """Run a cell; also return the raised exception (the runner needs to
         recognize NotebookExit, which IPython otherwise reports as an error)."""
         from IPython.utils.capture import capture_output
 
-        with capture_output() as cap:
-            result = self.shell.run_cell(code, store_history=True)
+        self._displays, self._blobs = [], []
+        self._interrupt_requested = False
+        self._cell_running = True
+        try:
+            if on_output is None:
+                with capture_output() as cap:
+                    result = self.shell.run_cell(code, store_history=True)
+                cap_stdout, cap_stderr = cap.stdout, cap.stderr
+            else:
+                # Stream stdout/stderr as they are written (protocol v2 events) and
+                # still collect them for the final result.
+                out_tee, err_tee = _Tee("stdout", on_output), _Tee("stderr", on_output)
+                with capture_output(stdout=False, stderr=False, display=True) as cap:
+                    saved = sys.stdout, sys.stderr
+                    sys.stdout, sys.stderr = out_tee, err_tee
+                    try:
+                        result = self.shell.run_cell(code, store_history=True)
+                    finally:
+                        sys.stdout, sys.stderr = saved
+                        out_tee.close(); err_tee.close()
+                cap_stdout, cap_stderr = out_tee.getvalue(), err_tee.getvalue()
+        finally:
+            self._cell_running = False
 
         error = None
         tb = None
@@ -594,7 +625,7 @@ class SparkEngine:
                     _tb.format_exception(type(exc), exc, exc.__traceback__)
                 )
 
-        stdout = cap.stdout
+        stdout = cap_stdout
         # Rich display outputs (e.g. displayhook) land in cap.outputs; fold their
         # text/plain representation into stdout so nothing is silently dropped.
         for out in cap.outputs:
@@ -602,6 +633,8 @@ class SparkEngine:
             if text:
                 stdout += text + "\n"
 
+        if error and exc is not None and self._interrupt_requested and not isinstance(exc, KeyboardInterrupt):
+            error = f"KeyboardInterrupt: interrupted (Spark jobs cancelled); underlying {error}"
         if error:
 
             stdout = self.annotate_error(stdout) or stdout
@@ -611,8 +644,12 @@ class SparkEngine:
         outcome = ExecResult(
             ok=bool(result.success),
             stdout=_truncate(stdout),
-            stderr=_truncate(cap.stderr),
+            stderr=_truncate(cap_stderr),
             error=error,
+            # By intent, not by exception type: a cancelled Spark job surfaces as a
+            # Py4JError / SparkException, not as KeyboardInterrupt.
+            interrupted=exc is not None and (isinstance(exc, KeyboardInterrupt) or self._interrupt_requested),
+            displays=list(self._displays),
             traceback=_truncate(tb) if tb else None,
             execution_count=self.shell.execution_count,
         )
@@ -636,11 +673,84 @@ class SparkEngine:
                 return text.rstrip("\n") + "\n\nlocal-spark: " + self.dv_refusal(t)
         return text
 
-    def run_code(self, code: str) -> ExecResult:
-        """Run a cell of Python against the persistent namespace."""
-        res = self._exec(code)[0]
+    def run_code(self, code: str, on_output=None) -> ExecResult:
+        """Run a cell of Python against the persistent namespace. ``on_output``
+        (stream, text) receives stdout/stderr as the cell writes them."""
+        res = self._exec(code, on_output=on_output)[0]
         res.notices.extend(self.drain_mount_notices())
+        self.blobs_out = list(self._blobs)
         return res
+
+    def interrupt(self) -> dict:
+        """Stop the running cell: cancel every Spark job, then raise
+        KeyboardInterrupt in the cell's thread. Called from the control thread.
+        A cell inside a long JVM call returns once its job is cancelled; a tight
+        C-extension loop cannot be interrupted."""
+        import _thread
+        import signal
+
+        if not self._cell_running:
+            return {"interrupted": False, "reason": "idle: no cell is running"}
+        self._interrupt_requested = True
+        try:
+            self.spark.sparkContext.cancelAllJobs()
+        except Exception as exc:  # the JVM may be gone; still interrupt Python
+            cancel = f"cancelAllJobs failed: {type(exc).__name__}: {exc}"
+        else:
+            cancel = "spark jobs cancelled"
+        # A real SIGINT to the cell's thread: it wakes a C-level time.sleep and a
+        # blocking py4j socket read (EINTR), and pyspark's own SIGINT handler then
+        # cancels jobs again and raises KeyboardInterrupt. interrupt_main() only
+        # sets a pending flag that those blocking calls never check.
+        main = threading.main_thread().ident
+        if hasattr(signal, "pthread_kill") and main is not None:
+            signal.pthread_kill(main, signal.SIGINT)
+        else:  # Windows: trips the SIGINT event, which wakes time.sleep and raises on the next bytecode
+            _thread.interrupt_main()
+        return {"interrupted": True, "detail": cancel}
+
+    # ---- Arrow results ----
+
+    def _arrow_from_df(self, df, limit: int) -> tuple[bytes, dict]:
+        """Arrow IPC stream of up to `limit` rows (fetching one extra to flag
+        truncation). Spark 4 has DataFrame.toArrow; Spark 3.5 has the private
+        _collect_as_arrow (stable across 3.5.x)."""
+        import pyarrow as pa
+
+        head = df.limit(limit + 1)
+        if hasattr(head, "toArrow"):
+            table = head.toArrow()
+        else:
+            from pyspark.sql.pandas.types import to_arrow_schema
+
+            batches = head._collect_as_arrow()
+            schema = to_arrow_schema(head.schema)
+            table = pa.Table.from_batches(batches, schema=schema) if batches else schema.empty_table()
+        truncated = table.num_rows > limit
+        if truncated:
+            table = table.slice(0, limit)
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        data = sink.getvalue().to_pybytes()
+        return data, {"arrow_bytes": len(data), "row_count": table.num_rows, "truncated": truncated,
+                      "limit": limit, "columns": list(table.schema.names)}
+
+    def display(self, obj, limit: int | None = None) -> None:
+        """`display(df)` as on Fabric: a DataFrame becomes an Arrow result attached
+        to the cell (hosts render it in a grid; the MCP server prints a table);
+        anything else is printed."""
+        try:
+            from pyspark.sql import DataFrame
+        except ImportError:  # pragma: no cover
+            DataFrame = ()
+        if isinstance(obj, DataFrame):
+            data, meta = self._arrow_from_df(obj, limit or self.default_sql_limit)
+            meta["kind"] = "arrow"
+            self._displays.append(meta)
+            self._blobs.append(data)
+        else:
+            print(repr(obj))
 
     def drain_mount_notices(self) -> list[str]:
         """Notices for the result being built: tables OneLakeCatalog materialized
@@ -918,10 +1028,12 @@ class SparkEngine:
                 if not self._automount_missing(exc):
                     raise
 
-    def run_sql(self, sql: str, limit: int | None = None) -> SqlResult:
-        """Run a SQL statement and return up to ``limit`` rows."""
+    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False) -> SqlResult:
+        """Run a SQL statement and return up to ``limit`` rows (as JSON rows, or
+        as an Arrow IPC stream in ``blobs_out`` when ``arrow`` is set)."""
         if limit is None:
             limit = self.default_sql_limit
+        self.blobs_out = []
         if self.write_mode != "writethrough" and (target := _sql_write_target(sql)):
             if dv := self.is_dv_table(target):
                 raise RuntimeError(self.dv_refusal(dv))
@@ -933,6 +1045,11 @@ class SparkEngine:
                 raise RuntimeError(annotated) from exc
             raise
         columns = list(df.columns)
+        if arrow and columns:
+            data, meta = self._arrow_from_df(df, limit)
+            self.blobs_out = [data]
+            return SqlResult(columns=meta["columns"], rows=[], row_count=meta["row_count"], truncated=meta["truncated"],
+                             limit=limit, notices=self.drain_mount_notices(), arrow=meta)
         # Pull one extra row to detect truncation without a full count.
         collected = df.limit(limit + 1).collect()
         truncated = len(collected) > limit
@@ -1180,7 +1297,46 @@ def _notice_table(notice: str) -> str:
     return notice.split(" ", 2)[1].lower() if notice.startswith("mounted ") else ""
 
 
-PROTOCOL_VERSION = 1  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
+PROTOCOL_VERSION = 2  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
+
+
+class _Tee(io.TextIOBase):
+    """A text stream that keeps everything written and forwards complete lines
+    (or 4 KB chunks) to a callback as they arrive."""
+
+    def __init__(self, name: str, on_output):
+        self._name, self._cb = name, on_output
+        self._all: list[str] = []
+        self._pending = ""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        self._all.append(text)
+        self._pending += text
+        if "\n" in self._pending or len(self._pending) >= 4096:
+            self._emit()
+        return len(text)
+
+    def _emit(self) -> None:
+        if self._pending:
+            chunk, self._pending = self._pending, ""
+            try:
+                self._cb(self._name, chunk)
+            except Exception:
+                pass
+
+    def flush(self) -> None:
+        self._emit()
+
+    def close(self) -> None:
+        self._emit()
+
+    def getvalue(self) -> str:
+        return "".join(self._all)
 
 
 def _ivy_dir(spark) -> str | None:

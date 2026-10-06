@@ -1,0 +1,90 @@
+"""Protocol v2 over a real worker: streaming events, interrupt of a sleeping
+cell and of a Spark job, Arrow run_sql, display(df), idle interrupt.
+
+    LOCAL_SPARK_RUN_INTEGRATION=1 .venv/bin/python -m pytest tests/test_protocol_v2_integration.py -v
+"""
+
+import os
+import threading
+import time
+
+import pytest
+
+from local_spark_mcp.worker_client import WorkerProcess
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("LOCAL_SPARK_RUN_INTEGRATION") != "1",
+    reason="set LOCAL_SPARK_RUN_INTEGRATION=1 to run (starts a real Spark session)",
+)
+
+
+@pytest.fixture(scope="module")
+def worker():
+    w = WorkerProcess(engine_kwargs={"driver_memory": "2g"})
+    info = w.start()
+    assert info["protocol_version"] == 2 and info.get("control") is True
+    yield w
+    w.stop()
+
+
+def test_streaming_events_arrive_before_the_reply(worker):
+    events = []
+    res = worker.run_code("import time\nfor i in range(3):\n    print('tick', i)\n    time.sleep(0.3)\nprint('done')",
+                          stream=True, on_event=events.append)
+    assert res["ok"] and "done" in res["stdout"]
+    texts = "".join(e["text"] for e in events if e["event"] == "stdout")
+    assert "tick 0" in texts and "tick 2" in texts and "done" in texts
+    assert len(events) >= 3  # one frame per line, not one at the end
+
+
+def test_interrupt_sleeping_cell(worker):
+    assert worker.interrupt() == {"interrupted": False, "reason": "idle: no cell is running"}
+    out = {}
+
+    def run():
+        out["res"] = worker.run_code("import time\nx = 'before'\ntime.sleep(60)\nx = 'after'")
+
+    t = threading.Thread(target=run); t.start()
+    time.sleep(1.5)
+    assert worker.status()["cell_running"] is True
+    r = worker.interrupt()
+    assert r["interrupted"] is True
+    t.join(timeout=15)
+    assert not t.is_alive(), "cell did not return after interrupt"
+    res = out["res"]
+    assert not res["ok"] and res["interrupted"] is True and "KeyboardInterrupt" in (res["error"] or "")
+    after = worker.run_code("print(x)")  # state kept, cell stopped before reassigning
+    assert "before" in after["stdout"]
+
+
+def test_interrupt_spark_job(worker):
+    out = {}
+
+    def run():
+        out["res"] = worker.run_code("n = spark.range(10**14).selectExpr('sum(id % 7)').collect()")  # ~hours uninterrupted
+
+    t = threading.Thread(target=run); t.start()
+    time.sleep(3)
+    r = worker.interrupt()
+    assert r["interrupted"] is True
+    t.join(timeout=60)
+    assert not t.is_alive(), "Spark job did not cancel"
+    assert not out["res"]["ok"] and out["res"]["interrupted"], out["res"]
+    assert out["res"]["error"].startswith("KeyboardInterrupt"), out["res"]["error"]
+    assert worker.run_code("print(spark.range(5).count())")["stdout"].strip() == "5"  # session healthy
+
+
+def test_run_sql_arrow_and_display(worker):
+    import pyarrow as pa
+
+    res = worker.run_sql("SELECT id, CAST(id * 1.5 AS DOUBLE) AS v, CAST(id AS STRING) AS s FROM range(250)", limit=100, arrow=True)
+    assert res["arrow"]["row_count"] == 100 and res["arrow"]["truncated"] is True and res["rows"] == []
+    table = pa.ipc.open_stream(res["blobs"][0]).read_all()
+    assert table.num_rows == 100 and table.schema.names == ["id", "v", "s"]
+    assert str(table.schema.field("v").type) == "double" and table.column("id").to_pylist()[:3] == [0, 1, 2]
+
+    res = worker.run_code("df = spark.range(7).withColumn('sq', F.col('id') * F.col('id'))\ndisplay(df)\ndisplay('not a frame')\nprint('after')")
+    assert res["ok"] and "after" in res["stdout"] and "'not a frame'" in res["stdout"]
+    assert len(res["displays"]) == 1 and res["displays"][0]["row_count"] == 7 and len(res["blobs"]) == 1
+    t2 = pa.ipc.open_stream(res["blobs"][0]).read_all()
+    assert t2.column("sq").to_pylist() == [0, 1, 4, 9, 16, 25, 36]

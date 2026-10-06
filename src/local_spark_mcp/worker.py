@@ -12,9 +12,10 @@ from __future__ import annotations
 import argparse
 import socket
 import sys
+import threading
 import traceback
 
-from .protocol import recv_msg, send_msg
+from .protocol import recv_msg, send_msg, send_reply
 
 
 _FATAL_MARKERS = ("Py4JNetworkError", "Java gateway process exited", "Answer from Java side is empty",
@@ -81,6 +82,7 @@ def _handle(engine, method: str, params: dict):
         engine = SparkEngine(**params)
         info = engine.info()
         info["profile_warnings"] = warnings
+        info["control"] = True  # a control socket is served when --control-port was given
         return info, engine
     if method == "preload":
         return engine.start_preload(params.get("lakehouses"), params.get("workers")), engine
@@ -93,9 +95,9 @@ def _handle(engine, method: str, params: dict):
     if engine is None:
         raise RuntimeError("engine not initialized; send 'init' first")
     if method == "run_code":
-        return engine.run_code(params["code"]).to_dict(), engine
+        return engine.run_code(params["code"], on_output=params.get("_on_output")).to_dict(), engine
     if method == "run_sql":
-        return engine.run_sql(params["sql"], params.get("limit")).to_dict(), engine
+        return engine.run_sql(params["sql"], params.get("limit"), bool(params.get("arrow"))).to_dict(), engine
     if method == "mount_table":
         return engine.mount_table(params["lakehouse"], params["table"]), engine
     if method == "table_features":
@@ -123,12 +125,56 @@ def _handle(engine, method: str, params: dict):
     raise ValueError(f"unknown method: {method!r}")
 
 
-def run_worker(port: int) -> int:
-    sock = socket.create_connection(("127.0.0.1", port))
+class _Shared:
+    """Engine handle shared between the request thread and the control thread."""
+
     engine = None
+
+
+def _control_loop(port: int, shared: _Shared) -> None:
+    """Serve the control socket: interrupt / ping / status / preload_status,
+    independent of the main loop (which a running cell blocks)."""
+    try:
+        sock = socket.create_connection(("127.0.0.1", port))
+    except OSError:
+        return
     try:
         while True:
             req = recv_msg(sock)
+            if req is None:
+                return
+            rid, method = req.get("id"), req.get("method")
+            eng = shared.engine
+            try:
+                if method == "ping":
+                    result = {}
+                elif method == "status":
+                    result = {"cell_running": bool(eng and eng._cell_running), "initialized": eng is not None}
+                elif method == "interrupt":
+                    result = eng.interrupt() if eng is not None else {"interrupted": False, "reason": "not initialized"}
+                elif method == "preload_status":
+                    result = eng.preload_status() if eng is not None else {"state": "idle"}
+                else:
+                    raise ValueError(f"unknown control method {method!r}")
+                send_msg(sock, {"id": rid, "ok": True, "result": result})
+            except Exception as exc:
+                send_msg(sock, {"id": rid, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    except OSError:
+        return
+
+
+def run_worker(port: int, control_port: int | None = None) -> int:
+    sock = socket.create_connection(("127.0.0.1", port))
+    shared = _Shared()
+    if control_port:
+        threading.Thread(target=_control_loop, args=(control_port, shared), name="lsm-control", daemon=True).start()
+    engine = None
+    try:
+        while True:
+            try:
+                req = recv_msg(sock)
+            except KeyboardInterrupt:
+                continue  # an interrupt that landed between cells; nothing to stop
             if req is None:
                 break  # parent closed
             rid = req.get("id")
@@ -139,9 +185,19 @@ def run_worker(port: int) -> int:
                 send_msg(sock, {"id": rid, "ok": True, "result": {}})
                 break
 
+            if params.pop("stream", False) and method == "run_code":
+                def _on_output(stream, text, _rid=rid):
+                    send_msg(sock, {"id": _rid, "event": stream, "text": text})
+                params["_on_output"] = _on_output
             try:
                 result, engine = _handle(engine, method, params)
-                send_msg(sock, {"id": rid, "ok": True, "result": result, "fatal": _result_is_fatal(result, engine)})
+                shared.engine = engine
+                blobs = list(getattr(engine, "blobs_out", []) or []) if engine is not None else []
+                if engine is not None:
+                    engine.blobs_out = []
+                send_reply(sock, {"id": rid, "ok": True, "result": result, "fatal": _result_is_fatal(result, engine)}, blobs)
+            except KeyboardInterrupt:  # interrupt landed outside a cell's run_cell
+                send_msg(sock, {"id": rid, "ok": False, "error": "KeyboardInterrupt: interrupted", "traceback": None, "fatal": False})
             except Exception as exc:  # report, keep serving
                 send_msg(
                     sock,
@@ -163,8 +219,9 @@ def run_worker(port: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="local_spark_mcp.worker")
     parser.add_argument("--port", type=int, required=True, help="parent listener port")
+    parser.add_argument("--control-port", type=int, default=None, help="parent listener for the control socket (interrupt, status)")
     args = parser.parse_args(argv)
-    return run_worker(args.port)
+    return run_worker(args.port, args.control_port)
 
 
 if __name__ == "__main__":
