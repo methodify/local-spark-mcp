@@ -179,7 +179,7 @@ server's **stderr**; stdout is reserved for the MCP transport.
   on an exact-path miss the catalog lists the lakehouse's `Tables/` once
   (cached 60 s) and matches the name case-insensitively, then materializes
   the OneLake-cased path under Spark's (lowercased) identifier.
-  **Deletion-vector tables** (Link-to-Fabric mirrors such as `dataverse_l2f`;
+  **Deletion-vector tables** (Link-to-Fabric mirrors such as `dataverse` (named `dataverse_l2f` until 2026-10-06);
   protocol feature `deletionVectors`): Delta 3.2 cannot SHALLOW CLONE them
   (`DELTA_ADDING_DELETION_VECTORS_DISALLOWED`, and forcing the feature trips
   the tightBounds check), so under `spark.localspark.dv_strategy=view` (the
