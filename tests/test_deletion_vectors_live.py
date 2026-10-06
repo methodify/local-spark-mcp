@@ -13,8 +13,8 @@ from tests.test_onelake_catalog_live import _engine, _run
 
 pytestmark = pytest.mark.skipif(os.environ.get("LOCAL_SPARK_LIVE") != "1", reason="set LOCAL_SPARK_LIVE=1")
 
-LH = os.environ.get("LOCAL_SPARK_LIVE_DV_LAKEHOUSE", "dataverse_l2f")
-TABLE = os.environ.get("LOCAL_SPARK_LIVE_DV_TABLE", "custtable")
+LH = os.environ.get("LOCAL_SPARK_LIVE_DV_LAKEHOUSE", "gold")  # dataverse_l2f (Link to Fabric) left the workspace 2026-10-06; dataverse_asl has no DVs
+TABLE = os.environ.get("LOCAL_SPARK_LIVE_DV_TABLE", "sales")  # written by Runtime 2.0 with deletion vectors
 
 
 def test_deletion_vector_table_reads_as_live_view_and_refuses_writes(tmp_path):
