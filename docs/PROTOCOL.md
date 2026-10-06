@@ -87,9 +87,15 @@ the host must run a token endpoint, see `token_server.py`), `lakehouses`
 `KeyboardInterrupt` in the cell's thread. The in-flight `run_code` /
 `run_sql` then returns `ok: false`, `interrupted: true`, `error` starting with
 `KeyboardInterrupt`; session state (variables, shadows) is kept. When nothing is
-running the result is `{"interrupted": false, "reason": "idle: …"}`. Limits: a
-cell inside a long JVM call returns when its job is cancelled (seconds), and a
-tight loop inside a C extension cannot be interrupted at all.
+running the result is `{"interrupted": false, "reason": "idle: …"}`. After the
+first cancel a watchdog keeps cancelling until the cell ends, so a job that was
+still being planned when you interrupted does not run to completion. Limits: a
+cell inside a long JVM call returns when its job is cancelled (seconds); a tight
+loop inside a C extension cannot be interrupted; and on **Windows** a cell that
+is sleeping or blocked in pure Python (not in Spark) returns only when that
+blocking call ends, since the interrupt there is queued rather than delivered
+(on Linux a real `SIGINT` wakes it at once). Spark work, the case that matters,
+stops within seconds on both platforms.
 
 ## Arrow
 

@@ -120,6 +120,7 @@ class SparkEngine:
         self._pending_notices: list[str] = []  # engine-level notices for the next result
         self._preload_thread: threading.Thread | None = None
         self._cell_running = False
+        self._cell_gen = 0  # bumps per cell; an interrupt watchdog only acts on the cell it was started for
         self._interrupt_requested = False
         self._displays: list[dict] = []
         self._blobs: list[bytes] = []
@@ -589,6 +590,7 @@ class SparkEngine:
 
         self._displays, self._blobs = [], []
         self._interrupt_requested = False
+        self._cell_gen += 1
         self._cell_running = True
         try:
             if on_output is None:
@@ -610,6 +612,8 @@ class SparkEngine:
                 cap_stdout, cap_stderr = out_tee.getvalue(), err_tee.getvalue()
         finally:
             self._cell_running = False
+            if self._interrupt_requested:
+                self._drain_pending_interrupt()
 
         error = None
         tb = None
@@ -707,7 +711,41 @@ class SparkEngine:
             signal.pthread_kill(main, signal.SIGINT)
         else:  # Windows: trips the SIGINT event, which wakes time.sleep and raises on the next bytecode
             _thread.interrupt_main()
+        # A job that starts after cancelAllJobs() (still planning when we cancelled)
+        # would run to completion: keep cancelling until the cell has ended.
+        threading.Thread(target=self._cancel_until_idle, args=(self._cell_gen,), name="lsm-interrupt-watchdog", daemon=True).start()
         return {"interrupted": True, "detail": cancel}
+
+    def _drain_pending_interrupt(self) -> None:
+        """An interrupt that cancelled the Spark job before Python consumed the
+        queued SIGINT would otherwise fire into the NEXT cell (seen on Windows,
+        where interrupt_main only queues). Consume it under a no-op handler."""
+        import signal
+
+        for _ in range(2):
+            try:
+                prev = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, lambda *_a: None)
+                try:
+                    time.sleep(0.05)  # a pending interrupt fires here, into the no-op
+                finally:
+                    signal.signal(signal.SIGINT, prev)
+                return
+            except KeyboardInterrupt:
+                continue  # it fired before the swap; now it is consumed
+
+    def _cancel_until_idle(self, gen: int, timeout: float = 120.0) -> None:
+        """Keep cancelling the interrupted cell's jobs until that cell ends. Never
+        touches a later cell: the generation is re-checked right before each cancel."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if not (self._cell_running and self._cell_gen == gen):
+                return
+            try:
+                self.spark.sparkContext.cancelAllJobs()
+            except Exception:
+                return
 
     # ---- Arrow results ----
 
