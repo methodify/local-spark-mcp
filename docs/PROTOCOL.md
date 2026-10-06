@@ -84,7 +84,7 @@ the host must run a token endpoint, see `token_server.py`), `lakehouses`
 ## Interrupt (control socket)
 
 `interrupt` cancels every Spark job (`SparkContext.cancelAllJobs`) and raises
-`KeyboardInterrupt` in the cell's thread. The in-flight `run_code` /
+`KeyboardInterrupt` in the cell's thread; the reply is `{"interrupted", "state": "interrupting" | "idle", …}`. The in-flight `run_code` /
 `run_sql` then returns `ok: false`, `interrupted: true`, `error` starting with
 `KeyboardInterrupt`; session state (variables, shadows) is kept. When nothing is
 running the result is `{"interrupted": false, "reason": "idle: …"}`. After the

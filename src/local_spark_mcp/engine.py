@@ -694,7 +694,7 @@ class SparkEngine:
         import signal
 
         if not self._cell_running:
-            return {"interrupted": False, "reason": "idle: no cell is running"}
+            return {"interrupted": False, "state": "idle", "reason": "idle: no cell is running"}
         self._interrupt_requested = True
         try:
             self.spark.sparkContext.cancelAllJobs()
@@ -714,7 +714,7 @@ class SparkEngine:
         # A job that starts after cancelAllJobs() (still planning when we cancelled)
         # would run to completion: keep cancelling until the cell has ended.
         threading.Thread(target=self._cancel_until_idle, args=(self._cell_gen,), name="lsm-interrupt-watchdog", daemon=True).start()
-        return {"interrupted": True, "detail": cancel}
+        return {"interrupted": True, "state": "interrupting", "detail": cancel}
 
     def _drain_pending_interrupt(self) -> None:
         """An interrupt that cancelled the Spark job before Python consumed the

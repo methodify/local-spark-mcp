@@ -38,17 +38,18 @@ def test_streaming_events_arrive_before_the_reply(worker):
 
 
 def test_interrupt_sleeping_cell(worker):
-    assert worker.interrupt() == {"interrupted": False, "reason": "idle: no cell is running"}
+    assert worker.interrupt() == {"interrupted": False, "state": "idle", "reason": "idle: no cell is running"}
     out = {}
 
     def run():
-        out["res"] = worker.run_code("import time\nx = 'before'\ntime.sleep(60)\nx = 'after'")
+        # short sleeps: on Windows a queued interrupt is noticed between calls, not inside one
+        out["res"] = worker.run_code("import time\nx = 'before'\nfor _ in range(600):\n    time.sleep(0.1)\nx = 'after'")
 
     t = threading.Thread(target=run); t.start()
     time.sleep(1.5)
     assert worker.status()["cell_running"] is True
     r = worker.interrupt()
-    assert r["interrupted"] is True
+    assert r["interrupted"] is True and r["state"] == "interrupting"
     t.join(timeout=15)
     assert not t.is_alive(), "cell did not return after interrupt"
     res = out["res"]
