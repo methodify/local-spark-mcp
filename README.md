@@ -215,7 +215,25 @@ still works).
 `KeyboardInterrupt` in the kernel) and keeps the session's state. `display(df)`
 in a cell renders a DataFrame as a table (hosts embedding the worker receive it
 as Arrow). Hosts can also stream a cell's stdout as it is written and fetch SQL
-results as Arrow IPC; see `docs/PROTOCOL.md`.
+results as Arrow IPC; see `docs/PROTOCOL.md`. 0.4.1 makes `run_sql`
+interruptible, lets a host capture a bare trailing DataFrame as Arrow
+(`capture_result`), and reports the running cell's elapsed time and active Spark
+job count on the control socket's `status`.
+
+## Schema-enabled lakehouses and host tokens (0.4.1)
+
+A lakehouse with schemas (`Tables/<schema>/<table>` on OneLake) appears with
+the Fabric spelling: `test.dbo.holidays`, `SHOW NAMESPACES IN test`, and `USE
+test` selecting its default schema. Each schema is also a plain session
+database, `test__dbo`. The server detects schemas from the OneLake listing at
+start; a host can declare them instead. Table discovery for `preload` and
+`list_tables` reads OneLake storage rather than the Fabric REST endpoint, which
+refuses schema-enabled lakehouses.
+
+The worker takes every Azure token from the token endpoint it is started with
+(`?scope=` selects Fabric REST, OneLake, or Key Vault), so a host that embeds
+it needs no `az login` inside the worker, and preload failures appear in
+`preload_status`, never in a cell's output.
 
 ## Embedding the worker
 

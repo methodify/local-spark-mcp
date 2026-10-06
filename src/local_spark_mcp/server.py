@@ -530,6 +530,8 @@ def format_info(info: dict) -> str:
             lines.append(f"  deletion-vector tables, read-only here ({len(dv)}): {', '.join(dv)}")
         if (pl := info.get("preload")) and pl.get("state") != "idle":
             lines.append("  " + format_preload(pl).splitlines()[0])
+        if schemas := info.get("lakehouse_schemas"):
+            lines.append("  schema-enabled lakehouses: " + "; ".join(f"{lh}: {', '.join(sc)} (use {lh}.<schema>.<table>)" for lh, sc in schemas.items()))
         if info.get("profile"):
             lines.append(f"  profile: {info['profile']}")
         for key in ("java_home", "python", "hadoop_home", "ivy_dir"):
@@ -831,6 +833,12 @@ def build_server(state: ServerState | None = None) -> FastMCP:
             tables = await state.list_tables(lakehouse, on_wait=_pinger(ctx, "listing tables"))
         except ConfigError as exc:
             return str(exc)
+        except Exception as exc:
+            # The REST endpoint refuses schema-enabled lakehouses (400); list OneLake through the session instead.
+            try:
+                tables = await state.call("list_tables", lakehouse, on_wait=_pinger(ctx, "listing tables on OneLake"))
+            except WorkerError as exc2:
+                return f"list_tables failed: REST: {exc}; OneLake: {exc2}"
         if not tables:
             return f"{lakehouse}: no tables."
         if not features:
@@ -854,10 +862,20 @@ def build_server(state: ServerState | None = None) -> FastMCP:
 
     @mcp.tool()
     async def preload_lakehouses(ctx: Context, lakehouses: str | None = None, wait: bool = False) -> str:
-        """Materialize every table of the given lakehouses (comma-separated names; default: all) in the background, many at a time, so later reads have no first-touch mount. Returns immediately with the status unless `wait=True`; session_info shows progress and the next result after completion carries a notice. Also runs at startup when [lakehouses] preload is configured."""
+        """Materialize tables in the background, many at a time, so later reads have no first-touch mount. `lakehouses`: comma-separated lakehouse names (default: all), or explicit tables as `lakehouse.table` / `lakehouse.schema.table` entries. Returns immediately with the status unless `wait=True`; session_info shows progress and the next result after completion carries a notice. Also runs at startup when [lakehouses] preload is configured."""
         if note := _local_only_note():
             return note
-        names = [n.strip() for n in lakehouses.split(",") if n.strip()] if lakehouses else None
+        names = None
+        if lakehouses:
+            parts = [n.strip() for n in lakehouses.split(",") if n.strip()]
+            if any("." in n for n in parts):
+                names = {}
+                for n in parts:
+                    lh, _, rest = n.partition(".")
+                    names.setdefault(lh, []).append(rest.replace(".", "/") if rest else None)
+                names = {lh: [t for t in ts if t] or None for lh, ts in names.items()}
+            else:
+                names = parts
         try:
             res = await state.call("preload", names, None, on_wait=_pinger(ctx, "starting preload"))
             if wait:

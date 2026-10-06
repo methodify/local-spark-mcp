@@ -55,10 +55,11 @@ class WorkerError(Exception):
     """A request failed in the worker (carries the remote error/traceback).
     ``fatal`` means the worker/JVM is unusable and must be respawned."""
 
-    def __init__(self, message: str, traceback_str: str | None = None, *, fatal: bool = False):
+    def __init__(self, message: str, traceback_str: str | None = None, *, fatal: bool = False, interrupted: bool = False):
         super().__init__(message)
         self.traceback_str = traceback_str
         self.fatal = fatal
+        self.interrupted = interrupted  # the call was stopped by `interrupt` (run_sql; run_code reports it in its result)
 
 
 class WorkerProcess:
@@ -213,7 +214,8 @@ class WorkerProcess:
             # out-of-step reply: the connection can't be trusted any more
             raise WorkerError(f"worker reply id {resp.get('id')} does not match request {req_id} ('{method}'); the runtime must be reset", fatal=True)
         if not resp.get("ok"):
-            raise WorkerError(resp.get("error", "unknown worker error"), resp.get("traceback"), fatal=bool(resp.get("fatal")))
+            raise WorkerError(resp.get("error", "unknown worker error"), resp.get("traceback"), fatal=bool(resp.get("fatal")),
+                              interrupted=bool(resp.get("interrupted")))
         if resp.get("fatal"):  # the call completed, but its result says the JVM is gone
             result = resp.get("result") or {}
             raise WorkerError(result.get("error") or "the Spark driver is no longer reachable",
@@ -224,9 +226,10 @@ class WorkerProcess:
         return result
 
     # --- proxied engine operations ---
-    def run_code(self, code: str, stream: bool = False, on_event=None) -> dict:
-        """``stream=True`` delivers stdout/stderr frames to ``on_event`` as the cell writes them."""
-        return self._call("run_code", {"code": code, "stream": stream}, on_event=on_event)
+    def run_code(self, code: str, stream: bool = False, on_event=None, capture_result: bool = False) -> dict:
+        """``stream=True`` delivers stdout/stderr frames to ``on_event`` as the cell
+        writes them; ``capture_result=True`` attaches a bare trailing DataFrame as a display."""
+        return self._call("run_code", {"code": code, "stream": stream, "capture_result": capture_result}, on_event=on_event)
 
     def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False) -> dict:
         """``arrow=True``: rows come back as one Arrow IPC stream in ``result["blobs"][0]``."""
@@ -253,6 +256,9 @@ class WorkerProcess:
 
     def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:
         return self._call("sync_files", {"paths": paths, "direction": direction, "lakehouse": lakehouse})
+
+    def list_tables(self, lakehouse: str) -> list:
+        return self._call("list_tables", {"lakehouse": lakehouse})
 
     def preload(self, lakehouses=None, workers: int | None = None) -> dict:
         return self._call("preload", {"lakehouses": lakehouses, "workers": workers})

@@ -64,8 +64,19 @@ class OneLakeCatalog extends DeltaCatalog {
         k.substring(LakehousePrefix.length).equalsIgnoreCase(namespace) => v
     }
 
-  private def oneLakePath(lakehouseId: String, table: String): String =
-    s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$table"
+  /** A session database is either a lakehouse (`silver`) or a schema of a
+    * schema-enabled lakehouse (`test__dbo`, Fabric's Tables/dbo/<table>). Returns
+    * (lakehouse id, schema folder or ""). */
+  private def lakehouseAndSchema(namespace: String): Option[(String, String)] =
+    lakehouseId(namespace).map(id => (id, "")).orElse {
+      val sep = namespace.lastIndexOf(SchemaSep)
+      if (sep <= 0) None
+      else lakehouseId(namespace.substring(0, sep)).map(id => (id, namespace.substring(sep + SchemaSep.length)))
+    }
+
+  private def oneLakePath(lakehouseId: String, table: String, schema: String = ""): String =
+    if (schema.isEmpty) s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$table"
+    else s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$schema/$table"
 
   private def isDeltaDir(path: String): Boolean = {
     // Only OneLake paths are cached: each check is a network round trip, and
@@ -85,20 +96,23 @@ class OneLakeCatalog extends DeltaCatalog {
     * Fabric's catalog is case-insensitive but OneLake paths are not, so
     * `dataverse.chtmotiftable` must reach `Tables/chtMotifTable`. One listing of
     * `Tables/` per lakehouse, cached briefly (new tables appear after the TTL). */
-  private def realTableName(lakehouseId: String, name: String): Option[String] = {
+  private def realTableName(lakehouseId: String, schema: String, name: String): Option[String] = {
     val now = System.currentTimeMillis()
-    val listing = tableListCache.get(lakehouseId) match {
+    val key = if (schema.isEmpty) lakehouseId else s"$lakehouseId/$schema"
+    val listing = tableListCache.get(key) match {
       case Some((at, m)) if now - at < TableListTtlMs => m
       case _ =>
         try {
-          val tables = new Path(s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables")
+          val dir = if (schema.isEmpty) s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables"
+                    else s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$schema"
+          val tables = new Path(dir)
           val m = tables.getFileSystem(spark.sessionState.newHadoopConf()).listStatus(tables)
             .filter(_.isDirectory).map(st => st.getPath.getName.toLowerCase -> st.getPath.getName).toMap
-          tableListCache.put(lakehouseId, (now, m))  // only a successful listing is cached
+          tableListCache.put(key, (now, m))  // only a successful listing is cached
           m
         } catch {
           case e: Exception =>
-            System.err.println(s"local-spark: listing Tables/ of lakehouse $lakehouseId failed (${e.getClass.getSimpleName}: ${e.getMessage}); case-insensitive resolution unavailable this time")
+            System.err.println(s"local-spark: listing $key failed (${e.getClass.getSimpleName}: ${e.getMessage}); case-insensitive resolution unavailable this time")
             Map.empty[String, String]
         }
     }
@@ -110,12 +124,12 @@ class OneLakeCatalog extends DeltaCatalog {
     if (Reentrant.get() || workspaceId.isEmpty) return None
     ident.namespace() match {
       case Array(ns) =>
-        lakehouseId(ns).flatMap { id =>
-          val exact = oneLakePath(id, ident.name())
+        lakehouseAndSchema(ns).flatMap { case (id, schema) =>
+          val exact = oneLakePath(id, ident.name(), schema)
           if (isDeltaDir(exact)) Some((ns, id, exact))
-          else realTableName(id, ident.name()) match {
+          else realTableName(id, schema, ident.name()) match {
             case Some(real) if real != ident.name() =>
-              val src = oneLakePath(id, real)
+              val src = oneLakePath(id, real, schema)
               if (isDeltaDir(src)) Some((ns, id, src)) else None
             case _ => None
           }
@@ -127,6 +141,10 @@ class OneLakeCatalog extends DeltaCatalog {
   private def quoted(s: String): String = "`" + s.replace("`", "``") + "`"
   /** Shadows are keyed by lakehouse id, not name, so projects that touch the same lakehouse share them. */
   private def shadowPath(lakehouseId: String, table: String): String = s"$shadowRoot/$lakehouseId/$table"
+  private def shadowName(ns: String, table: String): String = {
+    val sep = ns.lastIndexOf(SchemaSep)
+    if (sep > 0 && lakehouseId(ns).isEmpty) s"${ns.substring(sep + SchemaSep.length)}.$table" else table
+  }
 
   /** True when the source table's protocol declares the deletionVectors feature.
     * Delta 3.2 cannot SHALLOW CLONE such a table (the clone refuses the source's
@@ -148,7 +166,7 @@ class OneLakeCatalog extends DeltaCatalog {
       if (writeMode == "writethrough") {
         spark.sql(s"CREATE TABLE IF NOT EXISTS $name USING DELTA LOCATION '$src'")
       } else {
-        val shadow = shadowPath(id, ident.name())
+        val shadow = shadowPath(id, shadowName(ns, ident.name()))
         if (isDeltaDir(shadow)) {
           how = "existing shadow"
           spark.sql(s"CREATE TABLE IF NOT EXISTS $name USING DELTA LOCATION '$shadow'")
@@ -206,7 +224,7 @@ class OneLakeCatalog extends DeltaCatalog {
     if (Reentrant.get()) return props
     ident.namespace() match {
       case Array(ns) =>
-        lakehouseId(ns) match {
+        lakehouseAndSchema(ns).map(_._1) match {
           case None => props
           case Some(id) =>
             val hasLocation = props.containsKey("location")
@@ -300,6 +318,32 @@ class OneLakeCatalog extends DeltaCatalog {
 }
 
 object OneLakeCatalog {
+  /** Session-database separator for a schema of a schema-enabled lakehouse: `test__dbo`. */
+  val SchemaSep = "__"
+
+  /** Table names under a lakehouse's Tables/ as seen on OneLake: `table`, or
+    * `schema/table` for a schema-enabled lakehouse (a non-Delta directory whose
+    * children are Delta tables). Uses the active session's authenticated
+    * filesystem, so no Fabric REST call and no extra credential. */
+  def listOneLakeTables(workspaceId: String, lakehouseId: String): java.util.List[String] = {
+    val spark = org.apache.spark.sql.SparkSession.active
+    val host = spark.conf.getOption(HostKey).getOrElse("onelake.dfs.fabric.microsoft.com")
+    val root = new Path(s"abfss://$workspaceId@$host/$lakehouseId/Tables")
+    val fs = root.getFileSystem(spark.sessionState.newHadoopConf())
+    val out = new java.util.ArrayList[String]()
+    if (!fs.exists(root)) return out
+    def isDelta(p: Path): Boolean = try fs.exists(new Path(p, "_delta_log")) catch { case _: Exception => false }
+    for (st <- fs.listStatus(root) if st.isDirectory) {
+      val name = st.getPath.getName
+      if (isDelta(st.getPath)) out.add(name)
+      else if (!name.startsWith("_") && !name.startsWith(".")) {
+        for (child <- fs.listStatus(st.getPath) if child.isDirectory && isDelta(child.getPath))
+          out.add(s"$name/${child.getPath.getName}")
+      }
+    }
+    out
+  }
+
   /** Materializations since the last drain: "ns.table<TAB>millis<TAB>how". */
   private val Materialized = new java.util.concurrent.ConcurrentLinkedQueue[String]()
   def drainMaterialized(): java.util.List[String] = {

@@ -348,6 +348,42 @@ server's **stderr**; stdout is reserved for the MCP transport.
   (bypasses the worker lock via the control socket); `display` renders as a
   text table in `run_code` output. `.github/workflows/publish.yml` publishes to
   PyPI on `v*` tags via trusted publishing (one-time PyPI-side setup needed).
+- **0.4.1 (Cobalt reply)**: `HostTokenCredential` (`host_credential.py`) —
+  `engine.credential()` fetches tokens from the `onelake` endpoint
+  (`GET ?scope=…`, `TokenServer.get_token(scope)`) when one is configured, so
+  the worker holds no `DefaultAzureCredential` under a host; `preload` accepts
+  `{lakehouse: [tables]}` and its failures never become a cell notice.
+  **Schema-enabled lakehouses**: `OneLakeCatalog.listOneLakeTables(ws, lh)`
+  lists `Tables/` on OneLake (one level down for schema folders; `t` or
+  `schema/t`) and backs `engine.list_tables` / `_detect_schemas` / preload
+  (the REST `/tables` endpoint 400s on such lakehouses). Each schema is a
+  session database `<lh>__<schema>` (`SchemaSep`; the Scala resolver splits it
+  back and reads `Tables/<schema>/<table>`, shadow dir `<schema>.<table>`), and
+  the lakehouse gets a delegating V2 catalog `ch.fs.OneLakeSchemaCatalog`
+  (`spark.sql.catalog.<lh>`, options `lakehouse`, `default_schema`; delegates
+  to `catalogManager.catalog("spark_catalog")` because `v2SessionCatalog` is
+  package-private) so `lh.schema.table`, `SHOW NAMESPACES IN lh`, and `USE lh`
+  (→ default schema) work as on Fabric. Once `lh` is a catalog, a bare `lh` in
+  `CREATE DATABASE`/`USE` means the catalog — the engine creates the databases
+  before setting the catalog conf; tests qualify with `spark_catalog.`.
+  `tests/test_schema_catalog_integration.py` covers it without OneLake; no
+  schema-enabled lakehouse exists in the live workspace yet.
+- **Interrupt, after Cobalt's 0.4.0 reply**: pyspark's SIGINT handler calls
+  `cancelAllJobs()` on the interrupted thread; landing inside a py4j read it
+  re-enters that thread's pinned connection (`RuntimeError: reentrant call
+  inside <_io.BufferedReader>` → `Py4JNetworkError` → py4j `logging.exception`
+  noise on the cell's stderr). `_tame_sigint` restores
+  `signal.default_int_handler` after the session starts (the control thread
+  cancels jobs over its own connection); `_install_interrupt_log_filter` drops
+  py4j's "while sending command" records while `_interrupt_requested`.
+  `_running(method)` is the busy context for `_exec` AND `run_sql` (so SQL is
+  interruptible; `InterruptedQuery` → worker reply `interrupted: true`);
+  `engine.status()` backs the control `status` (`cell.{method, elapsed_s,
+  active_jobs}` via `statusTracker().getActiveJobsIds()` from the control
+  thread). `run_code(capture_result=True)` attaches a bare trailing Spark or
+  pandas DataFrame as a display with `source: "result"` (`_capture_result`;
+  IPython's `ExecutionResult.result`). `PROTOCOL_VERSION` lives in
+  `protocol.py` (healthcheck reports it without importing Spark).
 - **Worker protocol is a supported interface** (`docs/PROTOCOL.md`,
   `PROTOCOL_VERSION = 2` in `init`/`info`): Cobalt SQL Works spawns
   `python -m local_spark_mcp.worker` directly. `init` runs `check_profile`

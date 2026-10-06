@@ -19,10 +19,12 @@ def healthcheck(declared_profile: str | None = None) -> dict:
     from .hadoop import HadoopNotFoundError, is_windows, resolve_hadoop_home
     from .java import JavaNotFoundError, resolve_java_home
     from .profiles import check_profile, installed_versions
+    from .protocol import PROTOCOL_VERSION
 
     out: dict = {
         "package": "local-spark-mcp",
         "version": __version__,
+        "protocol_version": PROTOCOL_VERSION,
         "python": sys.version.split()[0],
         "python_executable": sys.executable,
         "platform": platform.platform(),

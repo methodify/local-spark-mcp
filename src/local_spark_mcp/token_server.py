@@ -43,11 +43,13 @@ class TokenServer:
             self._credential = DefaultAzureCredential()
         return self._credential
 
-    def get_token(self) -> str:
-        """Mint (or return cached) a storage token. azure-identity handles the
-        caching/refresh; the lock just serializes concurrent JVM fetches."""
+    def get_token(self, scope: str | None = None) -> str:
+        """Mint (or return cached) a token for ``scope`` (default: OneLake storage).
+        azure-identity handles the caching/refresh; the lock just serializes
+        concurrent fetches. The worker asks for the Fabric API scope here too, so
+        a host that owns the endpoint supplies every token the worker needs."""
         with self._lock:
-            return self.credential.get_token(self.scope).token
+            return self.credential.get_token(scope or self.scope).token
 
     @property
     def port(self) -> int | None:
@@ -81,16 +83,20 @@ def _make_handler(server: TokenServer):
             pass
 
         def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
-            if self.path.split("?", 1)[0] != "/token":
+            path, _, query = self.path.partition("?")
+            if path != "/token":
                 self.send_error(404, "not found")
                 return
+            from urllib.parse import parse_qs
+
+            scope = (parse_qs(query).get("scope") or [None])[0]
             if not secrets.compare_digest(
                 self.headers.get(SECRET_HEADER, ""), server.secret
             ):
                 self.send_error(403, "forbidden")
                 return
             try:
-                token = server.get_token()
+                token = server.get_token(scope)
             except Exception as exc:  # surface auth failures to the JVM
                 self.send_error(500, f"token error: {type(exc).__name__}")
                 return

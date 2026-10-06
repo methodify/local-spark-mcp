@@ -47,7 +47,9 @@ def test_interrupt_sleeping_cell(worker):
 
     t = threading.Thread(target=run); t.start()
     time.sleep(1.5)
-    assert worker.status()["cell_running"] is True
+    st = worker.status()
+    assert st["cell_running"] is True and st["cell"]["method"] == "run_code" and st["cell"]["elapsed_s"] >= 1.0
+    assert st["cell"]["active_jobs"] == 0  # sleeping, not in Spark
     r = worker.interrupt()
     assert r["interrupted"] is True and r["state"] == "interrupting"
     t.join(timeout=15)
@@ -66,12 +68,19 @@ def test_interrupt_spark_job(worker):
 
     t = threading.Thread(target=run); t.start()
     time.sleep(3)
+    st = worker.status()
+    assert st["cell_running"] and st["cell"]["active_jobs"] >= 1, st  # job count read from the control thread while the cell is blocked
+    t0 = time.time()
     r = worker.interrupt()
+    reply_s = time.time() - t0
     assert r["interrupted"] is True
+    assert reply_s < 5, f"interrupt acknowledged after {reply_s:.1f}s"  # Cobalt saw 10 s+ with pyspark's SIGINT handler in place
     t.join(timeout=60)
     assert not t.is_alive(), "Spark job did not cancel"
     assert not out["res"]["ok"] and out["res"]["interrupted"], out["res"]
     assert out["res"]["error"].startswith("KeyboardInterrupt"), out["res"]["error"]
+    # the cancel's own py4j noise ("reentrant call", "while sending command") stays off the cell's stderr
+    assert "while sending command" not in out["res"]["stderr"] and "reentrant" not in out["res"]["stderr"], out["res"]["stderr"]
     assert worker.run_code("print(spark.range(5).count())")["stdout"].strip() == "5"  # session healthy
 
 
@@ -89,3 +98,47 @@ def test_run_sql_arrow_and_display(worker):
     assert len(res["displays"]) == 1 and res["displays"][0]["row_count"] == 7 and len(res["blobs"]) == 1
     t2 = pa.ipc.open_stream(res["blobs"][0]).read_all()
     assert t2.column("sq").to_pylist() == [0, 1, 4, 9, 16, 25, 36]
+
+
+def test_interrupt_run_sql(worker):
+    from local_spark_mcp.worker_client import WorkerError
+
+    out = {}
+
+    def run():
+        try:
+            out["res"] = worker.run_sql("SELECT sum(id % 7) FROM range(100000000000000)")
+        except WorkerError as exc:
+            out["err"] = exc
+
+    t = threading.Thread(target=run); t.start()
+    time.sleep(3)
+    assert worker.status()["cell"]["method"] == "run_sql"
+    assert worker.interrupt()["interrupted"] is True
+    t.join(timeout=60)
+    assert not t.is_alive(), "query did not cancel"
+    err = out.get("err")
+    assert err is not None and err.interrupted and not err.fatal and str(err).startswith("KeyboardInterrupt"), out
+    assert worker.run_sql("SELECT 1 AS one")["rows"] == [[1]]
+
+
+def test_capture_result_bare_dataframe(worker):
+    import pyarrow as pa
+
+    # not captured unless asked
+    res = worker.run_code("spark.range(3)")
+    assert res["ok"] and res["displays"] == [] and "DataFrame" in res["stdout"]
+    # Spark DataFrame as the last expression
+    res = worker.run_code("spark.range(5).withColumn('d', F.col('id') * 2)", capture_result=True)
+    assert res["ok"] and len(res["displays"]) == 1 and res["displays"][0]["source"] == "result"
+    assert pa.ipc.open_stream(res["blobs"][0]).read_all().column("d").to_pylist() == [0, 2, 4, 6, 8]
+    # pandas DataFrame, truncated to the row cap
+    res = worker.run_code("import pandas as pd\npd.DataFrame({'a': range(150)})", capture_result=True)
+    d = res["displays"][0]
+    assert d["source"] == "result" and d["truncated"] is True and d["row_count"] == 100 and d["columns"] == ["a"]
+    # display() entries and the captured result both arrive, in order
+    res = worker.run_code("display(spark.range(2))\nspark.range(4)", capture_result=True)
+    assert [d["source"] for d in res["displays"]] == ["display", "result"] and len(res["blobs"]) == 2
+    # a non-frame result or a statement adds nothing
+    res = worker.run_code("x = 1\nx + 1", capture_result=True)
+    assert res["ok"] and res["displays"] == [] and "2" in res["stdout"]

@@ -84,6 +84,8 @@ def _handle(engine, method: str, params: dict):
         info["profile_warnings"] = warnings
         info["control"] = True  # a control socket is served when --control-port was given
         return info, engine
+    if method == "list_tables":
+        return engine.list_tables(params["lakehouse"]), engine
     if method == "preload":
         return engine.start_preload(params.get("lakehouses"), params.get("workers")), engine
     if method == "preload_status":
@@ -95,7 +97,7 @@ def _handle(engine, method: str, params: dict):
     if engine is None:
         raise RuntimeError("engine not initialized; send 'init' first")
     if method == "run_code":
-        return engine.run_code(params["code"], on_output=params.get("_on_output")).to_dict(), engine
+        return engine.run_code(params["code"], on_output=params.get("_on_output"), capture_result=bool(params.get("capture_result"))).to_dict(), engine
     if method == "run_sql":
         return engine.run_sql(params["sql"], params.get("limit"), bool(params.get("arrow"))).to_dict(), engine
     if method == "mount_table":
@@ -149,7 +151,7 @@ def _control_loop(port: int, shared: _Shared) -> None:
                 if method == "ping":
                     result = {}
                 elif method == "status":
-                    result = {"cell_running": bool(eng and eng._cell_running), "initialized": eng is not None}
+                    result = eng.status() if eng is not None else {"initialized": False, "cell_running": False, "cell": None}
                 elif method == "interrupt":
                     result = eng.interrupt() if eng is not None else {"interrupted": False, "reason": "not initialized"}
                 elif method == "preload_status":
@@ -199,14 +201,16 @@ def run_worker(port: int, control_port: int | None = None) -> int:
             except KeyboardInterrupt:  # interrupt landed outside a cell's run_cell
                 send_msg(sock, {"id": rid, "ok": False, "error": "KeyboardInterrupt: interrupted", "traceback": None, "fatal": False})
             except Exception as exc:  # report, keep serving
+                interrupted = type(exc).__name__ == "InterruptedQuery"
                 send_msg(
                     sock,
                     {
                         "id": rid,
                         "ok": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "traceback": traceback.format_exc(),
-                        "fatal": _is_fatal(exc),
+                        "error": str(exc) if interrupted else f"{type(exc).__name__}: {exc}",
+                        "traceback": None if interrupted else traceback.format_exc(),
+                        "fatal": False if interrupted else _is_fatal(exc),
+                        "interrupted": interrupted,
                     },
                 )
     finally:

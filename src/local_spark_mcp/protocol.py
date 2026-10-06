@@ -25,6 +25,8 @@ import json
 import socket
 import struct
 
+PROTOCOL_VERSION = 2  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
+
 _HEADER = struct.Struct(">I")
 
 

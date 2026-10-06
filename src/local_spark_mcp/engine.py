@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .protocol import PROTOCOL_VERSION  # noqa: F401  (re-exported; profiles.manifest imports it from here)
 from .spark_session import build_spark
 
 # Truncate over-long reprs/values so a single cell can't flood the transport.
@@ -43,6 +44,10 @@ class ExecResult:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class InterruptedQuery(RuntimeError):
+    """run_sql was stopped by `interrupt`; the worker reports it with interrupted=true."""
 
 
 @dataclass
@@ -120,6 +125,8 @@ class SparkEngine:
         self._pending_notices: list[str] = []  # engine-level notices for the next result
         self._preload_thread: threading.Thread | None = None
         self._cell_running = False
+        self._cell_started: float | None = None  # for control-socket `status`
+        self._cell_method: str | None = None
         self._cell_gen = 0  # bumps per cell; an interrupt watchdog only acts on the cell it was started for
         self._interrupt_requested = False
         self._displays: list[dict] = []
@@ -169,6 +176,8 @@ class SparkEngine:
                     pass  # reported by _register_lakehouses
 
         self.dv_strategy = _dv_strategy()
+        self._onelake = dict(onelake) if onelake else None
+        self._lakehouse_schemas: dict[str, list[str]] = {}
         catalog = None
         if onelake and lakehouses:
             catalog = {
@@ -192,6 +201,8 @@ class SparkEngine:
             warehouse_dir=(self._session_dir / "warehouse").as_posix(),
         )
         self.shell = self._make_shell()
+        self._tame_sigint()
+        self._install_interrupt_log_filter()
         self._register_lakehouses(lakehouses, default_lakehouse)
         self._bootstrap_namespace()
         if self.files is not None and self.default_lakehouse:
@@ -378,6 +389,15 @@ class SparkEngine:
             info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
             self.lakehouses[info.name] = info
             self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(info.name)}")
+            # Schema-enabled lakehouse (Tables/<schema>/<table>): the host may say so
+            # ("schemas": [...]); otherwise detected from the OneLake listing. Each
+            # schema becomes a session database `<lakehouse>__<schema>`, and the
+            # lakehouse gets a V2 catalog so `lakehouse.schema.table` works as on Fabric.
+            schemas = lh.get("schemas")
+            if schemas is None and lh.get("detect_schemas", True):
+                schemas = self._detect_schemas(info)
+            if schemas:
+                self._register_schemas(info, list(schemas), lh.get("default_schema") or "dbo")
         if default_lakehouse and self.lakehouses:
             info = self._resolve_lakehouse(default_lakehouse)
             if info is None:
@@ -388,6 +408,43 @@ class SparkEngine:
             # Unqualified names now resolve here, like a Fabric notebook's default lakehouse.
             self.spark.sql(f"USE {self._q(info.name)}")
             self.default_lakehouse = info.name
+
+    def _detect_schemas(self, info) -> list[str]:
+        """Schema folders under Tables/ (directories that are not Delta tables but
+        contain Delta tables), via the JVM's authenticated OneLake filesystem."""
+        try:
+            entries = [str(e) for e in self.spark._jvm.ch.fs.OneLakeCatalog.listOneLakeTables(info.workspace_id, info.id)]
+        except Exception as exc:
+            print(f"local-spark: could not list Tables/ of {info.name}: {exc}", file=sys.stderr)
+            return []
+        return sorted({e.split("/", 1)[0] for e in entries if "/" in e})
+
+    def _register_schemas(self, info, schemas: list[str], default_schema: str) -> None:
+        self._lakehouse_schemas[info.name] = schemas
+        for schema in schemas:
+            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(f'{info.name}__{schema}')}")
+        # `test.dbo.publicholidays` / `USE test` (-> dbo), as on Fabric: a thin V2
+        # catalog named after the lakehouse that delegates to the session catalog.
+        self.spark.conf.set(f"spark.sql.catalog.{info.name}", "ch.fs.OneLakeSchemaCatalog")
+        self.spark.conf.set(f"spark.sql.catalog.{info.name}.lakehouse", info.name)
+        self.spark.conf.set(f"spark.sql.catalog.{info.name}.default_schema", default_schema)
+
+    def list_tables(self, lakehouse: str) -> list[str]:
+        """Table names from OneLake storage (not the Fabric REST endpoint, which
+        refuses schema-enabled lakehouses): `table` for Tables/<table>,
+        `schema/table` for Tables/<schema>/<table>."""
+        info = self._resolve_lakehouse(lakehouse)
+        if info is None:
+            raise ValueError(f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}")
+        return [str(e) for e in self.spark._jvm.ch.fs.OneLakeCatalog.listOneLakeTables(info.workspace_id, info.id)]
+
+    @staticmethod
+    def _qualified(lakehouse: str, entry: str) -> tuple[str, str]:
+        """OneLake entry -> (session database, table): 'dbo/t' -> ('lh__dbo', 't')."""
+        if "/" in entry:
+            schema, table = entry.split("/", 1)
+            return f"{lakehouse}__{schema}", table
+        return lakehouse, entry
 
     def _resolve_lakehouse(self, name: str):
         """Look up a lakehouse by name (case-insensitively, since Spark
@@ -466,56 +523,71 @@ class SparkEngine:
         call while one runs returns the running status unchanged."""
         if self._preload_thread is not None and self._preload_thread.is_alive():
             return self.preload_status()
-        names = list(lakehouses or []) or ["all"]
-        if any(n.lower() == "all" for n in names):
-            targets = sorted(self.lakehouses)
-        else:
-            targets = []
-            for n in names:
+        explicit: dict[str, list[str] | None] = {}
+        if isinstance(lakehouses, dict):  # {"lakehouse": ["t1", "dbo/t2"]} — no listing needed
+            for n, tables in lakehouses.items():
                 info = self._resolve_lakehouse(n)
                 if info is None:
                     raise ValueError(f"unknown lakehouse {n!r}; known: {sorted(self.lakehouses)}")
-                targets.append(info.name)
+                explicit[info.name] = list(tables) if tables else None
+            targets = list(explicit)
+        else:
+            names = list(lakehouses or []) or ["all"]
+            if any(n.lower() == "all" for n in names):
+                targets = sorted(self.lakehouses)
+            else:
+                targets = []
+                for n in names:
+                    info = self._resolve_lakehouse(n)
+                    if info is None:
+                        raise ValueError(f"unknown lakehouse {n!r}; known: {sorted(self.lakehouses)}")
+                    targets.append(info.name)
         workers = workers or self.preload_workers
         self.preload_state = {"state": "running", "lakehouses": {n: {"state": "pending"} for n in targets},
                               "started_at": time.time(), "finished_at": None, "workers": workers,
                               "tables_total": 0, "tables_done": 0, "tables_failed": 0}
-        self._preload_thread = threading.Thread(target=self._run_preload, args=(targets, workers), name="lsm-preload", daemon=True)
+        self._preload_thread = threading.Thread(target=self._run_preload, args=(targets, workers, explicit), name="lsm-preload", daemon=True)
         self._preload_thread.start()
         return self.preload_status()
 
-    def _run_preload(self, targets: list[str], workers: int) -> None:
+    def _run_preload(self, targets: list[str], workers: int, explicit: dict | None = None) -> None:
         st = self.preload_state
+        explicit = explicit or {}
         try:
-            client = self.fabric_client()
             for name in targets:
                 info = self._resolve_lakehouse(name)
                 entry = st["lakehouses"][name]
                 entry.update({"state": "listing"})
                 t0 = time.time()
                 try:
-                    tables = client.list_tables(info.workspace_id, info.id)
+                    # Listing comes from OneLake storage through the JVM (already
+                    # authenticated), not the Fabric REST endpoint: no extra credential,
+                    # and it works for schema-enabled lakehouses (Tables/<schema>/<table>).
+                    tables = explicit.get(name) or self.list_tables(name)
                 except Exception as exc:
                     entry.update({"state": "failed", "error": f"{type(exc).__name__}: {exc}", "seconds": round(time.time() - t0, 1)})
+                    print(f"local-spark: preload of {name} could not list tables: {exc}", file=sys.stderr)
                     continue
                 already = self._mounted.get(info.name, set())
                 todo = [t for t in tables if t not in already]
+                qualified = {t: self._qualified(info.name, t) for t in todo}
                 with self._notice_lock:
-                    self._claimed_mounts |= {f"{info.name}.{t}".lower() for t in todo}
+                    self._claimed_mounts |= {f"{db}.{tb}".lower() for db, tb in qualified.values()}
                 entry.update({"state": "mounting", "total": len(tables), "done": len(tables) - len(todo), "failed": 0})
                 st["tables_total"] += len(tables)
                 st["tables_done"] += len(tables) - len(todo)
 
-                def one(table: str, _info=info, _entry=entry):
+                def one(table: str, _info=info, _entry=entry, _q=qualified):
+                    db, tb = _q[table]
                     try:
-                        self.spark.table(f"{self._q(_info.name)}.{self._q(table)}")
+                        self.spark.table(f"{self._q(db)}.{self._q(tb)}")
                         with self._notice_lock:
                             self._mounted.setdefault(_info.name, set()).add(table)
                         return None
                     except Exception as exc:
                         return f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
                     finally:
-                        self._consume_mount_notices({f"{_info.name}.{table}".lower()})
+                        self._consume_mount_notices({f"{db}.{tb}".lower()})
 
                 errors = {}
                 with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo) or 1)), thread_name_prefix="lsm-preload") as pool:
@@ -534,12 +606,15 @@ class SparkEngine:
         finally:
             st["finished_at"] = time.time()
             secs = st["finished_at"] - (st["started_at"] or st["finished_at"])
-            failed = f", {st['tables_failed']} failed" if st["tables_failed"] else ""
-            with self._notice_lock:
-                self._pending_notices.append(
-                    f"preloaded {st['tables_done'] - st['tables_failed']} tables across {len(targets)} lakehouse(s) "
-                    f"in {secs:.0f} s ({st['workers']} workers{failed}); every table now resolves without a first-touch mount"
-                )
+            done = st["tables_done"] - st["tables_failed"]
+            if done:  # failures are reported by preload_status and stderr, never as a notice on an unrelated cell
+                with self._notice_lock:
+                    self._pending_notices.append(
+                        f"preloaded {done} tables across {len(targets)} lakehouse(s) in {secs:.0f} s "
+                        f"({st['workers']} workers); every table now resolves without a first-touch mount"
+                    )
+            if st["tables_failed"] or any(e.get("state") == "failed" for e in st["lakehouses"].values()):
+                print(f"local-spark: preload finished with failures: {st}", file=sys.stderr)
 
     def preload_status(self) -> dict:
         st = dict(self.preload_state)
@@ -583,16 +658,39 @@ class SparkEngine:
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
             return {"tables": dict(pool.map(one, tables)), "dv_strategy": self.dv_strategy}
 
-    def _exec(self, code: str, on_output=None) -> tuple[ExecResult, BaseException | None]:
+    def _running(self, method: str):
+        """Context for one interruptible unit of work (a cell, a query): marks the
+        engine busy for `interrupt` / `status`, bumps the cell generation the
+        interrupt watchdog is bound to, and consumes a leftover interrupt at the end."""
+        engine = self
+
+        class _Running:
+            def __enter__(self_):
+                engine._interrupt_requested = False
+                engine._cell_gen += 1
+                engine._cell_method = method
+                engine._cell_started = time.time()
+                engine._cell_running = True
+
+            def __exit__(self_, *exc):
+                engine._cell_running = False
+                engine._cell_started = None
+                engine._cell_method = None
+                if engine._interrupt_requested:
+                    engine._drain_pending_interrupt()
+                return False
+
+        return _Running()
+
+    def _exec(self, code: str, on_output=None, capture_result: bool = False) -> tuple[ExecResult, BaseException | None]:
         """Run a cell; also return the raised exception (the runner needs to
-        recognize NotebookExit, which IPython otherwise reports as an error)."""
+        recognize NotebookExit, which IPython otherwise reports as an error).
+        ``capture_result``: a Spark or pandas DataFrame that is the cell's last
+        expression is attached as a display (Fabric shows a bare `df` as a grid)."""
         from IPython.utils.capture import capture_output
 
         self._displays, self._blobs = [], []
-        self._interrupt_requested = False
-        self._cell_gen += 1
-        self._cell_running = True
-        try:
+        with self._running("run_code"):
             if on_output is None:
                 with capture_output() as cap:
                     result = self.shell.run_cell(code, store_history=True)
@@ -610,10 +708,11 @@ class SparkEngine:
                         sys.stdout, sys.stderr = saved
                         out_tee.close(); err_tee.close()
                 cap_stdout, cap_stderr = out_tee.getvalue(), err_tee.getvalue()
-        finally:
-            self._cell_running = False
-            if self._interrupt_requested:
-                self._drain_pending_interrupt()
+        if capture_result and result.success and result.result is not None:
+            try:
+                self._capture_result(result.result)
+            except Exception as exc:  # the cell itself succeeded; say why the grid is missing
+                cap_stderr += f"\nlocal-spark: could not capture the result as Arrow: {type(exc).__name__}: {exc}\n"
 
         error = None
         tb = None
@@ -677,10 +776,11 @@ class SparkEngine:
                 return text.rstrip("\n") + "\n\nlocal-spark: " + self.dv_refusal(t)
         return text
 
-    def run_code(self, code: str, on_output=None) -> ExecResult:
+    def run_code(self, code: str, on_output=None, capture_result: bool = False) -> ExecResult:
         """Run a cell of Python against the persistent namespace. ``on_output``
-        (stream, text) receives stdout/stderr as the cell writes them."""
-        res = self._exec(code, on_output=on_output)[0]
+        (stream, text) receives stdout/stderr as the cell writes them;
+        ``capture_result`` attaches a bare trailing DataFrame as a display."""
+        res = self._exec(code, on_output=on_output, capture_result=capture_result)[0]
         res.notices.extend(self.drain_mount_notices())
         self.blobs_out = list(self._blobs)
         return res
@@ -696,12 +796,17 @@ class SparkEngine:
         if not self._cell_running:
             return {"interrupted": False, "state": "idle", "reason": "idle: no cell is running"}
         self._interrupt_requested = True
+        # From this (control) thread, py4j's pinned-thread mode gives us our own
+        # JVM connection, so the cancel never touches the connection the cell is
+        # blocked on. (The cell's own thread must not call into the JVM from its
+        # SIGINT handler, which is why _tame_sigint drops pyspark's handler.)
+        t0 = time.time()
         try:
             self.spark.sparkContext.cancelAllJobs()
         except Exception as exc:  # the JVM may be gone; still interrupt Python
             cancel = f"cancelAllJobs failed: {type(exc).__name__}: {exc}"
         else:
-            cancel = "spark jobs cancelled"
+            cancel = f"spark jobs cancelled in {time.time() - t0:.2f}s"
         # A real SIGINT to the cell's thread: it wakes a C-level time.sleep and a
         # blocking py4j socket read (EINTR), and pyspark's own SIGINT handler then
         # cancels jobs again and raises KeyboardInterrupt. interrupt_main() only
@@ -714,7 +819,59 @@ class SparkEngine:
         # A job that starts after cancelAllJobs() (still planning when we cancelled)
         # would run to completion: keep cancelling until the cell has ended.
         threading.Thread(target=self._cancel_until_idle, args=(self._cell_gen,), name="lsm-interrupt-watchdog", daemon=True).start()
-        return {"interrupted": True, "state": "interrupting", "detail": cancel}
+        return {"interrupted": True, "state": "interrupting", "detail": cancel, "method": self._cell_method,
+                "elapsed_s": round(time.time() - self._cell_started, 1) if self._cell_started else None}
+
+    def status(self) -> dict:
+        """For the control socket: what is running and for how long. Spark's active
+        job count comes from this thread's own JVM connection, so it works while
+        the cell's thread is blocked in a Spark call."""
+        out: dict = {"initialized": True, "cell_running": self._cell_running, "cell": None,
+                     "preload": self.preload_state.get("state", "idle")}
+        if self._cell_running:
+            cell: dict = {"method": self._cell_method, "elapsed_s": round(time.time() - (self._cell_started or time.time()), 1),
+                          "interrupt_requested": self._interrupt_requested, "active_jobs": None}
+            try:
+                cell["active_jobs"] = len(self.spark.sparkContext.statusTracker().getActiveJobsIds())
+            except Exception:
+                pass
+            out["cell"] = cell
+        return out
+
+    def _tame_sigint(self) -> None:
+        """pyspark installs a SIGINT handler that calls cancelAllJobs() from the
+        interrupted thread itself. When the interrupt lands while that thread is
+        inside a py4j read (always, for a cell blocked in Spark), the handler's
+        call re-enters the same pinned connection: `RuntimeError: reentrant call
+        inside <_io.BufferedReader>`, a Py4JNetworkError, and py4j's own error
+        logging on the cell's stderr. Our interrupt() cancels jobs from the control
+        thread, so the plain KeyboardInterrupt handler is all the cell needs."""
+        import signal
+
+        if threading.current_thread() is not threading.main_thread():
+            return
+        current = signal.getsignal(signal.SIGINT)
+        if callable(current) and getattr(current, "__name__", "") == "signal_handler":
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def _install_interrupt_log_filter(self) -> None:
+        """While an interrupt is in progress, py4j's `logging.exception(...)` lines
+        about the connection it is tearing down ("KeyboardInterrupt while sending
+        command", "Exception while sending command") are the interrupt's own
+        noise, not the cell's output: drop them from the loggers they come from."""
+        import logging
+
+        engine = self
+
+        class _Quiet(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                if not engine._interrupt_requested:
+                    return True
+                msg = record.getMessage()
+                return not ("while sending command" in msg or record.name.startswith("py4j"))
+
+        for name in (None, "py4j", "py4j.java_gateway", "py4j.clientserver"):
+            logging.getLogger(name).addFilter(_Quiet())
 
     def _drain_pending_interrupt(self) -> None:
         """An interrupt that cancelled the Spark job before Python consumed the
@@ -774,6 +931,39 @@ class SparkEngine:
         return data, {"arrow_bytes": len(data), "row_count": table.num_rows, "truncated": truncated,
                       "limit": limit, "columns": list(table.schema.names)}
 
+    def _capture_result(self, value) -> None:
+        """A bare Spark or pandas DataFrame as the cell's last expression → one
+        `displays` entry tagged `source: "result"` (opt-in via capture_result)."""
+        import pyarrow as pa
+
+        try:
+            from pyspark.sql import DataFrame
+        except ImportError:  # pragma: no cover
+            DataFrame = ()
+        limit = self.default_sql_limit
+        if isinstance(value, DataFrame):
+            data, meta = self._arrow_from_df(value, limit)
+        else:
+            try:
+                import pandas as pd
+            except ImportError:  # pragma: no cover
+                return
+            if not isinstance(value, pd.DataFrame):
+                return
+            table = pa.Table.from_pandas(value.head(limit + 1), preserve_index=False)
+            truncated = table.num_rows > limit
+            if truncated:
+                table = table.slice(0, limit)
+            sink = pa.BufferOutputStream()
+            with pa.ipc.new_stream(sink, table.schema) as writer:
+                writer.write_table(table)
+            data = sink.getvalue().to_pybytes()
+            meta = {"arrow_bytes": len(data), "row_count": table.num_rows, "truncated": truncated,
+                    "limit": limit, "columns": list(table.schema.names)}
+        meta.update(kind="arrow", source="result")
+        self._displays.append(meta)
+        self._blobs.append(data)
+
     def display(self, obj, limit: int | None = None) -> None:
         """`display(df)` as on Fabric: a DataFrame becomes an Arrow result attached
         to the cell (hosts render it in a grid; the MCP server prints a table);
@@ -784,7 +974,7 @@ class SparkEngine:
             DataFrame = ()
         if isinstance(obj, DataFrame):
             data, meta = self._arrow_from_df(obj, limit or self.default_sql_limit)
-            meta["kind"] = "arrow"
+            meta.update(kind="arrow", source="display")
             self._displays.append(meta)
             self._blobs.append(data)
         else:
@@ -962,10 +1152,19 @@ class SparkEngine:
     # ---- helpers the notebookutils shim calls ----
 
     def credential(self):
+        """Tokens come from the host's token endpoint when one is configured (the
+        MCP server's TokenServer, or an embedding host): the worker then needs no
+        Azure credential of its own. DefaultAzureCredential is the fallback for a
+        worker started with no endpoint."""
         if self._cred is None:
-            from azure.identity import DefaultAzureCredential
+            if self._onelake and self._onelake.get("endpoint"):
+                from .host_credential import HostTokenCredential
 
-            self._cred = DefaultAzureCredential()
+                self._cred = HostTokenCredential(self._onelake["endpoint"], self._onelake.get("secret", ""))
+            else:
+                from azure.identity import DefaultAzureCredential
+
+                self._cred = DefaultAzureCredential()
         return self._cred
 
     def workspace_id(self) -> str:
@@ -1075,21 +1274,29 @@ class SparkEngine:
         if self.write_mode != "writethrough" and (target := _sql_write_target(sql)):
             if dv := self.is_dv_table(target):
                 raise RuntimeError(self.dv_refusal(dv))
-        try:
-            df = self._sql_with_automount(sql)
-        except Exception as exc:
-            annotated = self.annotate_error(str(exc))
-            if annotated != str(exc):
-                raise RuntimeError(annotated) from exc
-            raise
-        columns = list(df.columns)
-        if arrow and columns:
-            data, meta = self._arrow_from_df(df, limit)
-            self.blobs_out = [data]
-            return SqlResult(columns=meta["columns"], rows=[], row_count=meta["row_count"], truncated=meta["truncated"],
-                             limit=limit, notices=self.drain_mount_notices(), arrow=meta)
-        # Pull one extra row to detect truncation without a full count.
-        collected = df.limit(limit + 1).collect()
+        with self._running("run_sql"):
+            try:
+                try:
+                    df = self._sql_with_automount(sql)
+                except Exception as exc:
+                    annotated = self.annotate_error(str(exc))
+                    if annotated != str(exc):
+                        raise RuntimeError(annotated) from exc
+                    raise
+                columns = list(df.columns)
+                if arrow and columns:
+                    data, meta = self._arrow_from_df(df, limit)
+                    self.blobs_out = [data]
+                    return SqlResult(columns=meta["columns"], rows=[], row_count=meta["row_count"], truncated=meta["truncated"],
+                                     limit=limit, notices=self.drain_mount_notices(), arrow=meta)
+                # Pull one extra row to detect truncation without a full count.
+                collected = df.limit(limit + 1).collect()
+            except KeyboardInterrupt:
+                raise InterruptedQuery("KeyboardInterrupt: interrupted (Spark jobs cancelled)") from None
+            except Exception as exc:
+                if self._interrupt_requested:  # a cancelled job surfaces as Py4JError / SparkException
+                    raise InterruptedQuery(f"KeyboardInterrupt: interrupted (Spark jobs cancelled); underlying {type(exc).__name__}: {exc}") from exc
+                raise
         truncated = len(collected) > limit
         collected = collected[:limit]
         rows = [[_jsonify(v) for v in row] for row in collected]
@@ -1134,6 +1341,7 @@ class SparkEngine:
             "extra_jars": self.extra_jars,
             "extra_packages": self.extra_packages,
             "preload": self.preload_status(),
+            "lakehouse_schemas": self._lakehouse_schemas,
             "protocol_version": PROTOCOL_VERSION,
             "files_root": (self.files_link or {}).get("files_root"),
             "spark_working_dir": self.spark_working_dir,
@@ -1157,9 +1365,16 @@ class SparkEngine:
             for table_dir in sorted(lh_dir.iterdir()):
                 if (table_dir / "_delta_log").is_dir():
                     state, version = _shadow_state(table_dir)
+                    lh_name = id_to_name.get(lh_dir.name, lh_dir.name)
+                    # a schema table's shadow dir is "<schema>.<table>" -> lakehouse "<lh>__<schema>"
+                    if "." in table_dir.name:
+                        schema, tbl = table_dir.name.split(".", 1)
+                        lh_name, table_name = f"{lh_name}__{schema}", tbl
+                    else:
+                        table_name = table_dir.name
                     found.append({
-                        "lakehouse": id_to_name.get(lh_dir.name, lh_dir.name),
-                        "table": table_dir.name,
+                        "lakehouse": lh_name,
+                        "table": table_name,
                         "path": table_dir.as_posix(),
                         "state": state,
                         "version": version,
@@ -1335,7 +1550,6 @@ def _notice_table(notice: str) -> str:
     return notice.split(" ", 2)[1].lower() if notice.startswith("mounted ") else ""
 
 
-PROTOCOL_VERSION = 2  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
 
 
 class _Tee(io.TextIOBase):

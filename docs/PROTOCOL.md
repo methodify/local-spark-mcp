@@ -30,8 +30,11 @@ data socket until it finishes. Version 2 adds three things on top:
 - **A control socket.** Spawn the worker with `--control-port M` as well; it
   connects to that port second. The control connection carries the same framing
   and is served by its own thread, so it answers while a cell runs:
-  `interrupt`, `ping`, `status` (`{cell_running, initialized}`), and
-  `preload_status`. Replies never carry blobs or events.
+  `interrupt`, `ping`, `status`, and `preload_status`. `status` returns
+  `{initialized, cell_running, preload, cell}` where `cell` is `null` when idle,
+  else `{method, elapsed_s, active_jobs, interrupt_requested}` (`active_jobs` is
+  Spark's active job count, read over the control thread's own JVM connection;
+  `null` if the JVM did not answer). Replies never carry blobs or events.
 
 Request:
 
@@ -54,16 +57,17 @@ one. The MCP server does exactly that and reports it on the next result.
 
 | Method | Params | Result |
 |---|---|---|
-| `healthcheck` | `profile?` | Works before `init`: versions, profile verdict, JDK and winutils resolution, jar validity (`healthcheck.healthcheck()` shape). |
+| `healthcheck` | `profile?` | Works before `init`: versions, `protocol_version`, profile verdict, JDK and winutils resolution, jar validity (`healthcheck.healthcheck()` shape). |
 | `init` | `SparkEngine` keyword arguments (below) plus `profile?` | The `info` dict plus `profile_warnings`. Runs `check_profile` first and fails with its message when the installed stack cannot serve the declared profile or would crash its Python workers on this platform. |
 | `ping` | | `{}` |
-| `run_code` | `code`, `stream?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", columns, row_count, truncated, limit, arrow_bytes}` per `display(df)`, blobs in the same order) |
+| `run_code` | `code`, `stream?`, `capture_result?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", source, columns, row_count, truncated, limit, arrow_bytes}` per `display(df)` (`source: "display"`) and, with `capture_result: true`, for a Spark or pandas DataFrame that is the cell's last expression (`source: "result"`, same row cap; stdout still carries the repr); blobs in the same order) |
 | `run_sql` | `sql`, `limit?`, `arrow?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
 | `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?` | per-cell results (see `engine.run_notebook`) |
 | `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
 | `mount_table` | `lakehouse`, `table` | materialize one table now |
 | `mount_tables` | `lakehouse`, `tables` | materialize many in parallel; `mounted`, `failed`, `seconds` per table |
-| `preload` | `lakehouses?` (names or `["all"]`), `workers?` | start background eager population; returns status at once |
+| `preload` | `lakehouses?` (names, `["all"]`, or `{"lakehouse": ["t1", "dbo/t2"]}` for explicit tables with no listing), `workers?` | start background eager population; returns status at once. Failures appear in `preload_status` and on the worker's stderr, never as a cell notice |
+| `list_tables` | `lakehouse` | table entries from OneLake storage (`t` for `Tables/t`, `schema/t` for `Tables/schema/t`), not the Fabric REST endpoint, so schema-enabled lakehouses work |
 | `preload_status` | | `state` (`idle` / `running` / `done` / `failed`), per-lakehouse progress, counts, `elapsed_s` |
 | `wait_preload` | `timeout?` | block until done (or timeout); returns status |
 | `table_features` | `lakehouse`, `tables` | Delta protocol features per table |
@@ -78,24 +82,65 @@ one. The MCP server does exactly that and reports it on the next result.
 the host must run a token endpoint, see `token_server.py`), `lakehouses`
 (`[{name, id, workspace_id}]`), `default_lakehouse`, `write_mode`,
 `persist_shadow`, `state_root`, `notebooks_root`, `files_sync`, `mirror_root`,
-`default_sql_limit`, `preload` (list of lakehouse names or `["all"]`),
-`preload_workers` (default 32), `extra_jars`, `extra_packages`.
+`default_sql_limit`, `preload` (list of lakehouse names, `["all"]`, or the
+`{lakehouse: [tables]}` form), `preload_workers` (default 32), `extra_jars`,
+`extra_packages`. Each `lakehouses` entry may add `schemas` (`["dbo", …]`),
+`default_schema` (default `dbo`), and `detect_schemas` (default true: the worker
+lists `Tables/` once at start and treats folders of Delta tables as schemas).
+
+## Tokens
+
+The worker holds no Azure credential of its own when `onelake.endpoint` is set.
+The JVM asks that endpoint for OneLake storage tokens; since 0.4.1 the Python
+side asks it for every other scope too (`GET <endpoint>?scope=<scope>` with the
+same `X-Token-Secret` header; the body is the bearer token). Scopes requested:
+`https://api.fabric.microsoft.com/.default` (table discovery fallback, Variable
+Libraries, notebook discovery), `https://storage.azure.com/.default` (Files
+mirror, `notebookutils.fs` on `abfss://`), and `https://vault.azure.net/.default`
+(`credentials.getSecret`). A host that serves only the storage scope breaks
+those features with a clear HTTP error, not a credential-chain message in a
+cell. Without an endpoint the worker falls back to `DefaultAzureCredential`.
+
+## Schema-enabled lakehouses
+
+A lakehouse with `Tables/<schema>/<table>` gets one session database per
+schema, `<lakehouse>__<schema>`, plus a V2 catalog named after the lakehouse
+(`ch.fs.OneLakeSchemaCatalog`) so the Fabric spelling works: `test.dbo.holidays`,
+`SHOW NAMESPACES IN test`, `USE test` (selects `default_schema`). The catalog
+delegates every operation to the session catalog, so first-touch resolution,
+shadows (`<schema>.<table>` under the lakehouse's shadow dir), and the write
+policy apply unchanged. Top-level `Tables/<table>` entries stay reachable as
+`test.table`. `info.lakehouse_schemas` maps lakehouse to schemas.
 
 ## Interrupt (control socket)
 
-`interrupt` cancels every Spark job (`SparkContext.cancelAllJobs`) and raises
-`KeyboardInterrupt` in the cell's thread; the reply is `{"interrupted", "state": "interrupting" | "idle", …}`. The in-flight `run_code` /
-`run_sql` then returns `ok: false`, `interrupted: true`, `error` starting with
-`KeyboardInterrupt`; session state (variables, shadows) is kept. When nothing is
-running the result is `{"interrupted": false, "reason": "idle: …"}`. After the
-first cancel a watchdog keeps cancelling until the cell ends, so a job that was
-still being planned when you interrupted does not run to completion. Limits: a
-cell inside a long JVM call returns when its job is cancelled (seconds); a tight
-loop inside a C extension cannot be interrupted; and on **Windows** a cell that
-is sleeping or blocked in pure Python (not in Spark) returns only when that
-blocking call ends, since the interrupt there is queued rather than delivered
-(on Linux a real `SIGINT` wakes it at once). Spark work, the case that matters,
-stops within seconds on both platforms.
+`interrupt` cancels every Spark job (`SparkContext.cancelAllJobs`, issued from
+the control thread over its own JVM connection) and raises `KeyboardInterrupt`
+in the cell's thread; the reply comes back as soon as the cancel returns:
+`{"interrupted", "state": "interrupting" | "idle", "detail", "method",
+"elapsed_s"}`. The in-flight `run_code` then returns `ok: false`, `interrupted:
+true`, `error` starting with `KeyboardInterrupt`; an in-flight `run_sql` fails
+with `ok: false`, `interrupted: true`, `fatal: false`. Session state (variables,
+shadows) is kept. When nothing is running the result is `{"interrupted": false,
+"reason": "idle: …"}`. After the first cancel a watchdog keeps cancelling until
+the cell ends, so a job that was still being planned when you interrupted does
+not run to completion.
+
+The worker replaces pyspark's own SIGINT handler with Python's default one.
+pyspark's handler calls `cancelAllJobs()` from the interrupted thread, and when
+the interrupt lands inside a py4j read (a cell blocked in Spark) that call
+re-enters the connection the thread is reading on: `RuntimeError: reentrant call
+inside <_io.BufferedReader>`, then `Py4JNetworkError`, with py4j's error logging
+on the cell's stderr. The control thread already cancels the jobs, so the cell's
+thread only needs the `KeyboardInterrupt`. py4j's log lines about the connection
+it tears down during an interrupt are filtered out of the cell's stderr.
+
+Limits: a cell inside a long JVM call returns when its job is cancelled
+(seconds); a tight loop inside a C extension cannot be interrupted; and on
+**Windows** a cell that is sleeping or blocked in pure Python (not in Spark)
+returns only when that blocking call ends, since the interrupt there is queued
+rather than delivered (on Linux a real `SIGINT` wakes it at once). Spark work,
+the case that matters, stops within seconds on both platforms.
 
 ## Arrow
 
