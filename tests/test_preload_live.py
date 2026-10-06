@@ -42,7 +42,9 @@ def test_preload_at_startup_and_on_demand(tmp_path):
         d = eng.discard_shadow(table=f"{LH}.{TABLE}")
         assert d["discarded"] == 1 and d["tables"][0]["table"] == TABLE
         assert not any(t["table"] == TABLE for t in eng.shadow_status()["tables"])
-        assert len(eng.shadow_status()["tables"]) >= lh["total"] - 3  # the rest are intact
+        # the rest are intact: shadows, plus (fabric-1.3) deletion-vector tables that are views, not clones
+        status = eng.shadow_status()
+        assert len(status["tables"]) + len(status["deletion_vector_tables"]) >= lh["total"] - 3, (len(status["tables"]), len(status["deletion_vector_tables"]), lh["total"])
         with pytest.raises(LookupError):
             eng.discard_shadow(table=f"{LH}.{TABLE}")
         # a second on-demand preload of the same lakehouse is a no-op-ish fast pass
