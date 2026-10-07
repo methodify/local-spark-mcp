@@ -29,9 +29,10 @@ def worker():
 
 
 def test_isolation_and_sharing(worker):
-    a = worker.create_context("nb-a")
+    a = worker.create_context("nb-a", name="Sales analysis")
     b = worker.create_context("nb-b")
-    assert a["id"] == "nb-a" and a["current_catalog"] == "spark_catalog" and b["current_database"] == "default"
+    assert a["id"] == "nb-a" and a["name"] == "Sales analysis" and a["current_catalog"] == "spark_catalog"
+    assert b["current_database"] == "default" and b["name"] is None and b["last_activity"] is None
     with pytest.raises(WorkerError, match="already exists"):
         worker.create_context("nb-a")
     with pytest.raises(WorkerError, match="unknown context"):
@@ -79,10 +80,16 @@ def test_isolation_and_sharing(worker):
     info = worker.get_info()
     ids = {c["id"]: c for c in info["contexts"]}
     assert set(ids) == {"default", "nb-a", "nb-b"} and ids["nb-a"]["current_database"] == "shared_db" and ids["nb-a"]["cells"] >= 5
+    assert ids["nb-a"]["last_activity"] and ids["nb-a"]["idle_s"] is not None and ids["nb-a"]["name"] == "Sales analysis"
+    # the context's name is the job group / description in Spark's job list
+    r = worker.run_code("sc.setLocalProperty('x', 'y'); print(sc.getLocalProperty('spark.jobGroup.id'), '|', sc.getLocalProperty('spark.job.description'))", context="nb-a")
+    assert r["stdout"].strip() == "nb-a | Sales analysis", r["stdout"]
+    r = worker.run_code("print(sc.getLocalProperty('spark.job.description'))", context="nb-a", job_description="cell 1")
+    assert r["stdout"].strip() == "cell 1"
 
 
 def test_status_and_interrupt_know_the_context(worker):
-    worker.create_context("busy")
+    worker.create_context("busy", name="Busy notebook")
     out = {}
 
     def run():
@@ -91,7 +98,7 @@ def test_status_and_interrupt_know_the_context(worker):
     t = threading.Thread(target=run); t.start()
     time.sleep(1.5)
     st = worker.status()
-    assert st["cell_running"] and st["cell"]["context"] == "busy" and "busy" in st["contexts"]
+    assert st["cell_running"] and st["cell"]["context"] == "busy" and st["cell"]["context_name"] == "Busy notebook" and "busy" in st["contexts"]
     assert worker.status(context="nb-a")["cell_running"] is False and worker.status(context="nb-a")["cell"] is None
     assert worker.status(context="busy")["cell"]["context"] == "busy"
     r = worker.interrupt(context="nb-a")
@@ -116,3 +123,22 @@ def test_drop_context(worker):
     assert worker.run_code("print(x)", context="nb-a")["stdout"].strip() == "A"
     assert worker.run_code("print(x)")["stdout"].strip() == "D"
     assert worker.run_sql("SELECT COUNT(*) FROM shared_db.t5", context="nb-a")["rows"] == [[5]]
+
+
+def test_force_drop_over_the_control_socket(worker):
+    worker.create_context("closing")
+    out = {}
+
+    def run():
+        out["res"] = worker.run_code("import time\nfor _ in range(600):\n    time.sleep(0.1)", context="closing")
+
+    t = threading.Thread(target=run); t.start()
+    time.sleep(1.5)
+    with pytest.raises(WorkerError, match="running a cell"):
+        worker.drop_context("closing", via_control=True)  # no force: refused while running
+    r = worker.drop_context("closing", force=True, via_control=True)
+    assert r["dropped"] is False and r["scheduled"] is True
+    t.join(timeout=15)
+    assert not t.is_alive() and out["res"]["interrupted"] is True
+    assert "closing" not in [c["id"] for c in worker.get_info()["contexts"]]
+    assert worker.run_code("print('fine')")["stdout"].strip() == "fine"

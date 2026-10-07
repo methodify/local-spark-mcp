@@ -368,6 +368,14 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **0.5.1**: `Context.name` (job group = context id, description = name, via
+  `sc.setLocalProperty` in `_running`; per-cell `job_description` overrides),
+  `drop_context(force=True)` served on the control socket too (sets
+  `pending_drop` + interrupts; `_running.__exit__` drops), per-context
+  `last_activity`/`idle_s`. Lazy-Files findings (probe in scratchpad): with
+  `fs.defaultFS` = the lakehouse root, relative `Files/` resolves to OneLake,
+  but shadow locations are scheme-less local paths and then 400 on OneLake —
+  shadow root / warehouse must become `file:` URIs first.
 - **Contexts (0.5.0, Cobalt sessions request item 0)**: `Context` = a module
   (namespace) + `spark.newSession()`. The singleton IPython shell serves every
   context: `_activate(ctx)` swaps `shell.user_module`/`user_ns` before a cell

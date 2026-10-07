@@ -68,6 +68,9 @@ class Context:
     created_at: float = field(default_factory=time.time)
     cells: int = 0
     seeded: bool = False  # IPython's hidden names (In, Out, get_ipython, …) added on first activation
+    name: str | None = None  # display name (the notebook's title); job group in the Spark UI
+    last_activity: float | None = None
+    pending_drop: bool = False  # drop_context(force=True) on the control socket while a cell runs
 
     @property
     def ns(self) -> dict:
@@ -328,7 +331,8 @@ class SparkEngine:
             self.shell.init_user_ns()  # In, Out, _, get_ipython, exit: hidden names IPython expects in user_ns
             ctx.seeded = True
 
-    def create_context(self, id: str, default_lakehouse: str | None = None, default_schema: str | None = None) -> dict:
+    def create_context(self, id: str, default_lakehouse: str | None = None, default_schema: str | None = None,
+                       name: str | None = None) -> dict:
         """A new isolated REPL: fresh namespace and `spark.newSession()` with the
         engine's runtime confs re-applied (a new session does not inherit them), its
         current database set from the default lakehouse (and schema) like a Fabric
@@ -345,7 +349,7 @@ class SparkEngine:
         module = types.ModuleType("__main__")
         module, _ns = self.shell.prepare_user_module(module)
         self._seed_namespace(module.__dict__, sess)
-        ctx = Context(id, sess, module, None, None)
+        ctx = Context(id, sess, module, None, None, name=(name or None))
         if default_lakehouse:
             info = self._resolve_lakehouse(default_lakehouse)
             if info is None:
@@ -363,12 +367,20 @@ class SparkEngine:
         self.contexts[id] = ctx
         return self._context_info(ctx)
 
-    def drop_context(self, id: str) -> dict:
+    def drop_context(self, id: str, force: bool = False) -> dict:
+        """Release a context. On the data socket a request waits behind the running
+        cell, so the context is idle by the time this runs; on the control socket
+        (where a cell may be in flight) ``force`` interrupts the cell and the drop
+        happens as soon as it ends (`scheduled: true`)."""
         if id == "default":
             raise ValueError("the default context cannot be dropped")
         ctx = self._resolve_context(id)
         if self._cell_running and self._cell_context == id:
-            raise RuntimeError(f"context {id!r} is running a cell; interrupt it first")
+            if not force:
+                raise RuntimeError(f"context {id!r} is running a cell; interrupt it first (or drop with force)")
+            ctx.pending_drop = True
+            self.interrupt(context=id)
+            return {"id": id, "dropped": False, "scheduled": True, "contexts": sorted(self.contexts)}
         try:  # temp views belong to the session; drop them so the JVM can release the plans
             for t in ctx.spark.catalog.listTables():
                 if t.isTemporary:
@@ -379,12 +391,14 @@ class SparkEngine:
         if self._active is ctx:
             self._activate(self.contexts["default"])
         ctx.module.__dict__.clear()
-        return {"id": id, "contexts": sorted(self.contexts)}
+        return {"id": id, "dropped": True, "scheduled": False, "contexts": sorted(self.contexts)}
 
     def _context_info(self, ctx: Context) -> dict:
-        return {"id": ctx.id, "default_lakehouse": ctx.default_lakehouse, "default_schema": ctx.default_schema,
+        return {"id": ctx.id, "name": ctx.name, "default_lakehouse": ctx.default_lakehouse, "default_schema": ctx.default_schema,
                 "current_database": _safe(ctx.spark.catalog.currentDatabase), "current_catalog": _safe(ctx.spark.catalog.currentCatalog),
-                "created_at": ctx.created_at, "cells": ctx.cells}
+                "created_at": ctx.created_at, "cells": ctx.cells, "last_activity": ctx.last_activity,
+                "idle_s": None if (self._cell_running and self._cell_context == ctx.id) else
+                (round(time.time() - ctx.last_activity, 1) if ctx.last_activity else None)}
 
     def _set_conf(self, key: str, value: str) -> None:
         """A runtime conf that every context's session must share (lakehouse ids,
@@ -892,11 +906,13 @@ class SparkEngine:
                 engine._active.cells += 1
                 engine._cell_started = time.time()
                 engine._cell_running = True
-                if job_description:
-                    try:
-                        engine.spark.sparkContext.setJobDescription(job_description[:200])
-                    except Exception:
-                        pass
+                try:
+                    sc = engine.spark.sparkContext
+                    ctx = engine._active
+                    sc.setLocalProperty("spark.jobGroup.id", ctx.id)
+                    sc.setLocalProperty("spark.job.description", (job_description or ctx.name or "")[:200] or None)
+                except Exception:
+                    pass
 
             def __exit__(self_, *exc):
                 engine._cell_running = False
@@ -904,14 +920,18 @@ class SparkEngine:
                 engine._cell_method = None
                 engine._cell_context = None
                 engine._last_activity = time.time()
+                engine._active.last_activity = engine._last_activity
                 if engine._interrupt_requested:
                     engine._drain_pending_interrupt()
                     engine.jvm_alive(retries=12, delay=0.25)  # re-establish this thread's JVM connection (see jvm_alive)
-                if job_description:
-                    try:
-                        engine.spark.sparkContext.setJobDescription(None)
-                    except Exception:
-                        pass
+                try:
+                    sc = engine.spark.sparkContext
+                    sc.setLocalProperty("spark.jobGroup.id", None)
+                    sc.setLocalProperty("spark.job.description", None)
+                except Exception:
+                    pass
+                if engine._active.pending_drop:  # requested over the control socket while this cell ran
+                    engine.drop_context(engine._active.id)
                 return False
 
         return _Running()
@@ -1080,6 +1100,7 @@ class SparkEngine:
                      "last_activity": self._last_activity, "contexts": sorted(self.contexts)}
         if running:
             cell: dict = {"method": self._cell_method, "context": self._cell_context,
+                          "context_name": _safe(lambda: self.contexts[self._cell_context].name),
                           "elapsed_s": round(time.time() - (self._cell_started or time.time()), 1),
                           "interrupt_requested": self._interrupt_requested, "active_jobs": None}
             try:

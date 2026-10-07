@@ -30,7 +30,7 @@ data socket until it finishes. Version 2 adds three things on top:
 - **A control socket.** Spawn the worker with `--control-port M` as well; it
   connects to that port second. The control connection carries the same framing
   and is served by its own thread, so it answers while a cell runs:
-  `interrupt`, `ping`, `status`, and `preload_status`. `status` returns
+  `interrupt`, `ping`, `status`, `preload_status`, and `drop_context`. `status` returns
   `{initialized, cell_running, preload, idle_s, last_activity, cell}` where
   `idle_s` is the time since the last cell, query, or preload ended (`null`
   while one runs) and `cell` is `null` when idle,
@@ -71,8 +71,8 @@ one. The MCP server does exactly that and reports it on the next result.
 | `mount_table` | `lakehouse`, `table` | materialize one table now |
 | `mount_tables` | `lakehouse`, `tables` | materialize many in parallel; `mounted`, `failed`, `seconds` per table |
 | `preload` | `lakehouses?` (names, `["all"]`, or `{"lakehouse": ["t1", "dbo/t2"]}` for explicit tables with no listing), `workers?` | start background eager population; returns status at once. Failures appear in `preload_status` and on the worker's stderr, never as a cell notice |
-| `create_context` | `id`, `default_lakehouse?`, `default_schema?` | a new isolated REPL in the same JVM (see **Contexts**); returns `{id, default_lakehouse, default_schema, current_database, current_catalog, created_at, cells}` |
-| `drop_context` | `id` | release its namespace and session (`default` cannot be dropped; a context running a cell must be interrupted first) |
+| `create_context` | `id`, `default_lakehouse?`, `default_schema?`, `name?` | a new isolated REPL in the same JVM (see **Contexts**); `name` is the display name (the notebook's title), used as the Spark job group description; returns `{id, name, default_lakehouse, default_schema, current_database, current_catalog, created_at, cells, last_activity, idle_s}` |
+| `drop_context` | `id`, `force?` | release its namespace and session (`default` cannot be dropped). On the data socket the request waits behind a running cell, so the context is idle when it runs; on the **control socket** `force: true` interrupts a running cell and drops the context when it ends (`{dropped: false, scheduled: true}`), otherwise `{dropped: true}` |
 | `register_lakehouse` | `lakehouse` (`{name, id, workspace_id, schemas?, default_schema?, detect_schemas?}`, as in `init`) | attach a lakehouse after start (its own workspace is fine): session database, schema catalog, first-touch resolution, shadows under the shared root |
 | `unregister_lakehouse` | `name` | detach it: databases dropped from the session catalog (shadow files stay and re-link on re-registration), confs removed |
 | `list_tables` | `lakehouse` | table entries from OneLake storage (`t` for `Tables/t`, `schema/t` for `Tables/schema/t`), not the Fabric REST endpoint, so schema-enabled lakehouses work |
@@ -111,8 +111,11 @@ session's current database from the lakehouse (`spark_catalog.<lh>`, or
 confs (lakehouse ids, schema catalogs) to it; `register_lakehouse` later
 pushes to every context. `run_code`, `run_sql`, and `run_notebook` take
 `context`; `interrupt` and `status` on the control socket take an optional
-`context` (`status.cell.context` names the running one, `status.contexts` lists
-them); `info.contexts` and `info.active_context` describe them. Execution is
+`context` (`status.cell.context` and `context_name` name the running one, `status.contexts`
+lists them); `info.contexts` (with per-context `last_activity` and `idle_s`) and
+`info.active_context` describe them. Each context's cells run under the Spark
+job group `<context id>` with the context's `name` as description (overridden
+per cell by `job_description`), so the Spark UI groups a notebook's jobs. Execution is
 sequential across contexts (one request loop); the API does not preclude a
 later concurrent mode. `display`, `capture_result`, and `notebookutils` work in
 every context; `notebookutils.notebook.run` runs in the calling context.

@@ -181,12 +181,18 @@ class WorkerProcess:
     def status(self, context: str | None = None) -> dict:
         return self.control("status", {"context": context} if context else None, timeout=10.0)
 
-    def create_context(self, id: str, default_lakehouse: str | None = None, default_schema: str | None = None) -> dict:
+    def create_context(self, id: str, default_lakehouse: str | None = None, default_schema: str | None = None,
+                       name: str | None = None) -> dict:
         """A new isolated REPL (namespace + SparkSession) inside the same JVM; see docs/PROTOCOL.md."""
-        return self._call("create_context", {"id": id, "default_lakehouse": default_lakehouse, "default_schema": default_schema})
+        return self._call("create_context", {"id": id, "default_lakehouse": default_lakehouse, "default_schema": default_schema,
+                                             "name": name})
 
-    def drop_context(self, id: str) -> dict:
-        return self._call("drop_context", {"id": id})
+    def drop_context(self, id: str, force: bool = False, via_control: bool = False) -> dict:
+        """Release a context. ``via_control=True`` sends it on the control socket, where
+        ``force`` can interrupt a running cell and drop the context when it ends."""
+        if via_control:
+            return self.control("drop_context", {"id": id, "force": force})
+        return self._call("drop_context", {"id": id, "force": force})
 
     def _call(self, method: str, params: dict | None = None, *, timeout: float | None = None, on_event=None) -> dict:
         """Send one request and return its result. Binary blobs announced by the

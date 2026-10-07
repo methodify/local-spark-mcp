@@ -85,9 +85,10 @@ def _handle(engine, method: str, params: dict):
         info["control"] = True  # a control socket is served when --control-port was given
         return info, engine
     if method == "create_context":
-        return engine.create_context(params["id"], params.get("default_lakehouse"), params.get("default_schema")), engine
+        return engine.create_context(params["id"], params.get("default_lakehouse"), params.get("default_schema"),
+                                     name=params.get("name")), engine
     if method == "drop_context":
-        return engine.drop_context(params["id"]), engine
+        return engine.drop_context(params["id"], force=bool(params.get("force"))), engine
     if method == "register_lakehouse":
         return engine.register_lakehouse(params["lakehouse"]), engine
     if method == "unregister_lakehouse":
@@ -168,6 +169,10 @@ def _control_loop(port: int, shared: _Shared) -> None:
                     result = eng.interrupt(cparams.get("context")) if eng is not None else {"interrupted": False, "reason": "not initialized"}
                 elif method == "preload_status":
                     result = eng.preload_status() if eng is not None else {"state": "idle"}
+                elif method == "drop_context":  # here a cell may be in flight: force interrupts it and drops at its end
+                    if eng is None:
+                        raise ValueError("not initialized")
+                    result = eng.drop_context(cparams["id"], force=bool(cparams.get("force")))
                 else:
                     raise ValueError(f"unknown control method {method!r}")
                 send_msg(sock, {"id": rid, "ok": True, "result": result})
