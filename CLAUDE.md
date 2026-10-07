@@ -368,6 +368,21 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **Lazy Files, phase A (0.6.0)**: `ch.fs.LakehouseFileSystem` (jar) =
+  `lakehouse://<ws>@<lh>.onelake...` → inner `abfss://<ws>@host/<lh>/...`
+  (statuses translated back so Spark keeps reading through it; writes refused
+  unless `spark.localspark.write_mode` = writethrough, read from the conf the
+  instance was created with — cached per lakehouse; `innerRoot` is kept in
+  Hadoop's canonical spelling, `file:/x` not `file:///x`, or returned paths
+  never match and Spark feeds inner paths back in). `files_mode="lazy"` sets a
+  session's `fs.defaultFS` to it (`_set_default_fs`; a session's Hadoop conf
+  is derived from its SQL conf, so this is per context) and skips the local
+  working-dir hack; shadow root is now a `file:` URI in the catalog conf (a
+  scheme-less path 400'd on OneLake once defaultFS was abfss).
+  `spark.hadoop.fs.lakehouse.impl` is set in `build_spark` for Fabric
+  sessions; `fs.lakehouse.inner` overrides the inner root (tests use a local
+  dir). Phase B (Python IO hooks on `/lakehouse/` paths, `mirror_status`,
+  `clear_mirror`) is 0.6.1.
 - **0.5.1**: `Context.name` (job group = context id, description = name, via
   `sc.setLocalProperty` in `_running`; per-cell `job_description` overrides),
   `drop_context(force=True)` served on the control socket too (sets

@@ -105,6 +105,7 @@ class FilesConfig:
 
     sync: list[str] = field(default_factory=list)
     mirror_root: str | None = None
+    mode: str = "mirror"  # "mirror": Spark's Files/ is the local mirror; "lazy": Files/ is OneLake, read directly
 
 
 @dataclass
@@ -152,6 +153,10 @@ class Config:
             raise ConfigError(
                 f"runtime.write_mode must be one of {', '.join(WRITE_MODES)} "
                 f"(got {self.runtime.write_mode!r}) [from {self.origin('runtime.write_mode')}]."
+            )
+        if self.files.mode not in ("mirror", "lazy"):
+            raise ConfigError(
+                f"files.mode must be 'mirror' or 'lazy' (got {self.files.mode!r}) [from {self.origin('files.mode')}]."
             )
 
     def require_workspace(self) -> WorkspaceConfig:
@@ -254,7 +259,8 @@ def _parse_file(path: Path) -> Config:
             id=_require_str(ws, "id", "workspace"),
         ),
         notebooks=NotebooksConfig(root=_require_str(nbs, "root", "notebooks")),
-        files=FilesConfig(sync=list(sync), mirror_root=_require_str(files, "mirror_root", "files")),
+        files=FilesConfig(sync=list(sync), mirror_root=_require_str(files, "mirror_root", "files"),
+                          mode=_require_str(files, "mode", "files") or "mirror"),
         lakehouses=LakehouseConfig(
             exclude=list(exclude),
             default=_require_str(lh, "default", "lakehouses"),
@@ -365,6 +371,9 @@ def _apply_env_overrides(config: Config) -> None:
     if (mirror := env.get(f"{ENV_PREFIX}MIRROR_ROOT")) is not None:
         config.files.mirror_root = mirror or None
 
+    if (fmode := env.get(f"{ENV_PREFIX}FILES_MODE")) is not None:
+        config.files.mode = fmode.strip().lower() or "mirror"
+
 
 _ENV_KEYS = {
     f"{ENV_PREFIX}WORKSPACE_NAME": "workspace.name",
@@ -388,6 +397,7 @@ _ENV_KEYS = {
     f"{ENV_PREFIX}NOTEBOOKS_ROOT": "notebooks.root",
     f"{ENV_PREFIX}FILES_SYNC": "files.sync",
     f"{ENV_PREFIX}MIRROR_ROOT": "files.mirror_root",
+    f"{ENV_PREFIX}FILES_MODE": "files.mode",
 }
 
 

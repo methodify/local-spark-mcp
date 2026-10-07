@@ -92,7 +92,8 @@ the host must run a token endpoint, see `token_server.py`), `lakehouses`
 `persist_shadow`, `state_root`, `notebooks_root`, `files_sync`, `mirror_root`,
 `default_sql_limit`, `preload` (list of lakehouse names, `["all"]`, or the
 `{lakehouse: [tables]}` form), `preload_workers` (default 32), `extra_jars`,
-`extra_packages`. Each `lakehouses` entry may add `schemas` (`["dbo", …]`),
+`extra_packages`, `files_mode` (`"mirror"`, the default, or `"lazy"`; see
+**Files**). Each `lakehouses` entry may add `schemas` (`["dbo", …]`),
 `default_schema` (default `dbo`), and `detect_schemas` (default true: the worker
 lists `Tables/` once at start and treats folders of Delta tables as schemas).
 
@@ -120,11 +121,36 @@ sequential across contexts (one request loop); the API does not preclude a
 later concurrent mode. `display`, `capture_result`, and `notebookutils` work in
 every context; `notebookutils.notebook.run` runs in the calling context.
 `/lakehouse/default/Files` is one link per process and follows the session's
-default lakehouse, not the context's.
+default lakehouse; with `files_mode: "lazy"` Spark's `Files/` follows the
+context's default lakehouse (see **Files**).
 
 `init` and `info` carry `features`, the additive capabilities of this worker:
 `arrow`, `streaming`, `interrupt`, `capture_result`, `job_description`,
-`register_lakehouse`, `contexts`.
+`register_lakehouse`, `contexts`, `files_lazy`.
+
+## Files
+
+`files_mode` decides what Spark's relative `Files/…` means.
+
+- `"mirror"` (default): the local mirror behind `/lakehouse/default/Files`, populated
+  by `files_sync` and `sync_files`; a relative `Files/x` in Spark resolves there
+  through the local filesystem's working directory.
+- `"lazy"`: the default lakehouse's OneLake `Files/`, read directly. The session's
+  default filesystem is `lakehouse://<workspace-id>@<lakehouse-id>.onelake.dfs.fabric.microsoft.com`
+  (`ch.fs.LakehouseFileSystem` in the catalog jar, a wrapper over ABFS with the
+  lakehouse as root), so `spark.read.csv("Files/x")`, `binaryFile.\`Files/x\``,
+  and Delta paths under `Files/` stream from OneLake with the host token and
+  nothing is mirrored. Under `write_mode` sandbox or readonly the filesystem
+  refuses anything that would modify OneLake (`create`, `mkdirs`, `delete`,
+  `rename`, …) with `write_mode=sandbox: … refused because it would modify
+  OneLake. Write to /lakehouse/default/Files (the local mirror) instead, or start
+  the runtime with write_mode = writethrough`; writethrough passes writes through.
+  Each context's session has its own default filesystem, so a context's `Files/`
+  follows *its* default lakehouse (`info.contexts[].files_fs`); `run_notebook`
+  switches it with the notebook's default lakehouse and restores it after. The
+  `/lakehouse/default/Files` link and `sync_files` keep working for Python IO (the
+  Python-level lazy fetch is the next step). Shadows and the warehouse are `file:`
+  URIs, so they resolve the same under any default filesystem.
 
 ## Tokens
 

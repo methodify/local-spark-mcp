@@ -73,6 +73,7 @@ def _base_engine_kwargs(config: Config) -> dict:
         "notebooks_root": config.notebooks.root,
         "files_sync": config.files.sync,
         "mirror_root": config.files.mirror_root,
+        "files_mode": config.files.mode,
         "default_sql_limit": config.runtime.default_sql_limit,
         "preload": config.lakehouses.preload,
         "preload_workers": config.lakehouses.preload_workers,

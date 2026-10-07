@@ -135,6 +135,7 @@ class SparkEngine:
         persist_shadow: bool = False,
         state_root: str | None = None,
         notebooks_root: str | None = None,
+        files_mode: str = "mirror",
         files_sync: list[str] | None = None,
         mirror_root: str | None = None,
         preload: list[str] | None = None,
@@ -145,6 +146,9 @@ class SparkEngine:
         self.default_sql_limit = default_sql_limit
         self.notebooks_root = notebooks_root
         self.files_sync = list(files_sync or [])
+        if files_mode not in ("mirror", "lazy"):
+            raise ValueError(f"files_mode must be 'mirror' or 'lazy', not {files_mode!r}")
+        self.files_mode = files_mode
         self.files: "FilesMirror | None" = None
         self.files_link: dict | None = None
         self.files_sync_report: list[dict] = []
@@ -221,7 +225,8 @@ class SparkEngine:
                 "workspace_id": workspace_id or "",  # set by the first register_lakehouse when empty
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
-                "shadow_root": self.shadow_root.as_posix(),
+                # a file: URI, so shadows resolve whatever a session's default filesystem is (files_mode = lazy)
+                "shadow_root": self.shadow_root.resolve().as_uri(),
             }
         self.spark = build_spark(
             extra_jars=self.extra_jars,
@@ -246,6 +251,8 @@ class SparkEngine:
         default_ctx = Context("default", self.spark, self.shell.user_module, self.default_lakehouse, None, seeded=True)
         self.contexts["default"] = default_ctx
         self._active: Context = default_ctx
+        if self.default_lakehouse:
+            self._set_default_fs(self.spark, self.default_lakehouse)
         if self.files is not None and self.default_lakehouse:
             self._activate_files(self.default_lakehouse)
         if preload and getattr(self, "lakehouses", None):
@@ -255,13 +262,36 @@ class SparkEngine:
         """Point /lakehouse/default at this lakehouse's mirror and pull the
         configured Files/ subtrees (cached: unchanged files are skipped)."""
         self.files_link = self.files.link_default(lakehouse)
-        self._set_spark_working_dir(Path(self.files_link["files_root"]).parent)
+        if self.files_mode == "mirror":
+            self._set_spark_working_dir(Path(self.files_link["files_root"]).parent)
         for rel in self.files_sync:
             try:
                 self.files_sync_report.append(self.files.pull(lakehouse, [rel]).to_dict())
             except Exception as exc:  # keep the session usable; report instead
                 self.files_sync_report.append({"direction": "pull", "lakehouse": lakehouse, "paths": [rel],
                                                "errors": [f"{type(exc).__name__}: {exc}"]})
+
+    def _files_fs_uri(self, lakehouse: str) -> str | None:
+        """`lakehouse://<ws>@<lh>.onelake...`: the filesystem a session's relative
+        `Files/` resolves against under files_mode = lazy (ch.fs.LakehouseFileSystem)."""
+        from .discovery import ONELAKE_HOST
+
+        info = self._resolve_lakehouse(lakehouse)
+        if info is None:
+            return None
+        return f"lakehouse://{info.workspace_id}@{info.id}.{ONELAKE_HOST}"
+
+    def _set_default_fs(self, spark, lakehouse: str | None) -> str | None:
+        """files_mode = lazy: a session's `fs.defaultFS` (its Hadoop configuration is
+        derived from its SQL conf, so this is per session, hence per context) is the
+        lakehouse's OneLake root: `spark.read.csv("Files/x")` reads OneLake directly,
+        and a write under sandbox/readonly is refused by the filesystem. Returns the
+        URI set, or None (mirror mode, or no lakehouse: back to file:///)."""
+        if self.files_mode != "lazy" or self._onelake is None:
+            return None
+        uri = self._files_fs_uri(lakehouse) if lakehouse else None
+        spark.conf.set("fs.defaultFS", uri or "file:///")
+        return uri
 
     def _set_spark_working_dir(self, lakehouse_dir: Path) -> None:
         """On Fabric a relative `Files/x` resolves against the default lakehouse.
@@ -364,6 +394,7 @@ class SparkEngine:
             sess.sql(f"USE {db}")
             ctx.default_lakehouse, ctx.default_schema = info.name, default_schema or (
                 self._default_schemas.get(info.name) if self._lakehouse_schemas.get(info.name) else None)
+            self._set_default_fs(sess, info.name)
         self.contexts[id] = ctx
         return self._context_info(ctx)
 
@@ -395,6 +426,7 @@ class SparkEngine:
 
     def _context_info(self, ctx: Context) -> dict:
         return {"id": ctx.id, "name": ctx.name, "default_lakehouse": ctx.default_lakehouse, "default_schema": ctx.default_schema,
+                "files_fs": _safe(lambda: ctx.spark.conf.get("fs.defaultFS")) if self.files_mode == "lazy" else None,
                 "current_database": _safe(ctx.spark.catalog.currentDatabase), "current_catalog": _safe(ctx.spark.catalog.currentCatalog),
                 "created_at": ctx.created_at, "cells": ctx.cells, "last_activity": ctx.last_activity,
                 "idle_s": None if (self._cell_running and self._cell_context == ctx.id) else
@@ -1370,6 +1402,8 @@ class SparkEngine:
                 )
             else:
                 ctx.spark.sql(f"USE {self._default_db(info.name)}")
+                prev_fs = _safe(lambda: ctx.spark.conf.get("fs.defaultFS"))
+                self._set_default_fs(ctx.spark, info.name)
                 effective_db, switched = info.name, True
                 if self.files is not None and info.name != self.default_lakehouse:
                     self._activate_files(info.name)
@@ -1440,6 +1474,8 @@ class SparkEngine:
         finally:
             if switched:
                 ctx.spark.sql(f"USE {prev_db}")
+                if self.files_mode == "lazy" and prev_fs:
+                    _safe(lambda: ctx.spark.conf.set("fs.defaultFS", prev_fs))
                 if self.files is not None and effective_db != self.default_lakehouse and self.default_lakehouse:
                     self._activate_files(self.default_lakehouse)
         if any(r.get("status") in ("error", "unsupported") for r in results):
@@ -1662,6 +1698,7 @@ class SparkEngine:
             "execution_count": self.shell.execution_count,
             "default_sql_limit": self.default_sql_limit,
             "features": list(FEATURES),
+            "files_mode": self.files_mode,
             "contexts": [self._context_info(c) for c in self.contexts.values()],
             "active_context": self._active.id,
         }

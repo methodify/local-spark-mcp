@@ -19,6 +19,11 @@ name = "My Fabric Workspace"
 # root = "fabric-git-repo/data-warehouse"
 
 [files]
+# "mirror" (default): Spark's relative Files/ is the local mirror behind
+# /lakehouse/default/Files, populated by `sync`. "lazy": Spark's Files/ is the
+# default lakehouse's OneLake Files/ read directly (nothing mirrored; writes
+# refused in sandbox/readonly); /lakehouse/default/Files stays the mirror.
+# mode = "mirror"
 # Files mirror: /lakehouse/default/Files is a link to a local mirror of the
 # default lakehouse's Files/ (shared across projects, keyed by workspace and
 # lakehouse id). List the Files/ subtrees to pull at session start; unchanged

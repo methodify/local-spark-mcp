@@ -235,6 +235,16 @@ The worker takes every Azure token from the token endpoint it is started with
 it needs no `az login` inside the worker, and preload failures appear in
 `preload_status`, never in a cell's output.
 
+## Lazy Files (0.6.0)
+
+With `[files] mode = "lazy"` (env `LOCAL_SPARK_FILES_MODE`), Spark's relative
+`Files/…` is the default lakehouse's OneLake `Files/`, read directly through the
+host token with nothing mirrored, and each context's `Files/` follows its own
+default lakehouse. In sandbox and readonly mode a Spark write under `Files/` is
+refused with a message that names the alternatives; writethrough passes it
+through. `/lakehouse/default/Files` stays the local mirror for Python IO. The
+default remains `"mirror"`.
+
 ## Contexts (0.5.0)
 
 A host can run several notebooks against one Spark runtime without crosstalk:
@@ -243,6 +253,8 @@ SQL conf, current database, UDFs), sharing the JVM, the catalog, clones, and
 cached data, the way Fabric's high-concurrency sessions work. The MCP server
 uses the default context; hosts create more through the worker protocol.
 
+
+## Embedding the worker
 
 Hosts other than Claude Code can drive the Spark worker directly over its
 localhost socket protocol (Cobalt SQL Works does): see `docs/PROTOCOL.md`.

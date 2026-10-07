@@ -116,6 +116,9 @@ def build_spark(
     catalog_class = "org.apache.spark.sql.delta.catalog.DeltaCatalog"
     if catalog:
         catalog_class = "ch.fs.OneLakeCatalog"
+        configs["spark.hadoop.fs.lakehouse.impl"] = "ch.fs.LakehouseFileSystem"  # lakehouse://ws@lh.onelake... (files_mode = lazy)
+        # Delta on that scheme: the Azure log store (FileSystem API), not HDFSLogStore (FileContext, which has no AbstractFileSystem for it)
+        configs["spark.delta.logStore.lakehouse.impl"] = "io.delta.storage.AzureLogStore"
         configs["spark.localspark.workspace_id"] = catalog["workspace_id"]
         configs["spark.localspark.write_mode"] = catalog["write_mode"]
         configs["spark.localspark.shadow_root"] = catalog["shadow_root"]
