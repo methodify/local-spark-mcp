@@ -183,6 +183,7 @@ def test_status_and_clear(world):
     st = mirror.status()
     assert st["lakehouses"]["alpha"]["fetched_files"] == 1 and st["lakehouses"]["alpha"]["fetched_bytes"] == 7
     assert st["lakehouses"]["alpha"]["local_files"] == 1 and st["lakehouses"]["beta"]["local_files"] == 0
+    assert st["total_files"] == 1 and st["total_bytes"] == 7
     r = mirror.clear("alpha", ["lib"])
     assert r["removed"] and not (mirror.mirror_dir("alpha") / "lib").exists() and mirror.fetched["alpha"] == {}
     assert os.path.isfile("/lakehouse/default/Files/lib/a.txt")  # still answers from OneLake

@@ -80,7 +80,7 @@ one. The MCP server does exactly that and reports it on the next result.
 | `wait_preload` | `timeout?` | block until done (or timeout); returns status |
 | `table_features` | `lakehouse`, `tables` | Delta protocol features per table |
 | `sync_files` | `paths?`, `direction?`, `lakehouse?` | Files mirror pull/push |
-| `mirror_status` | | per lakehouse: `mirror_dir`, `pulled`, `fetched_files`, `fetched_bytes`, `fetched` (first 200), `local_files`, `local_bytes` |
+| `mirror_status` | | per lakehouse: `mirror_dir`, `pulled`, `fetched_files`, `fetched_bytes`, `fetched` (first 200), `local_files`, `local_bytes`; plus `total_files`, `total_bytes` |
 | `clear_mirror` | `lakehouse?`, `paths?` | delete mirror contents (one lakehouse's subtrees or files, one lakehouse, or all); returns `removed` |
 | `shadow_status` | | write mode and shadowed tables with `state`, `version`, `cloned_at` (first commit, ISO-8601 UTC) and `registered` (known to this session's catalog yet; a persisted clone from an earlier session is listed before any touch) |
 | `discard_shadow` | `only?` (`read` / `written`), `table?` | drop shadows |
@@ -115,7 +115,8 @@ confs (lakehouse ids, schema catalogs) to it; `register_lakehouse` later
 pushes to every context. `run_code`, `run_sql`, and `run_notebook` take
 `context`; `interrupt` and `status` on the control socket take an optional
 `context` (`status.cell.context` and `context_name` name the running one, `status.contexts`
-lists them); `info.contexts` (with per-context `last_activity` and `idle_s`) and
+lists them, `status.dropping` names contexts whose forced drop is scheduled);
+`info.contexts` (with per-context `last_activity`, `idle_s`, and `dropping`) and
 `info.active_context` describe them. Each context's cells run under the Spark
 job group `<context id>` with the context's `name` as description (overridden
 per cell by `job_description`), so the Spark UI groups a notebook's jobs. Execution is
@@ -149,7 +150,11 @@ context's default lakehouse (see **Files**).
   the runtime with write_mode = writethrough`; writethrough passes writes through.
   Each context's session has its own default filesystem, so a context's `Files/`
   follows *its* default lakehouse (`info.contexts[].files_fs`); `run_notebook`
-  switches it with the notebook's default lakehouse and restores it after.
+  switches it with the notebook's default lakehouse and restores it after. Read it
+  with `spark.conf.get("fs.defaultFS")` in the session: the SparkContext's
+  `hadoopConfiguration().get("fs.defaultFS")` still says `file:///`, because the
+  per-session value lives in the session's SQL conf, which Spark copies into the
+  Hadoop configuration it actually uses for that session.
   Shadows and the warehouse are `file:` URIs, so they resolve the same under any
   default filesystem.
 

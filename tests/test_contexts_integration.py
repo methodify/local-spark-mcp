@@ -138,7 +138,10 @@ def test_force_drop_over_the_control_socket(worker):
         worker.drop_context("closing", via_control=True)  # no force: refused while running
     r = worker.drop_context("closing", force=True, via_control=True)
     assert r["dropped"] is False and r["scheduled"] is True
+    st = worker.status()
+    assert st["dropping"] == ["closing"] or "closing" not in st["contexts"]  # scheduled (or already gone on a fast machine)
     t.join(timeout=15)
+    assert worker.status()["dropping"] == []
     assert not t.is_alive() and out["res"]["interrupted"] is True
     assert "closing" not in [c["id"] for c in worker.get_info()["contexts"]]
     assert worker.run_code("print('fine')")["stdout"].strip() == "fine"

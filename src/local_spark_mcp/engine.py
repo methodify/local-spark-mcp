@@ -447,6 +447,7 @@ class SparkEngine:
 
     def _context_info(self, ctx: Context) -> dict:
         return {"id": ctx.id, "name": ctx.name, "default_lakehouse": ctx.default_lakehouse, "default_schema": ctx.default_schema,
+                "dropping": ctx.pending_drop,
                 "files_fs": _safe(lambda: ctx.spark.conf.get("fs.defaultFS")) if self.files_mode == "lazy" else None,
                 "current_database": _safe(ctx.spark.catalog.currentDatabase), "current_catalog": _safe(ctx.spark.catalog.currentCatalog),
                 "created_at": ctx.created_at, "cells": ctx.cells, "last_activity": ctx.last_activity,
@@ -1150,7 +1151,8 @@ class SparkEngine:
         out: dict = {"initialized": True, "cell_running": running, "cell": None,
                      "preload": self.preload_state.get("state", "idle"),
                      "idle_s": None if (self._cell_running or preload_running) else round(time.time() - self._last_activity, 1),
-                     "last_activity": self._last_activity, "contexts": sorted(self.contexts)}
+                     "last_activity": self._last_activity, "contexts": sorted(self.contexts),
+                     "dropping": sorted(c.id for c in self.contexts.values() if c.pending_drop)}
         if running:
             cell: dict = {"method": self._cell_method, "context": self._cell_context,
                           "context_name": _safe(lambda: self.contexts[self._cell_context].name),

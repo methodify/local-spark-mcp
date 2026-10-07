@@ -333,7 +333,9 @@ class FilesMirror:
             out[name] = {"mirror_dir": d.as_posix(), "pulled": sorted(self.pulled.get(name, ())),
                          "fetched_files": len(fetched), "fetched_bytes": sum(fetched.values()),
                          "fetched": sorted(fetched)[:200], "local_files": files, "local_bytes": bytes_}
-        return {"root": self.root.as_posix(), "write_mode": self.write_mode, "lakehouses": out}
+        return {"root": self.root.as_posix(), "write_mode": self.write_mode, "lakehouses": out,
+                "total_files": sum(v["local_files"] for v in out.values()),
+                "total_bytes": sum(v["local_bytes"] for v in out.values())}
 
     def clear(self, lakehouse: str | None = None, paths: list[str] | None = None) -> dict:
         """Delete mirror contents: the given Files/ subtrees (or files) of one
