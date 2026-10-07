@@ -257,9 +257,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
 - `notebookutils_shim.py` — `notebookutils` / `mssparkutils` for local runs:
   `credentials.getSecret` (Key Vault, ambient credential), `variableLibrary
   .getLibrary` (Fabric REST definition → attributes, active value set applied),
-  `fs.ls`/`exists` for `abfss://` (OneLake data plane) and for `/lakehouse/...`
-  and mount points (the Files mirror), `fs.mount` (registers + links a mount
-  point to the mirror), `notebook.run`/`runMultiple` (sequential in
+  `fs.ls`/`exists`/`mkdirs`/`rm`/`cp`/`mv`/`put`/`head`/`append`/`mounts`/
+  `getMountPath` for `abfss://` (OneLake data plane; writes only in
+  writethrough, via `engine.onelake_*`) and for `/lakehouse/...` and mount
+  points (the Files mirror; under lazy hooks through the hooked `os`/`open`, so
+  `default` is the context's), cross-side `cp`/`mv` = read + write, `fs.mount`
+  (registers + links a mount point to the mirror), `notebook.run`/`runMultiple` (sequential in
   dependency order; raises with `.result` like Fabric)/`exit`, `session.stop`
   (no-op), `runtime.context`. Anything else raises `NotImplementedError` naming
   the member. Registered in `sys.modules` and the namespace at bootstrap.

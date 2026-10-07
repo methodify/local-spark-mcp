@@ -6,6 +6,7 @@ bootstrap so ``import notebookutils`` / ``import mssparkutils`` work in cells.
 
 from __future__ import annotations
 
+import os
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,9 +105,14 @@ class _FS:
         if path.startswith("abfss://"):
             return self._engine.onelake_ls(path)
         local = self._local(path)
+        base = path.rstrip("/")
+        if getattr(self._engine, "files_hooks", False):  # lazy: the hooks answer from OneLake + local
+            with os.scandir(str(path)) as it:
+                entries = sorted(it, key=lambda e: e.name)
+            return [FileInfo(name=e.name, path=f"{base}/{e.name}", size=0 if e.is_dir() else e.stat().st_size, isDir=e.is_dir())
+                    for e in entries]
         if not local.exists():
             raise FileNotFoundError(f"{path} (mirror: {local}) does not exist locally; sync_files may pull it")
-        base = path.rstrip("/")
         return [
             FileInfo(name=child.name, path=f"{base}/{child.name}",
                      size=child.stat().st_size if child.is_file() else 0, isDir=child.is_dir())
@@ -116,6 +122,8 @@ class _FS:
     def exists(self, path: str) -> bool:
         if path.startswith("abfss://"):
             return self._engine.onelake_exists(path)
+        if getattr(self._engine, "files_hooks", False):
+            return self._engine.files_resolve(path) is not None and os.path.exists(str(path))
         local = self._engine.files_resolve(path)
         return bool(local and local.exists())
 
@@ -123,6 +131,141 @@ class _FS:
         return self._engine.files_mount(source, mountPoint).get("linked", False) or True
 
     def unmount(self, mountPoint: str):  # noqa: N803
+        return True
+
+    def mounts(self) -> list:
+        return [types.SimpleNamespace(**m) for m in self._engine.files_mounts()]
+
+    def getMountPath(self, mountPoint: str, scope: str = "") -> str:  # noqa: N802, N803
+        return str(self._local(mountPoint))
+
+    def refreshMounts(self) -> bool:  # noqa: N802
+        return True
+
+    # ---- the rest of Fabric's fs surface: both path kinds ----
+    # abfss:// goes to the OneLake data plane (writes only in writethrough);
+    # /lakehouse/... and mount points go to the local mirror: under files_mode =
+    # lazy through the hooked path (fetch on read, context-aware "default"),
+    # otherwise through the mirror directory. Mirror writes are never pushed here;
+    # that is sync_files (push) or, under lazy + writethrough, the hooked open().
+
+    @staticmethod
+    def _remote(path: str) -> bool:
+        return str(path).startswith("abfss://")
+
+    def _os_path(self, path: str) -> str:
+        """The path to hand os/open for a local-side path."""
+        return str(path) if getattr(self._engine, "files_hooks", False) else str(self._local(path))
+
+    def _is_dir(self, path: str) -> bool | None:
+        if self._remote(path):
+            return self._engine.onelake_is_dir(path)
+        p = self._os_path(path)
+        if not os.path.exists(p):
+            return None
+        return os.path.isdir(p)
+
+    def _read(self, path: str, max_bytes: int | None = None) -> bytes:
+        if self._remote(path):
+            return self._engine.onelake_read(path, max_bytes)
+        with open(self._os_path(path), "rb") as f:
+            return f.read(max_bytes) if max_bytes else f.read()
+
+    def _write(self, path: str, data: bytes, overwrite: bool) -> None:
+        if self._remote(path):
+            self._engine.onelake_write(path, data, overwrite)
+            return
+        p = self._os_path(path)
+        if os.path.exists(p) and not overwrite:
+            raise FileExistsError(f"{path} exists; pass overwrite=True")
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+
+    def _children(self, path: str) -> list[FileInfo]:
+        return self.ls(path)
+
+    def mkdirs(self, dir: str) -> bool:  # noqa: A002 — Fabric's parameter name
+        if self._remote(dir):
+            self._engine.onelake_mkdirs(dir)
+        else:
+            os.makedirs(self._os_path(dir), exist_ok=True)
+        return True
+
+    def rm(self, dir: str, recurse: bool = False) -> bool:  # noqa: A002
+        kind = self._is_dir(dir)
+        if kind is None:
+            raise FileNotFoundError(dir)
+        if self._remote(dir):
+            self._engine.onelake_rm(dir, recurse)
+            return True
+        p = self._os_path(dir)
+        if kind:
+            if not recurse and os.listdir(p):
+                raise IsADirectoryError(f"{dir} is a non-empty directory; pass recurse=True")
+            for child in self.ls(dir):
+                self.rm(child.path, True)
+            os.rmdir(p)
+        else:
+            os.remove(p)
+        return True
+
+    def put(self, file: str, content: str, overwrite: bool = False) -> bool:
+        self._write(file, content.encode("utf-8") if isinstance(content, str) else bytes(content), overwrite)
+        return True
+
+    def head(self, file: str, maxBytes: int = 1024 * 100) -> str:  # noqa: N803
+        return self._read(file, maxBytes).decode("utf-8", errors="replace")
+
+    def append(self, file: str, content: str, createFileIfNotExists: bool = False) -> bool:  # noqa: N803
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        if self._remote(file):
+            self._engine.onelake_append(file, data, createFileIfNotExists)
+            return True
+        p = self._os_path(file)
+        if not os.path.exists(p) and not createFileIfNotExists:
+            raise FileNotFoundError(f"{file} does not exist (pass createFileIfNotExists=True)")
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(p, "ab") as f:
+            f.write(data)
+        return True
+
+    def cp(self, from_: str, to: str, recurse: bool = False) -> bool:
+        kind = self._is_dir(from_)
+        if kind is None:
+            raise FileNotFoundError(from_)
+        if kind:
+            if not recurse:
+                raise IsADirectoryError(f"{from_} is a directory; pass recurse=True")
+            self.mkdirs(to)
+            for child in self.ls(from_):
+                self.cp(child.path, f"{to.rstrip('/')}/{child.name}", True)
+            return True
+        self._write(to, self._read(from_), overwrite=True)
+        return True
+
+    def mv(self, from_: str, to: str, create_path: bool = False, overwrite: bool = False) -> bool:
+        if self._is_dir(to) is not None and not overwrite:
+            raise FileExistsError(f"{to} exists; pass overwrite=True")
+        if self._remote(from_) and self._remote(to):
+            if overwrite and self._is_dir(to) is not None:
+                self._engine.onelake_rm(to, True)
+            if create_path:
+                parent = to.rsplit("/", 1)[0]
+                if self._engine.onelake_is_dir(parent) is None:
+                    self._engine.onelake_mkdirs(parent)
+            self._engine.onelake_rename(from_, to)
+            return True
+        if not self._remote(from_) and not self._remote(to):
+            src, dst = self._os_path(from_), self._os_path(to)
+            if os.path.exists(dst) and overwrite:
+                self.rm(to, True)
+            if create_path:
+                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            os.rename(src, dst)
+            return True
+        self.cp(from_, to, recurse=True)  # across the two sides: copy, then remove
+        self.rm(from_, recurse=True)
         return True
 
 

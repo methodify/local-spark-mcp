@@ -1602,6 +1602,88 @@ class SparkEngine:
             for p in fs.get_paths(path=rel, recursive=False)
         ]
 
+    def _onelake_guard_write(self, path: str, op: str) -> None:
+        if self.write_mode != "writethrough":
+            raise PermissionError(
+                f"notebookutils.fs.{op}: write_mode is '{self.write_mode}', so {path} on OneLake is not modified. "
+                "Use a /lakehouse/... path (the local mirror) or run with write_mode = writethrough.")
+
+    def onelake_is_dir(self, path: str) -> bool | None:
+        """True / False for a directory / file on OneLake, None when absent."""
+        fs, rel = self._onelake_fs(path)
+        try:
+            props = fs.get_file_client(rel).get_file_properties()
+        except Exception:
+            return None
+        return str((props.metadata or {}).get("hdi_isfolder", "")).lower() == "true"
+
+    def onelake_read(self, path: str, max_bytes: int | None = None) -> bytes:
+        fs, rel = self._onelake_fs(path)
+        dl = fs.get_file_client(rel).download_file(offset=0, length=max_bytes) if max_bytes else fs.get_file_client(rel).download_file()
+        return dl.readall()
+
+    def onelake_write(self, path: str, data: bytes, overwrite: bool = False) -> None:
+        self._onelake_guard_write(path, "put")
+        fs, rel = self._onelake_fs(path)
+        if not overwrite and self.onelake_is_dir(path) is not None:
+            raise FileExistsError(f"{path} exists; pass overwrite=True")
+        fs.get_file_client(rel).upload_data(data, overwrite=True)
+
+    def onelake_append(self, path: str, data: bytes, create: bool = False) -> None:
+        self._onelake_guard_write(path, "append")
+        fs, rel = self._onelake_fs(path)
+        client = fs.get_file_client(rel)
+        try:
+            size = int(client.get_file_properties().size or 0)
+        except Exception:
+            if not create:
+                raise FileNotFoundError(f"{path} does not exist (pass createFileIfNotExists=True)")
+            client.create_file()
+            size = 0
+        client.append_data(data, offset=size)
+        client.flush_data(size + len(data))
+
+    def onelake_mkdirs(self, path: str) -> None:
+        self._onelake_guard_write(path, "mkdirs")
+        fs, rel = self._onelake_fs(path)
+        fs.get_directory_client(rel).create_directory()
+
+    def onelake_rm(self, path: str, recurse: bool = False) -> None:
+        self._onelake_guard_write(path, "rm")
+        fs, rel = self._onelake_fs(path)
+        is_dir = self.onelake_is_dir(path)
+        if is_dir is None:
+            raise FileNotFoundError(path)
+        if is_dir:
+            if not recurse and any(True for _ in fs.get_paths(path=rel, recursive=False)):
+                raise IsADirectoryError(f"{path} is a non-empty directory; pass recurse=True")
+            fs.get_directory_client(rel).delete_directory()
+        else:
+            fs.get_file_client(rel).delete_file()
+
+    def onelake_rename(self, src: str, dst: str) -> None:
+        """Rename within one OneLake filesystem (same workspace)."""
+        self._onelake_guard_write(dst, "mv")
+        fs, rel = self._onelake_fs(src)
+        fs2, rel2 = self._onelake_fs(dst)
+        if fs.file_system_name != fs2.file_system_name:
+            raise ValueError("mv across workspaces: copy then remove")
+        if self.onelake_is_dir(src):
+            fs.get_directory_client(rel).rename_directory(f"{fs.file_system_name}/{rel2}")
+        else:
+            fs.get_file_client(rel).rename_file(f"{fs.file_system_name}/{rel2}")
+
+    def files_mounts(self) -> list[dict]:
+        if self.files is None:
+            return []
+        out = []
+        for mp, lh in sorted(self.files.mounts.items()):
+            info = self._resolve_lakehouse(lh)
+            source = f"abfss://{info.workspace_id}@onelake.dfs.fabric.microsoft.com/{info.id}" if info else lh
+            out.append({"mountPoint": mp, "source": source, "lakehouse": lh,
+                        "localPath": self.files.mirror_dir(lh).parent.as_posix() if info else None})
+        return out
+
     def onelake_exists(self, path: str) -> bool:
         fs, rel = self._onelake_fs(path)
         try:
@@ -1936,6 +2018,39 @@ class _ShimEngine:
 
     def files_mount(self, source, mount_point):
         return self._e.files_mount(source, mount_point)
+
+    def files_mounts(self):
+        return self._e.files_mounts()
+
+    @property
+    def write_mode(self):
+        return self._e.write_mode
+
+    @property
+    def files_hooks(self) -> bool:
+        hooks = getattr(self._e, "_lazy_hooks", None)
+        return bool(hooks and hooks.installed)
+
+    def onelake_is_dir(self, path):
+        return self._e.onelake_is_dir(path)
+
+    def onelake_read(self, path, max_bytes=None):
+        return self._e.onelake_read(path, max_bytes)
+
+    def onelake_write(self, path, data, overwrite=False):
+        return self._e.onelake_write(path, data, overwrite)
+
+    def onelake_append(self, path, data, create=False):
+        return self._e.onelake_append(path, data, create)
+
+    def onelake_mkdirs(self, path):
+        return self._e.onelake_mkdirs(path)
+
+    def onelake_rm(self, path, recurse=False):
+        return self._e.onelake_rm(path, recurse)
+
+    def onelake_rename(self, src, dst):
+        return self._e.onelake_rename(src, dst)
 
 
 _WRITE_TARGET = re.compile(
