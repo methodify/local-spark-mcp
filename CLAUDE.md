@@ -368,6 +368,21 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **Contexts (0.5.0, Cobalt sessions request item 0)**: `Context` = a module
+  (namespace) + `spark.newSession()`. The singleton IPython shell serves every
+  context: `_activate(ctx)` swaps `shell.user_module`/`user_ns` before a cell
+  (sequential execution), `init_user_ns()` on first activation adds the hidden
+  names. `newSession()` drops runtime-set confs, so every conf the engine sets
+  after start goes through `_set_conf`/`_unset_conf` (`_runtime_confs`,
+  pushed to all contexts; `create_context` re-applies). `default` context =
+  root session + IPython's own namespace (so no-context hosts see no change;
+  `self.spark` stays the root session for internals, `self._active.spark` is
+  the cell's). `_cell_context` in `_running`; `interrupt(context)` /
+  `status(context)` filter; `run_notebook(context)` uses `ctx.spark` for
+  `USE`/restore. `FEATURES` (protocol.py) listed in init/info. Not per
+  context: `/lakehouse/default` link, the notebookutils shim's engine calls.
+  Test lesson: the data socket serializes requests, so a test cannot send
+  `drop_context` while a cell is in flight on the same `WorkerProcess`.
 - **0.4.3 (Cobalt sessions request, small items)**: `job_description` on
   `run_code`/`run_sql` (`_running` sets/clears `setJobDescription`),
   `status.idle_s`/`last_activity` (`_last_activity` set at cell/query/preload

@@ -26,6 +26,8 @@ import socket
 import struct
 
 PROTOCOL_VERSION = 2  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
+# Additive capabilities a version-2 host can test for (init / info `features`).
+FEATURES = ["arrow", "streaming", "interrupt", "capture_result", "job_description", "register_lakehouse", "contexts"]
 
 _HEADER = struct.Struct(">I")
 

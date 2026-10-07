@@ -235,7 +235,14 @@ The worker takes every Azure token from the token endpoint it is started with
 it needs no `az login` inside the worker, and preload failures appear in
 `preload_status`, never in a cell's output.
 
-## Embedding the worker
+## Contexts (0.5.0)
+
+A host can run several notebooks against one Spark runtime without crosstalk:
+each context is its own Python namespace and its own Spark session (temp views,
+SQL conf, current database, UDFs), sharing the JVM, the catalog, clones, and
+cached data, the way Fabric's high-concurrency sessions work. The MCP server
+uses the default context; hosts create more through the worker protocol.
+
 
 Hosts other than Claude Code can drive the Spark worker directly over its
 localhost socket protocol (Cobalt SQL Works does): see `docs/PROTOCOL.md`.

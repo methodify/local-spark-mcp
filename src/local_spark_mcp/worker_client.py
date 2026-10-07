@@ -173,12 +173,20 @@ class WorkerProcess:
             raise WorkerError(resp.get("error", "control call failed"))
         return resp["result"]
 
-    def interrupt(self) -> dict:
-        """Stop the running cell (cancel Spark jobs + KeyboardInterrupt); safe while a call is in flight."""
-        return self.control("interrupt")
+    def interrupt(self, context: str | None = None) -> dict:
+        """Stop the running cell (cancel Spark jobs + KeyboardInterrupt); safe while a
+        call is in flight. With ``context``, only a cell of that context."""
+        return self.control("interrupt", {"context": context} if context else None)
 
-    def status(self) -> dict:
-        return self.control("status", timeout=10.0)
+    def status(self, context: str | None = None) -> dict:
+        return self.control("status", {"context": context} if context else None, timeout=10.0)
+
+    def create_context(self, id: str, default_lakehouse: str | None = None, default_schema: str | None = None) -> dict:
+        """A new isolated REPL (namespace + SparkSession) inside the same JVM; see docs/PROTOCOL.md."""
+        return self._call("create_context", {"id": id, "default_lakehouse": default_lakehouse, "default_schema": default_schema})
+
+    def drop_context(self, id: str) -> dict:
+        return self._call("drop_context", {"id": id})
 
     def _call(self, method: str, params: dict | None = None, *, timeout: float | None = None, on_event=None) -> dict:
         """Send one request and return its result. Binary blobs announced by the
@@ -227,16 +235,19 @@ class WorkerProcess:
 
     # --- proxied engine operations ---
     def run_code(self, code: str, stream: bool = False, on_event=None, capture_result: bool = False,
-                 job_description: str | None = None) -> dict:
+                 job_description: str | None = None, context: str | None = None) -> dict:
         """``stream=True`` delivers stdout/stderr frames to ``on_event`` as the cell
         writes them; ``capture_result=True`` attaches a bare trailing DataFrame as a
-        display; ``job_description`` names the cell's Spark jobs (status, Spark UI)."""
+        display; ``job_description`` names the cell's Spark jobs (status, Spark UI);
+        ``context`` selects the REPL (default: the "default" context)."""
         return self._call("run_code", {"code": code, "stream": stream, "capture_result": capture_result,
-                                       "job_description": job_description}, on_event=on_event)
+                                       "job_description": job_description, "context": context}, on_event=on_event)
 
-    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False, job_description: str | None = None) -> dict:
+    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False, job_description: str | None = None,
+                context: str | None = None) -> dict:
         """``arrow=True``: rows come back as one Arrow IPC stream in ``result["blobs"][0]``."""
-        return self._call("run_sql", {"sql": sql, "limit": limit, "arrow": arrow, "job_description": job_description})
+        return self._call("run_sql", {"sql": sql, "limit": limit, "arrow": arrow, "job_description": job_description,
+                                      "context": context})
 
     def register_lakehouse(self, lakehouse: dict) -> dict:
         """Attach a lakehouse after start: ``{name, id, workspace_id, schemas?, default_schema?, detect_schemas?}``."""
@@ -258,10 +269,11 @@ class WorkerProcess:
         return self._call("info")
 
     def run_notebook(self, path: str, cells=None, stop_on_error: bool = True,
-                     default_lakehouse: str | None = None, parameters: dict | None = None) -> dict:
+                     default_lakehouse: str | None = None, parameters: dict | None = None,
+                     context: str | None = None) -> dict:
         return self._call("run_notebook", {
             "path": path, "cells": cells, "stop_on_error": stop_on_error,
-            "default_lakehouse": default_lakehouse, "parameters": parameters,
+            "default_lakehouse": default_lakehouse, "parameters": parameters, "context": context,
         })
 
     def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:

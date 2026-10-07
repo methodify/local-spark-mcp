@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .protocol import PROTOCOL_VERSION  # noqa: F401  (re-exported; profiles.manifest imports it from here)
+from .protocol import FEATURES, PROTOCOL_VERSION  # noqa: F401  (re-exported; profiles.manifest imports it from here)
 from .spark_session import build_spark
 
 # Truncate over-long reprs/values so a single cell can't flood the transport.
@@ -51,6 +51,27 @@ def _safe(fn, default=None):
         return fn()
     except Exception:
         return default
+
+
+@dataclass
+class Context:
+    """One notebook's REPL inside the shared JVM: its own Python namespace (a
+    module whose dict IPython runs cells in) and its own SparkSession
+    (`newSession()`: isolated temp views, SQL conf, current database, UDFs;
+    shared SparkContext, catalog, clones, cache, jars)."""
+
+    id: str
+    spark: object
+    module: object
+    default_lakehouse: str | None = None
+    default_schema: str | None = None
+    created_at: float = field(default_factory=time.time)
+    cells: int = 0
+    seeded: bool = False  # IPython's hidden names (In, Out, get_ipython, …) added on first activation
+
+    @property
+    def ns(self) -> dict:
+        return self.module.__dict__
 
 
 class InterruptedQuery(RuntimeError):
@@ -187,6 +208,9 @@ class SparkEngine:
         self._onelake = dict(onelake) if onelake else None
         self._lakehouse_schemas: dict[str, list[str]] = {}
         self._default_schemas: dict[str, str] = {}
+        self._runtime_confs: dict[str, str] = {}  # confs set after start, re-applied to every context's session
+        self.contexts: dict[str, Context] = {}
+        self._cell_context: str | None = None
         catalog = None
         if onelake:
             catalog = {
@@ -214,6 +238,11 @@ class SparkEngine:
         self._install_interrupt_log_filter()
         self._register_lakehouses(lakehouses, default_lakehouse)
         self._bootstrap_namespace()
+        # The "default" context is the root session and IPython's own namespace, so a
+        # host that never asks for contexts sees exactly the single-REPL behaviour.
+        default_ctx = Context("default", self.spark, self.shell.user_module, self.default_lakehouse, None, seeded=True)
+        self.contexts["default"] = default_ctx
+        self._active: Context = default_ctx
         if self.files is not None and self.default_lakehouse:
             self._activate_files(self.default_lakehouse)
         if preload and getattr(self, "lakehouses", None):
@@ -268,22 +297,109 @@ class SparkEngine:
 
     def _bootstrap_namespace(self):
         """Seed the namespace with the things a Fabric notebook would have."""
+        self._install_delta_forname_bridge()
+        self._install_notebookutils()
+        self._seed_namespace(self.shell.user_ns, self.spark)
+
+    def _seed_namespace(self, ns: dict, spark) -> None:
         import pyspark.sql.functions as F
         import pyspark.sql.types as T
         from pyspark.sql import Window
 
-        self.shell.user_ns.update(
-            {
-                "spark": self.spark,
-                "sc": self.spark.sparkContext,
-                "F": F,
-                "T": T,
-                "Window": Window,
-            }
-        )
-        self._install_delta_forname_bridge()
-        self._install_notebookutils()
-        self.shell.user_ns["display"] = self.display
+        ns.update({"spark": spark, "sc": spark.sparkContext, "F": F, "T": T, "Window": Window, "display": self.display,
+                   "notebookutils": self._shim, "mssparkutils": self._shim})
+
+    # ---- contexts ----
+
+    def _resolve_context(self, context: str | None) -> Context:
+        ctx = self.contexts.get(context or "default")
+        if ctx is None:
+            raise ValueError(f"unknown context {context!r}; known: {sorted(self.contexts)}")
+        return ctx
+
+    def _activate(self, ctx: Context) -> None:
+        """Run the next cell in this context: swap its namespace into the (singleton)
+        IPython shell. Execution is sequential, so one shell serves every context."""
+        if self._active is not ctx:
+            self.shell.user_module = ctx.module
+            self.shell.user_ns = ctx.ns
+            self._active = ctx
+        if not ctx.seeded:
+            self.shell.init_user_ns()  # In, Out, _, get_ipython, exit: hidden names IPython expects in user_ns
+            ctx.seeded = True
+
+    def create_context(self, id: str, default_lakehouse: str | None = None, default_schema: str | None = None) -> dict:
+        """A new isolated REPL: fresh namespace and `spark.newSession()` with the
+        engine's runtime confs re-applied (a new session does not inherit them), its
+        current database set from the default lakehouse (and schema) like a Fabric
+        notebook's. Shares the SparkContext, catalog, clones, and cache with the rest."""
+        import types
+
+        if not isinstance(id, str) or not id.strip():
+            raise ValueError("create_context: id must be a non-empty string")
+        if id in self.contexts:
+            raise ValueError(f"context {id!r} already exists")
+        sess = self.spark.newSession()
+        for k, v in self._runtime_confs.items():
+            sess.conf.set(k, v)
+        module = types.ModuleType("__main__")
+        module, _ns = self.shell.prepare_user_module(module)
+        self._seed_namespace(module.__dict__, sess)
+        ctx = Context(id, sess, module, None, None)
+        if default_lakehouse:
+            info = self._resolve_lakehouse(default_lakehouse)
+            if info is None:
+                raise ValueError(f"unknown lakehouse {default_lakehouse!r}; known: {sorted(self.lakehouses)}")
+            if default_schema:
+                if default_schema not in self._lakehouse_schemas.get(info.name, []):
+                    raise ValueError(f"lakehouse {info.name!r} has no schema {default_schema!r}; "
+                                     f"known: {self._lakehouse_schemas.get(info.name, [])}")
+                db = self._fq(f"{info.name}__{default_schema}")
+            else:
+                db = self._default_db(info.name)
+            sess.sql(f"USE {db}")
+            ctx.default_lakehouse, ctx.default_schema = info.name, default_schema or (
+                self._default_schemas.get(info.name) if self._lakehouse_schemas.get(info.name) else None)
+        self.contexts[id] = ctx
+        return self._context_info(ctx)
+
+    def drop_context(self, id: str) -> dict:
+        if id == "default":
+            raise ValueError("the default context cannot be dropped")
+        ctx = self._resolve_context(id)
+        if self._cell_running and self._cell_context == id:
+            raise RuntimeError(f"context {id!r} is running a cell; interrupt it first")
+        try:  # temp views belong to the session; drop them so the JVM can release the plans
+            for t in ctx.spark.catalog.listTables():
+                if t.isTemporary:
+                    ctx.spark.catalog.dropTempView(t.name)
+        except Exception:
+            pass
+        del self.contexts[id]
+        if self._active is ctx:
+            self._activate(self.contexts["default"])
+        ctx.module.__dict__.clear()
+        return {"id": id, "contexts": sorted(self.contexts)}
+
+    def _context_info(self, ctx: Context) -> dict:
+        return {"id": ctx.id, "default_lakehouse": ctx.default_lakehouse, "default_schema": ctx.default_schema,
+                "current_database": _safe(ctx.spark.catalog.currentDatabase), "current_catalog": _safe(ctx.spark.catalog.currentCatalog),
+                "created_at": ctx.created_at, "cells": ctx.cells}
+
+    def _set_conf(self, key: str, value: str) -> None:
+        """A runtime conf that every context's session must share (lakehouse ids,
+        schema catalogs): set on the root session, remembered for contexts created
+        later, pushed to the ones that exist."""
+        self.spark.conf.set(key, value)
+        self._runtime_confs[key] = value
+        for ctx in self.contexts.values():
+            if ctx.spark is not self.spark:
+                _safe(lambda: ctx.spark.conf.set(key, value))
+
+    def _unset_conf(self, key: str) -> None:
+        self._runtime_confs.pop(key, None)
+        for sess in [self.spark] + [c.spark for c in self.contexts.values() if c.spark is not self.spark]:
+            _safe(lambda: sess.conf.unset(key))
 
     def _install_notebookutils(self) -> None:
         """Make ``import notebookutils`` / ``import mssparkutils`` resolve to the
@@ -297,8 +413,7 @@ class SparkEngine:
         # so a later engine in the same process must replace an earlier shim.
         sys.modules["notebookutils"] = shim
         sys.modules["mssparkutils"] = shim
-        self.shell.user_ns["notebookutils"] = shim
-        self.shell.user_ns["mssparkutils"] = shim
+        self._shim = shim
 
     def _install_delta_forname_bridge(self) -> None:
         """Bridge ``DeltaTable.forName`` to OneLakeCatalog.
@@ -394,10 +509,10 @@ class SparkEngine:
         name = f"spark_catalog.{cls._q(db)}"
         return name if table is None else f"{name}.{cls._q(table)}"
 
-    def _current_db_name(self) -> str:
+    def _current_db_name(self, spark=None) -> str:
         """`<catalog>.<database>` of the session's current namespace, quoted, for a
         later `USE` that restores it exactly (the user may have `USE`d a V2 catalog)."""
-        cat, db = self.spark.sql("SELECT current_catalog(), current_schema()").first()
+        cat, db = (spark if spark is not None else self.spark).sql("SELECT current_catalog(), current_schema()").first()
         return f"{self._q(cat)}.{self._q(db)}"
 
     def _register_lakehouses(self, lakehouses: list[dict], default_lakehouse: str | None = None) -> None:
@@ -434,12 +549,12 @@ class SparkEngine:
         if self.files is not None:
             self.files.lakehouses[info.name] = info  # the Files mirror resolves /lakehouse/<name> by this registry
         if runtime and self._onelake:
-            self.spark.conf.set(f"spark.localspark.lakehouse.{info.name}", info.id)
+            self._set_conf(f"spark.localspark.lakehouse.{info.name}", info.id)
             session_ws = self.spark.conf.get("spark.localspark.workspace_id", "")
             if not session_ws:  # a session started with no lakehouses has no workspace yet; the resolver needs one
-                self.spark.conf.set("spark.localspark.workspace_id", info.workspace_id)
+                self._set_conf("spark.localspark.workspace_id", info.workspace_id)
             elif info.workspace_id != session_ws:
-                self.spark.conf.set(f"spark.localspark.lakehouse_ws.{info.name}", info.workspace_id)
+                self._set_conf(f"spark.localspark.lakehouse_ws.{info.name}", info.workspace_id)
         self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._fq(info.name)}")
         # Schema-enabled lakehouse (Tables/<schema>/<table>): the host may say so
         # ("schemas": [...]); otherwise detected from the OneLake listing. Each
@@ -485,10 +600,7 @@ class SparkEngine:
         for key in (f"spark.localspark.lakehouse.{info.name}", f"spark.localspark.lakehouse_ws.{info.name}",
                     f"spark.sql.catalog.{info.name}", f"spark.sql.catalog.{info.name}.lakehouse",
                     f"spark.sql.catalog.{info.name}.default_schema"):
-            try:
-                self.spark.conf.unset(key)
-            except Exception:
-                pass
+            self._unset_conf(key)
         self.lakehouses.pop(info.name, None)
         if self.files is not None:
             self.files.lakehouses.pop(info.name, None)
@@ -529,9 +641,9 @@ class SparkEngine:
             self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._fq(f'{info.name}__{schema}')}")
         # `test.dbo.publicholidays` / `USE test` (-> dbo), as on Fabric: a thin V2
         # catalog named after the lakehouse that delegates to the session catalog.
-        self.spark.conf.set(f"spark.sql.catalog.{info.name}", "ch.fs.OneLakeSchemaCatalog")
-        self.spark.conf.set(f"spark.sql.catalog.{info.name}.lakehouse", info.name)
-        self.spark.conf.set(f"spark.sql.catalog.{info.name}.default_schema", default_schema)
+        self._set_conf(f"spark.sql.catalog.{info.name}", "ch.fs.OneLakeSchemaCatalog")
+        self._set_conf(f"spark.sql.catalog.{info.name}.lakehouse", info.name)
+        self._set_conf(f"spark.sql.catalog.{info.name}.default_schema", default_schema)
 
     def list_tables(self, lakehouse: str) -> list[str]:
         """Table names from OneLake storage (not the Fabric REST endpoint, which
@@ -776,6 +888,8 @@ class SparkEngine:
                 engine._interrupt_requested = False
                 engine._cell_gen += 1
                 engine._cell_method = method
+                engine._cell_context = engine._active.id
+                engine._active.cells += 1
                 engine._cell_started = time.time()
                 engine._cell_running = True
                 if job_description:
@@ -788,6 +902,7 @@ class SparkEngine:
                 engine._cell_running = False
                 engine._cell_started = None
                 engine._cell_method = None
+                engine._cell_context = None
                 engine._last_activity = time.time()
                 if engine._interrupt_requested:
                     engine._drain_pending_interrupt()
@@ -802,7 +917,7 @@ class SparkEngine:
         return _Running()
 
     def _exec(self, code: str, on_output=None, capture_result: bool = False,
-              job_description: str | None = None) -> tuple[ExecResult, BaseException | None]:
+              job_description: str | None = None, context: str | None = None) -> tuple[ExecResult, BaseException | None]:
         """Run a cell; also return the raised exception (the runner needs to
         recognize NotebookExit, which IPython otherwise reports as an error).
         ``capture_result``: a Spark or pandas DataFrame that is the cell's last
@@ -810,6 +925,7 @@ class SparkEngine:
         from IPython.utils.capture import capture_output
 
         self._displays, self._blobs = [], []
+        self._activate(self._resolve_context(context))
         with self._running("run_code", job_description):
             if on_output is None:
                 with capture_output() as cap:
@@ -897,26 +1013,32 @@ class SparkEngine:
         return text
 
     def run_code(self, code: str, on_output=None, capture_result: bool = False,
-                 job_description: str | None = None) -> ExecResult:
-        """Run a cell of Python against the persistent namespace. ``on_output``
-        (stream, text) receives stdout/stderr as the cell writes them;
-        ``capture_result`` attaches a bare trailing DataFrame as a display;
-        ``job_description`` names the cell's Spark jobs."""
-        res = self._exec(code, on_output=on_output, capture_result=capture_result, job_description=job_description)[0]
+                 job_description: str | None = None, context: str | None = None) -> ExecResult:
+        """Run a cell of Python against a context's persistent namespace (the
+        default context unless ``context`` names another). ``on_output`` (stream,
+        text) receives stdout/stderr as the cell writes them; ``capture_result``
+        attaches a bare trailing DataFrame as a display; ``job_description`` names
+        the cell's Spark jobs."""
+        res = self._exec(code, on_output=on_output, capture_result=capture_result, job_description=job_description,
+                         context=context)[0]
         res.notices.extend(self.drain_mount_notices())
         self.blobs_out = list(self._blobs)
         return res
 
-    def interrupt(self) -> dict:
+    def interrupt(self, context: str | None = None) -> dict:
         """Stop the running cell: cancel every Spark job, then raise
         KeyboardInterrupt in the cell's thread. Called from the control thread.
         A cell inside a long JVM call returns once its job is cancelled; a tight
-        C-extension loop cannot be interrupted."""
+        C-extension loop cannot be interrupted. With ``context``, only a cell of
+        that context is stopped."""
         import _thread
         import signal
 
         if not self._cell_running:
             return {"interrupted": False, "state": "idle", "reason": "idle: no cell is running"}
+        if context is not None and context != self._cell_context:
+            return {"interrupted": False, "state": "idle",
+                    "reason": f"idle: context {context!r} is not running (running: {self._cell_context!r})"}
         self._interrupt_requested = True
         # From this (control) thread, py4j's pinned-thread mode gives us our own
         # JVM connection, so the cancel never touches the connection the cell is
@@ -942,19 +1064,23 @@ class SparkEngine:
         # would run to completion: keep cancelling until the cell has ended.
         threading.Thread(target=self._cancel_until_idle, args=(self._cell_gen,), name="lsm-interrupt-watchdog", daemon=True).start()
         return {"interrupted": True, "state": "interrupting", "detail": cancel, "method": self._cell_method,
+                "context": self._cell_context,
                 "elapsed_s": round(time.time() - self._cell_started, 1) if self._cell_started else None}
 
-    def status(self) -> dict:
+    def status(self, context: str | None = None) -> dict:
         """For the control socket: what is running and for how long. Spark's active
         job count comes from this thread's own JVM connection, so it works while
-        the cell's thread is blocked in a Spark call."""
+        the cell's thread is blocked in a Spark call. With ``context``, `cell_running`
+        and `cell` describe that context only."""
         preload_running = self.preload_state.get("state") == "running"
-        out: dict = {"initialized": True, "cell_running": self._cell_running, "cell": None,
+        running = self._cell_running and (context is None or context == self._cell_context)
+        out: dict = {"initialized": True, "cell_running": running, "cell": None,
                      "preload": self.preload_state.get("state", "idle"),
                      "idle_s": None if (self._cell_running or preload_running) else round(time.time() - self._last_activity, 1),
-                     "last_activity": self._last_activity}
-        if self._cell_running:
-            cell: dict = {"method": self._cell_method, "elapsed_s": round(time.time() - (self._cell_started or time.time()), 1),
+                     "last_activity": self._last_activity, "contexts": sorted(self.contexts)}
+        if running:
+            cell: dict = {"method": self._cell_method, "context": self._cell_context,
+                          "elapsed_s": round(time.time() - (self._cell_started or time.time()), 1),
                           "interrupt_requested": self._interrupt_requested, "active_jobs": None}
             try:
                 sc = self.spark.sparkContext
@@ -1195,8 +1321,9 @@ class SparkEngine:
         stop_on_error: bool = True,
         default_lakehouse: str | None = None,
         parameters: dict | None = None,
+        context: str | None = None,
     ) -> dict:
-        """Run a Fabric notebook (Git .py format) cell by cell in this namespace."""
+        """Run a Fabric notebook (Git .py format) cell by cell in a context's namespace."""
         from .notebook import load_notebook, select_cells, strip_line_magics
         from .notebookutils_shim import NotebookExit
 
@@ -1204,10 +1331,13 @@ class SparkEngine:
         nb = load_notebook(nb_path)
         selected = select_cells(cells, len(nb.cells))
         warnings = list(nb.warnings)
+        ctx = self._resolve_context(context)
+        self._activate(ctx)
+        context = ctx.id
 
         # Default lakehouse for this run: explicit arg, else the notebook's META.
         lh_name = default_lakehouse or nb.default_lakehouse_name
-        prev_db = self._current_db_name()
+        prev_db = self._current_db_name(ctx.spark)
         effective_db = prev_db
         switched = False
         if lh_name and getattr(self, "lakehouses", None):
@@ -1218,7 +1348,7 @@ class SparkEngine:
                     f"workspace); running against {prev_db!r}"
                 )
             else:
-                self.spark.sql(f"USE {self._default_db(info.name)}")
+                ctx.spark.sql(f"USE {self._default_db(info.name)}")
                 effective_db, switched = info.name, True
                 if self.files is not None and info.name != self.default_lakehouse:
                     self._activate_files(info.name)
@@ -1254,7 +1384,7 @@ class SparkEngine:
                     entry["unsupported"] = unsupported
                 if cell.language == "sparksql":
                     try:
-                        res = self.run_sql(code)
+                        res = self.run_sql(code, context=context)
                         entry["status"] = "ok"
                         entry["stdout"] = _sql_preview(res)
                     except Exception as exc:
@@ -1262,7 +1392,7 @@ class SparkEngine:
                         entry["error"] = f"{type(exc).__name__}: {exc}".splitlines()[0]
                         first_error = first_error or entry["error"]
                 elif cell.language == "python":
-                    res, exc = self._exec(code)
+                    res, exc = self._exec(code, context=context)
                     entry["stdout"] = res.stdout
                     if isinstance(exc, NotebookExit):
                         entry["status"] = "exited"
@@ -1288,7 +1418,7 @@ class SparkEngine:
                     break
         finally:
             if switched:
-                self.spark.sql(f"USE {prev_db}")
+                ctx.spark.sql(f"USE {prev_db}")
                 if self.files is not None and effective_db != self.default_lakehouse and self.default_lakehouse:
                     self._activate_files(self.default_lakehouse)
         if any(r.get("status") in ("error", "unsupported") for r in results):
@@ -1408,33 +1538,36 @@ class SparkEngine:
                 return True
         return False
 
-    def _sql_with_automount(self, sql: str):
+    def _sql_with_automount(self, sql: str, spark=None):
         """spark.sql, transparently mounting referenced Fabric tables on first
         use. Each iteration mounts one newly-referenced table; the per-table
         guard prevents loops if a mount doesn't resolve the reference."""
         from pyspark.errors import AnalysisException
 
+        spark = spark if spark is not None else self.spark
         while True:
             try:
-                return self.spark.sql(sql)
+                return spark.sql(sql)
             except AnalysisException as exc:
                 if not self._automount_missing(exc):
                     raise
 
     def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False,
-                job_description: str | None = None) -> SqlResult:
-        """Run a SQL statement and return up to ``limit`` rows (as JSON rows, or
-        as an Arrow IPC stream in ``blobs_out`` when ``arrow`` is set)."""
+                job_description: str | None = None, context: str | None = None) -> SqlResult:
+        """Run a SQL statement in a context's session and return up to ``limit``
+        rows (as JSON rows, or as an Arrow IPC stream in ``blobs_out`` when
+        ``arrow`` is set)."""
         if limit is None:
             limit = self.default_sql_limit
         self.blobs_out = []
+        self._activate(self._resolve_context(context))
         if self.write_mode != "writethrough" and (target := _sql_write_target(sql)):
             if dv := self.is_dv_table(target):
                 raise RuntimeError(self.dv_refusal(dv))
         with self._running("run_sql", job_description):
             try:
                 try:
-                    df = self._sql_with_automount(sql)
+                    df = self._sql_with_automount(sql, self._active.spark)
                 except Exception as exc:
                     annotated = self.annotate_error(str(exc))
                     if annotated != str(exc):
@@ -1507,6 +1640,9 @@ class SparkEngine:
             "files_sync": self.files_sync_report,
             "execution_count": self.shell.execution_count,
             "default_sql_limit": self.default_sql_limit,
+            "features": list(FEATURES),
+            "contexts": [self._context_info(c) for c in self.contexts.values()],
+            "active_context": self._active.id,
         }
 
     # ---- write-policy shadow ----

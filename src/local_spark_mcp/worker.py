@@ -84,6 +84,10 @@ def _handle(engine, method: str, params: dict):
         info["profile_warnings"] = warnings
         info["control"] = True  # a control socket is served when --control-port was given
         return info, engine
+    if method == "create_context":
+        return engine.create_context(params["id"], params.get("default_lakehouse"), params.get("default_schema")), engine
+    if method == "drop_context":
+        return engine.drop_context(params["id"]), engine
     if method == "register_lakehouse":
         return engine.register_lakehouse(params["lakehouse"]), engine
     if method == "unregister_lakehouse":
@@ -102,10 +106,10 @@ def _handle(engine, method: str, params: dict):
         raise RuntimeError("engine not initialized; send 'init' first")
     if method == "run_code":
         return engine.run_code(params["code"], on_output=params.get("_on_output"), capture_result=bool(params.get("capture_result")),
-                               job_description=params.get("job_description")).to_dict(), engine
+                               job_description=params.get("job_description"), context=params.get("context")).to_dict(), engine
     if method == "run_sql":
         return engine.run_sql(params["sql"], params.get("limit"), bool(params.get("arrow")),
-                              job_description=params.get("job_description")).to_dict(), engine
+                              job_description=params.get("job_description"), context=params.get("context")).to_dict(), engine
     if method == "mount_table":
         return engine.mount_table(params["lakehouse"], params["table"]), engine
     if method == "table_features":
@@ -119,6 +123,7 @@ def _handle(engine, method: str, params: dict):
             stop_on_error=params.get("stop_on_error", True),
             default_lakehouse=params.get("default_lakehouse"),
             parameters=params.get("parameters"),
+            context=params.get("context"),
         ), engine
     if method == "sync_files":
         return engine.sync_files(params.get("paths"), params.get("direction", "pull"), params.get("lakehouse")), engine
@@ -152,14 +157,15 @@ def _control_loop(port: int, shared: _Shared) -> None:
             if req is None:
                 return
             rid, method = req.get("id"), req.get("method")
+            cparams = req.get("params") or {}
             eng = shared.engine
             try:
                 if method == "ping":
                     result = {}
                 elif method == "status":
-                    result = eng.status() if eng is not None else {"initialized": False, "cell_running": False, "cell": None}
+                    result = eng.status(cparams.get("context")) if eng is not None else {"initialized": False, "cell_running": False, "cell": None}
                 elif method == "interrupt":
-                    result = eng.interrupt() if eng is not None else {"interrupted": False, "reason": "not initialized"}
+                    result = eng.interrupt(cparams.get("context")) if eng is not None else {"interrupted": False, "reason": "not initialized"}
                 elif method == "preload_status":
                     result = eng.preload_status() if eng is not None else {"state": "idle"}
                 else:

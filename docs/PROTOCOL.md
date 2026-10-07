@@ -64,13 +64,15 @@ one. The MCP server does exactly that and reports it on the next result.
 | `healthcheck` | `profile?` | Works before `init`: versions, `protocol_version`, profile verdict, JDK and winutils resolution, jar validity (`healthcheck.healthcheck()` shape). |
 | `init` | `SparkEngine` keyword arguments (below) plus `profile?` | The `info` dict plus `profile_warnings`. Runs `check_profile` first and fails with its message when the installed stack cannot serve the declared profile or would crash its Python workers on this platform. |
 | `ping` | | `{}` |
-| `run_code` | `code`, `stream?`, `capture_result?`, `job_description?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", source, columns, row_count, truncated, limit, arrow_bytes}` per `display(df)` (`source: "display"`) and, with `capture_result: true`, for a Spark or pandas DataFrame that is the cell's last expression (`source: "result"`, same row cap; stdout still carries the repr); blobs in the same order) |
-| `run_sql` | `sql`, `limit?`, `arrow?`, `job_description?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
-| `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?` | per-cell results (see `engine.run_notebook`) |
+| `run_code` | `code`, `stream?`, `capture_result?`, `job_description?`, `context?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", source, columns, row_count, truncated, limit, arrow_bytes}` per `display(df)` (`source: "display"`) and, with `capture_result: true`, for a Spark or pandas DataFrame that is the cell's last expression (`source: "result"`, same row cap; stdout still carries the repr); blobs in the same order) |
+| `run_sql` | `sql`, `limit?`, `arrow?`, `job_description?`, `context?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
+| `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?`, `context?` | per-cell results (see `engine.run_notebook`) |
 | `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
 | `mount_table` | `lakehouse`, `table` | materialize one table now |
 | `mount_tables` | `lakehouse`, `tables` | materialize many in parallel; `mounted`, `failed`, `seconds` per table |
 | `preload` | `lakehouses?` (names, `["all"]`, or `{"lakehouse": ["t1", "dbo/t2"]}` for explicit tables with no listing), `workers?` | start background eager population; returns status at once. Failures appear in `preload_status` and on the worker's stderr, never as a cell notice |
+| `create_context` | `id`, `default_lakehouse?`, `default_schema?` | a new isolated REPL in the same JVM (see **Contexts**); returns `{id, default_lakehouse, default_schema, current_database, current_catalog, created_at, cells}` |
+| `drop_context` | `id` | release its namespace and session (`default` cannot be dropped; a context running a cell must be interrupted first) |
 | `register_lakehouse` | `lakehouse` (`{name, id, workspace_id, schemas?, default_schema?, detect_schemas?}`, as in `init`) | attach a lakehouse after start (its own workspace is fine): session database, schema catalog, first-touch resolution, shadows under the shared root |
 | `unregister_lakehouse` | `name` | detach it: databases dropped from the session catalog (shadow files stay and re-link on re-registration), confs removed |
 | `list_tables` | `lakehouse` | table entries from OneLake storage (`t` for `Tables/t`, `schema/t` for `Tables/schema/t`), not the Fabric REST endpoint, so schema-enabled lakehouses work |
@@ -93,6 +95,33 @@ the host must run a token endpoint, see `token_server.py`), `lakehouses`
 `extra_packages`. Each `lakehouses` entry may add `schemas` (`["dbo", …]`),
 `default_schema` (default `dbo`), and `detect_schemas` (default true: the worker
 lists `Tables/` once at start and treats folders of Delta tables as schemas).
+
+## Contexts
+
+One JVM, one isolated REPL per notebook, the way Fabric's high-concurrency
+sessions work. A context is its own Python namespace plus its own
+`spark.newSession()`: separate variables, imports, temp views, SQL conf,
+current database, and UDF registry; shared `SparkContext`, catalog
+(databases, tables, clones), cached data, and jars. `init` creates the
+`default` context, which is the root session and the namespace a version-2
+host already uses, so hosts that never pass `context` see no change.
+`create_context(id, default_lakehouse?, default_schema?)` sets the new
+session's current database from the lakehouse (`spark_catalog.<lh>`, or
+`<lh>__<schema>` for a schema-enabled one) and re-applies the worker's runtime
+confs (lakehouse ids, schema catalogs) to it; `register_lakehouse` later
+pushes to every context. `run_code`, `run_sql`, and `run_notebook` take
+`context`; `interrupt` and `status` on the control socket take an optional
+`context` (`status.cell.context` names the running one, `status.contexts` lists
+them); `info.contexts` and `info.active_context` describe them. Execution is
+sequential across contexts (one request loop); the API does not preclude a
+later concurrent mode. `display`, `capture_result`, and `notebookutils` work in
+every context; `notebookutils.notebook.run` runs in the calling context.
+`/lakehouse/default/Files` is one link per process and follows the session's
+default lakehouse, not the context's.
+
+`init` and `info` carry `features`, the additive capabilities of this worker:
+`arrow`, `streaming`, `interrupt`, `capture_result`, `job_description`,
+`register_lakehouse`, `contexts`.
 
 ## Tokens
 
