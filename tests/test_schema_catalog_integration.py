@@ -54,6 +54,22 @@ def test_schema_catalog_delegates_to_session_databases():
         assert spark.catalog.tableExists("spark_catalog.lh__dbo.made")
         spark.sql("DROP TABLE lh.dbo.made")
         assert not spark.catalog.tableExists("spark_catalog.lh__dbo.made")
+        # The trap Cobalt hit (0.4.1): with the V2 catalog current, a two-part
+        # delta.`path` resolves as lh.delta.<path> and Spark rejects it. Engine
+        # internals and OneLakeCatalog's materialization therefore qualify both the
+        # target and the source with spark_catalog, which resolves whatever is current.
+        src = spark.sql("DESCRIBE DETAIL spark_catalog.lh__dbo.holidays").first()["location"]
+        assert spark.sql("SELECT current_catalog()").first()[0] == "lh"
+        with pytest.raises(Exception, match="UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY|TABLE_OR_VIEW_NOT_FOUND"):
+            spark.sql(f"SELECT COUNT(*) FROM delta.`{src}`").collect()
+        assert spark.sql(f"SELECT COUNT(*) FROM spark_catalog.delta.`{src}`").first()[0] == 3
+        clone = (eng._session_dir / "clone_holidays").as_posix()
+        spark.sql(f"CREATE TABLE spark_catalog.`lh__dbo`.`holidays_clone` SHALLOW CLONE spark_catalog.delta.`{src}` LOCATION '{clone}'")
+        assert spark.table("lh.dbo.holidays_clone").count() == 3
+        spark.sql(f"CREATE VIEW IF NOT EXISTS spark_catalog.`lh__dbo`.`holidays_view` COMMENT 'x' AS SELECT * FROM spark_catalog.delta.`{src}`")
+        assert spark.table("lh.dbo.holidays_view").count() == 3
+        assert {t.name for t in spark.catalog.listTables("spark_catalog.lh__dbo")} >= {"holidays", "holidays_clone", "holidays_view"}
+        assert eng._current_db_name() == "`lh`.`dbo`"
         # a missing table raises the normal not-found
         with pytest.raises(Exception, match="TABLE_OR_VIEW_NOT_FOUND|cannot be found"):
             spark.table("lh.dbo.nope").count()

@@ -368,6 +368,31 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **Current catalog (0.4.2, Cobalt's 0.4.1 reply)**: with a V2 catalog current
+  (`USE test` on a schema-enabled lakehouse) a two-part `delta.\`path\`` resolves
+  as `test.delta.<path>` → `UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY`, and
+  `<db>.<t>` lands in the V2 namespace; every OneLake table then failed to
+  materialize. `OneLakeCatalog.materialize` now writes
+  `spark_catalog.<db>.<t>` / `spark_catalog.delta.\`src\`` (works for CLONE and
+  VIEW; `test_schema_catalog_integration` proves the SQL forms, and
+  `test_schema_catalog_live` registers `customer` with host-declared schemas and
+  materializes with `USE customer` current). Engine internals go through
+  `_fq()` (`spark_catalog.`-qualified), the default lakehouse `USE`s
+  `_default_db()` (`<lh>__<default_schema>` when schema-enabled, never the
+  catalog), and the notebook runner restores `<catalog>.<db>`
+  (`_current_db_name`). `status().cell.jobs` reads `statusStore().job(id)`
+  (name = call site, description, group) through py4j. `info.current_catalog`.
+- **Interrupt reconnect (0.4.2)**: py4j closes the interrupted thread's pinned
+  connection on KeyboardInterrupt; pyspark's `SCCallSiteSync.__exit__` then
+  reconnects and the auth handshake intermittently (~50% in tests) gets
+  "Answer from Java side is empty" from a healthy JVM, surfacing as the cell's
+  exception — and `_FATAL_MARKERS` matched that text and dropped the worker.
+  `engine.jvm_alive(retries, delay)` probes with retries; `_running.__exit__`
+  calls it after an interrupted unit, and `_result_is_fatal` uses only the
+  probe (never text) for `interrupted` results. Plain pyspark never showed the
+  empty answer in 8 tries; the worker's extra connections (control thread,
+  watchdog) are the suspected difference. Run `test_interrupt_spark_job`
+  several times when touching this.
 - **Interrupt, after Cobalt's 0.4.0 reply**: pyspark's SIGINT handler calls
   `cancelAllJobs()` on the interrupted thread; landing inside a py4j read it
   re-enters that thread's pinned connection (`RuntimeError: reentrant call

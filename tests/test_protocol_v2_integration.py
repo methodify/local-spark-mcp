@@ -64,12 +64,16 @@ def test_interrupt_spark_job(worker):
     out = {}
 
     def run():
-        out["res"] = worker.run_code("n = spark.range(10**14).selectExpr('sum(id % 7)').collect()")  # ~hours uninterrupted
+        try:
+            out["res"] = worker.run_code("n = spark.range(10**14).selectExpr('sum(id % 7)').collect()")  # ~hours uninterrupted
+        except Exception as exc:  # a worker-level error instead of a cell result: report it, do not hide it in a KeyError
+            out["exc"] = f"{type(exc).__name__}: {exc} fatal={getattr(exc, 'fatal', None)} tb={getattr(exc, 'traceback_str', '')}"
 
     t = threading.Thread(target=run); t.start()
     time.sleep(3)
     st = worker.status()
     assert st["cell_running"] and st["cell"]["active_jobs"] >= 1, st  # job count read from the control thread while the cell is blocked
+    assert st["cell"]["jobs"] and isinstance(st["cell"]["jobs"][0]["name"], str) and "id" in st["cell"]["jobs"][0], st
     t0 = time.time()
     r = worker.interrupt()
     reply_s = time.time() - t0
@@ -77,6 +81,7 @@ def test_interrupt_spark_job(worker):
     assert reply_s < 5, f"interrupt acknowledged after {reply_s:.1f}s"  # Cobalt saw 10 s+ with pyspark's SIGINT handler in place
     t.join(timeout=60)
     assert not t.is_alive(), "Spark job did not cancel"
+    assert "exc" not in out, out["exc"]
     assert not out["res"]["ok"] and out["res"]["interrupted"], out["res"]
     assert out["res"]["error"].startswith("KeyboardInterrupt"), out["res"]["error"]
     # the cancel's own py4j noise ("reentrant call", "while sending command") stays off the cell's stderr

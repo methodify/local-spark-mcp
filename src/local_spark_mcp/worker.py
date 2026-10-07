@@ -30,17 +30,17 @@ def _result_is_fatal(result, engine=None) -> bool:
     protocol hiccup."""
     if not isinstance(result, dict) or result.get("ok", True) and "error" not in result:
         return False
+    if result.get("interrupted"):
+        # An interrupted cell's error often carries py4j connection text
+        # (KeyboardInterrupt closed the thread's connection mid-call), which says
+        # nothing about the JVM: ask it, with retries (engine.jvm_alive).
+        return engine is not None and not engine.jvm_alive(retries=12, delay=0.25)
     text = f"{result.get('error') or ''}\n{result.get('traceback') or ''}\n{result.get('stdout') or ''}"
     if any(m in text for m in _FATAL_MARKERS):
         return True
-    spark = getattr(engine, "spark", None)
-    if spark is None:
+    if engine is None or getattr(engine, "spark", None) is None:
         return False
-    try:
-        spark._jvm.java.lang.System.currentTimeMillis()
-        return False
-    except Exception:
-        return True
+    return not engine.jvm_alive()
 
 
 def _is_fatal(exc: BaseException) -> bool:

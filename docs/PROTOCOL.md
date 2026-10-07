@@ -32,9 +32,11 @@ data socket until it finishes. Version 2 adds three things on top:
   and is served by its own thread, so it answers while a cell runs:
   `interrupt`, `ping`, `status`, and `preload_status`. `status` returns
   `{initialized, cell_running, preload, cell}` where `cell` is `null` when idle,
-  else `{method, elapsed_s, active_jobs, interrupt_requested}` (`active_jobs` is
-  Spark's active job count, read over the control thread's own JVM connection;
-  `null` if the JVM did not answer). Replies never carry blobs or events.
+  else `{method, elapsed_s, active_jobs, jobs, interrupt_requested}` (`active_jobs`
+  is Spark's active job count and `jobs` up to five `{id, name, description,
+  group}` entries, `name` being the call site such as `collect at <stdin>:1` and
+  `description` what `spark.sparkContext.setJobDescription` set; both read over
+  the control thread's own JVM connection, absent if the JVM did not answer). Replies never carry blobs or events.
 
 Request:
 
@@ -112,6 +114,16 @@ shadows (`<schema>.<table>` under the lakehouse's shadow dir), and the write
 policy apply unchanged. Top-level `Tables/<table>` entries stay reachable as
 `test.table`. `info.lakehouse_schemas` maps lakehouse to schemas.
 
+The session's current catalog stays `spark_catalog`: a default lakehouse with
+schemas selects `spark_catalog.<lakehouse>__<default_schema>`, so unqualified
+names resolve to its default schema as on Fabric. `USE <lakehouse>` (making the
+V2 catalog current) is the user's choice, and everything the worker runs on its
+own behalf (materialization in the catalog jar, mounts, shadow management, the
+notebook runner's `USE`) is `spark_catalog.`-qualified, so it works either way.
+Spark itself behaves differently once a V2 catalog is current: two-part names
+resolve inside that catalog, and `delta.\`path\`` fails with
+`UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY`; write `spark_catalog.delta.\`path\``.
+
 ## Interrupt (control socket)
 
 `interrupt` cancels every Spark job (`SparkContext.cancelAllJobs`, issued from
@@ -134,6 +146,14 @@ inside <_io.BufferedReader>`, then `Py4JNetworkError`, with py4j's error logging
 on the cell's stderr. The control thread already cancels the jobs, so the cell's
 thread only needs the `KeyboardInterrupt`. py4j's log lines about the connection
 it tears down during an interrupt are filtered out of the cell's stderr.
+
+py4j closes the interrupted thread's JVM connection when the `KeyboardInterrupt`
+lands inside a call, so the cell's exception may be a `Py4JNetworkError` rather
+than `KeyboardInterrupt` (the result is still `interrupted: true`). The worker
+then re-establishes the connection before replying, retrying because the first
+reconnect is sometimes answered with an empty line by a healthy gateway, and an
+interrupted result is flagged `fatal` only when that probe fails, never from
+connection text in the error.
 
 Limits: a cell inside a long JVM call returns when its job is cancelled
 (seconds); a tight loop inside a C extension cannot be interrupted; and on

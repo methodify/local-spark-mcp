@@ -158,7 +158,11 @@ class OneLakeCatalog extends DeltaCatalog {
 
   /** Register the table in the session catalog according to the write policy. */
   private def materialize(ident: Identifier, ns: String, id: String, src: String): Unit = {
-    val name = s"${quoted(ns)}.${quoted(ident.name())}"
+    // Fully qualified on both sides: with a V2 catalog current (`USE <lakehouse>`
+    // on a schema-enabled lakehouse) a two-part `delta.\`path\`` would resolve as
+    // <catalog>.delta.<path> and fail with UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY,
+    // and `<db>.<t>` would land in that catalog's namespace (Cobalt, 0.4.1).
+    val name = s"spark_catalog.${quoted(ns)}.${quoted(ident.name())}"
     val t0 = System.nanoTime()
     var how = "external"
     Reentrant.set(true)
@@ -175,7 +179,7 @@ class OneLakeCatalog extends DeltaCatalog {
             // Delta >= 3.3 can shallow-clone a deletion-vector table when the
             // clone enables the feature; the Python side picks this strategy.
             how = "shallow clone, deletion vectors"
-            spark.sql(s"CREATE TABLE $name SHALLOW CLONE delta.`$src` " +
+            spark.sql(s"CREATE TABLE $name SHALLOW CLONE spark_catalog.delta.`$src` " +
               "TBLPROPERTIES ('delta.enableDeletionVectors'='true') " +
               s"LOCATION '$shadow'")
           } else {
@@ -183,11 +187,11 @@ class OneLakeCatalog extends DeltaCatalog {
             // write is refused by Spark (a view) and explained by the Python
             // side, which finds these views by the comment tag.
             how = "read-only view, deletion vectors"
-            spark.sql(s"CREATE VIEW IF NOT EXISTS $name COMMENT '$DvViewTag source=$src' AS SELECT * FROM delta.`$src`")
+            spark.sql(s"CREATE VIEW IF NOT EXISTS $name COMMENT '$DvViewTag source=$src' AS SELECT * FROM spark_catalog.delta.`$src`")
           }
         } else {
           how = "shallow clone"
-          spark.sql(s"CREATE TABLE $name SHALLOW CLONE delta.`$src` LOCATION '$shadow'")
+          spark.sql(s"CREATE TABLE $name SHALLOW CLONE spark_catalog.delta.`$src` LOCATION '$shadow'")
         }
       }
       // The Python side drains this after each cell and reports "mounted X in N s",

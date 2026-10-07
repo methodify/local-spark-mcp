@@ -46,6 +46,13 @@ class ExecResult:
         return asdict(self)
 
 
+def _safe(fn, default=None):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 class InterruptedQuery(RuntimeError):
     """run_sql was stopped by `interrupt`; the worker reports it with interrupted=true."""
 
@@ -178,6 +185,7 @@ class SparkEngine:
         self.dv_strategy = _dv_strategy()
         self._onelake = dict(onelake) if onelake else None
         self._lakehouse_schemas: dict[str, list[str]] = {}
+        self._default_schemas: dict[str, str] = {}
         catalog = None
         if onelake and lakehouses:
             catalog = {
@@ -377,6 +385,20 @@ class SparkEngine:
         """Backtick-quote a Spark SQL identifier."""
         return "`" + identifier.replace("`", "``") + "`"
 
+    @classmethod
+    def _fq(cls, db: str, table: str | None = None) -> str:
+        """A session-catalog name qualified with `spark_catalog`, so engine
+        internals resolve the same whatever catalog the user made current
+        (`USE <lakehouse>` on a schema-enabled lakehouse switches to its V2 catalog)."""
+        name = f"spark_catalog.{cls._q(db)}"
+        return name if table is None else f"{name}.{cls._q(table)}"
+
+    def _current_db_name(self) -> str:
+        """`<catalog>.<database>` of the session's current namespace, quoted, for a
+        later `USE` that restores it exactly (the user may have `USE`d a V2 catalog)."""
+        cat, db = self.spark.sql("SELECT current_catalog(), current_schema()").first()
+        return f"{self._q(cat)}.{self._q(db)}"
+
     def _register_lakehouses(self, lakehouses: list[dict], default_lakehouse: str | None = None) -> None:
         """Register each (non-excluded) lakehouse as a Spark database and select
         the default. Tables are NOT mounted here: OneLakeCatalog resolves them on
@@ -388,7 +410,7 @@ class SparkEngine:
         for lh in lakehouses:
             info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
             self.lakehouses[info.name] = info
-            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(info.name)}")
+            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._fq(info.name)}")
             # Schema-enabled lakehouse (Tables/<schema>/<table>): the host may say so
             # ("schemas": [...]); otherwise detected from the OneLake listing. Each
             # schema becomes a session database `<lakehouse>__<schema>`, and the
@@ -406,7 +428,7 @@ class SparkEngine:
                     f"(or is excluded); known: {sorted(self.lakehouses)}"
                 )
             # Unqualified names now resolve here, like a Fabric notebook's default lakehouse.
-            self.spark.sql(f"USE {self._q(info.name)}")
+            self.spark.sql(f"USE {self._default_db(info.name)}")
             self.default_lakehouse = info.name
 
     def _detect_schemas(self, info) -> list[str]:
@@ -419,10 +441,24 @@ class SparkEngine:
             return []
         return sorted({e.split("/", 1)[0] for e in entries if "/" in e})
 
+    def _default_db(self, lakehouse: str) -> str:
+        """The session database unqualified names should resolve against for this
+        lakehouse: its default schema's database when it has schemas (Fabric
+        resolves `t` to `<lakehouse>.dbo.t`), else the lakehouse database. Always
+        `spark_catalog.`-qualified: `USE <lakehouse>` would make the V2 catalog
+        current, and then two-part names and `delta.\`path\`` stop resolving."""
+        schemas = self._lakehouse_schemas.get(lakehouse)
+        if schemas:
+            default = self._default_schemas.get(lakehouse, "dbo")
+            if default in schemas:
+                return self._fq(f"{lakehouse}__{default}")
+        return self._fq(lakehouse)
+
     def _register_schemas(self, info, schemas: list[str], default_schema: str) -> None:
         self._lakehouse_schemas[info.name] = schemas
+        self._default_schemas[info.name] = default_schema
         for schema in schemas:
-            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._q(f'{info.name}__{schema}')}")
+            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._fq(f'{info.name}__{schema}')}")
         # `test.dbo.publicholidays` / `USE test` (-> dbo), as on Fabric: a thin V2
         # catalog named after the lakehouse that delegates to the session catalog.
         self.spark.conf.set(f"spark.sql.catalog.{info.name}", "ch.fs.OneLakeSchemaCatalog")
@@ -471,7 +507,7 @@ class SparkEngine:
             raise ValueError(
                 f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}"
             )
-        self.spark.table(f"{self._q(info.name)}.{self._q(table)}")
+        self.spark.table(self._fq(info.name, table))
         with self._notice_lock:
             self._mounted.setdefault(info.name, set()).add(table)
         return {
@@ -580,7 +616,7 @@ class SparkEngine:
                 def one(table: str, _info=info, _entry=entry, _q=qualified):
                     db, tb = _q[table]
                     try:
-                        self.spark.table(f"{self._q(db)}.{self._q(tb)}")
+                        self.spark.table(self._fq(db, tb))
                         with self._notice_lock:
                             self._mounted.setdefault(_info.name, set()).add(table)
                         return None
@@ -678,6 +714,7 @@ class SparkEngine:
                 engine._cell_method = None
                 if engine._interrupt_requested:
                     engine._drain_pending_interrupt()
+                    engine.jvm_alive(retries=12, delay=0.25)  # re-establish this thread's JVM connection (see jvm_alive)
                 return False
 
         return _Running()
@@ -832,11 +869,42 @@ class SparkEngine:
             cell: dict = {"method": self._cell_method, "elapsed_s": round(time.time() - (self._cell_started or time.time()), 1),
                           "interrupt_requested": self._interrupt_requested, "active_jobs": None}
             try:
-                cell["active_jobs"] = len(self.spark.sparkContext.statusTracker().getActiveJobsIds())
+                sc = self.spark.sparkContext
+                ids = sorted(sc.statusTracker().getActiveJobsIds())
+                cell["active_jobs"] = len(ids)
+                store = sc._jsc.sc().statusStore()
+                jobs = []
+                for jid in ids[:5]:
+                    try:
+                        j = store.job(jid)
+                        desc, grp = j.description(), j.jobGroup()
+                        jobs.append({"id": jid, "name": j.name(), "description": desc.get() if desc.isDefined() else None,
+                                     "group": grp.get() if grp.isDefined() else None})
+                    except Exception:
+                        jobs.append({"id": jid})
+                cell["jobs"] = jobs
             except Exception:
                 pass
             out["cell"] = cell
         return out
+
+    def jvm_alive(self, retries: int = 1, delay: float = 0.25) -> bool:
+        """One trivial JVM call, retried. After an interrupt the cell's thread has
+        lost its pinned py4j connection (py4j closes it on KeyboardInterrupt) and
+        the first reconnect is sometimes answered with an empty line by the
+        gateway ("Answer from Java side is empty") although the JVM is healthy;
+        the next attempt goes through. Callers that decide "dead JVM" must use
+        this with retries rather than trust that text."""
+        for attempt in range(max(1, retries)):
+            try:
+                self.spark._jvm.java.lang.System.currentTimeMillis()
+                if attempt:
+                    print(f"local-spark: JVM connection re-established after {attempt + 1} attempts", file=sys.stderr)
+                return True
+            except Exception:
+                if attempt + 1 < retries:
+                    time.sleep(delay)
+        return False
 
     def _tame_sigint(self) -> None:
         """pyspark installs a SIGINT handler that calls cancelAllJobs() from the
@@ -1051,7 +1119,7 @@ class SparkEngine:
 
         # Default lakehouse for this run: explicit arg, else the notebook's META.
         lh_name = default_lakehouse or nb.default_lakehouse_name
-        prev_db = self.spark.catalog.currentDatabase()
+        prev_db = self._current_db_name()
         effective_db = prev_db
         switched = False
         if lh_name and getattr(self, "lakehouses", None):
@@ -1062,7 +1130,7 @@ class SparkEngine:
                     f"workspace); running against {prev_db!r}"
                 )
             else:
-                self.spark.sql(f"USE {self._q(info.name)}")
+                self.spark.sql(f"USE {self._default_db(info.name)}")
                 effective_db, switched = info.name, True
                 if self.files is not None and info.name != self.default_lakehouse:
                     self._activate_files(info.name)
@@ -1132,7 +1200,7 @@ class SparkEngine:
                     break
         finally:
             if switched:
-                self.spark.sql(f"USE {self._q(prev_db)}")
+                self.spark.sql(f"USE {prev_db}")
                 if self.files is not None and effective_db != self.default_lakehouse and self.default_lakehouse:
                     self._activate_files(self.default_lakehouse)
         if any(r.get("status") in ("error", "unsupported") for r in results):
@@ -1323,6 +1391,7 @@ class SparkEngine:
             "app_id": sc.applicationId,
             "master": sc.master,
             "current_database": catalog.currentDatabase(),
+            "current_catalog": _safe(catalog.currentCatalog),
             "databases": databases,
             "lakehouses": sorted(getattr(self, "lakehouses", {})),
             "default_lakehouse": self.default_lakehouse,
@@ -1390,7 +1459,7 @@ class SparkEngine:
         found: list[dict] = []
         for name in sorted(getattr(self, "lakehouses", {}) or {}):
             try:
-                tables = self.spark.catalog.listTables(name)
+                tables = self.spark.catalog.listTables(f"spark_catalog.{self._q(name)}")
             except Exception:
                 continue
             for t in tables:
@@ -1451,7 +1520,7 @@ class SparkEngine:
         except Exception:
             pass
         try:
-            self.spark.catalog.refreshTable(f"{self._q(shadow['lakehouse'])}.{self._q(shadow['table'])}")
+            self.spark.catalog.refreshTable(self._fq(shadow["lakehouse"], shadow["table"]))
         except Exception:
             pass
         state, latest = _shadow_state(Path(shadow["path"]))
@@ -1478,7 +1547,7 @@ class SparkEngine:
             raise LookupError(f"{want[0]}.{want[1]} has no shadow this session")
         for t in tables:
             try:
-                self.spark.sql(f"DROP TABLE IF EXISTS {self._q(t['lakehouse'])}.{self._q(t['table'])}")
+                self.spark.sql(f"DROP TABLE IF EXISTS {self._fq(t['lakehouse'], t['table'])}")
             except Exception:  # external table; best effort — files go next
                 pass
             shutil.rmtree(t["path"], ignore_errors=True)
