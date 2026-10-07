@@ -242,8 +242,13 @@ With `[files] mode = "lazy"` (env `LOCAL_SPARK_FILES_MODE`), Spark's relative
 host token with nothing mirrored, and each context's `Files/` follows its own
 default lakehouse. In sandbox and readonly mode a Spark write under `Files/` is
 refused with a message that names the alternatives; writethrough passes it
-through. `/lakehouse/default/Files` stays the local mirror for Python IO. The
-default remains `"mirror"`.
+through. For Python IO, `/lakehouse/default/Files/...` (and `/lakehouse/<name>/...`)
+works without syncing: a file is fetched into the mirror on first `open`,
+listings and `exists`/`isdir` come from OneLake, writes stay local (pushed only in
+writethrough), and `/lakehouse/default` means the active context's default
+lakehouse. Native readers still need the file on disk first (`sync_files`);
+`mirror_status` and `clear_mirror` manage the mirror. The default remains
+`"mirror"`.
 
 ## Contexts (0.5.0)
 

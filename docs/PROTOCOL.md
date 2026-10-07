@@ -80,6 +80,8 @@ one. The MCP server does exactly that and reports it on the next result.
 | `wait_preload` | `timeout?` | block until done (or timeout); returns status |
 | `table_features` | `lakehouse`, `tables` | Delta protocol features per table |
 | `sync_files` | `paths?`, `direction?`, `lakehouse?` | Files mirror pull/push |
+| `mirror_status` | | per lakehouse: `mirror_dir`, `pulled`, `fetched_files`, `fetched_bytes`, `fetched` (first 200), `local_files`, `local_bytes` |
+| `clear_mirror` | `lakehouse?`, `paths?` | delete mirror contents (one lakehouse's subtrees or files, one lakehouse, or all); returns `removed` |
 | `shadow_status` | | write mode and shadowed tables with `state`, `version`, `cloned_at` (first commit, ISO-8601 UTC) and `registered` (known to this session's catalog yet; a persisted clone from an earlier session is listed before any touch) |
 | `discard_shadow` | `only?` (`read` / `written`), `table?` | drop shadows |
 | `restore_shadow` | `table`, `version?` | rewind one shadow's local log |
@@ -126,7 +128,7 @@ context's default lakehouse (see **Files**).
 
 `init` and `info` carry `features`, the additive capabilities of this worker:
 `arrow`, `streaming`, `interrupt`, `capture_result`, `job_description`,
-`register_lakehouse`, `contexts`, `files_lazy`.
+`register_lakehouse`, `contexts`, `files_lazy`, `files_lazy_python`.
 
 ## Files
 
@@ -147,10 +149,29 @@ context's default lakehouse (see **Files**).
   the runtime with write_mode = writethrough`; writethrough passes writes through.
   Each context's session has its own default filesystem, so a context's `Files/`
   follows *its* default lakehouse (`info.contexts[].files_fs`); `run_notebook`
-  switches it with the notebook's default lakehouse and restores it after. The
-  `/lakehouse/default/Files` link and `sync_files` keep working for Python IO (the
-  Python-level lazy fetch is the next step). Shadows and the warehouse are `file:`
-  URIs, so they resolve the same under any default filesystem.
+  switches it with the notebook's default lakehouse and restores it after.
+  Shadows and the warehouse are `file:` URIs, so they resolve the same under any
+  default filesystem.
+
+  Python IO under `"lazy"` (0.6.1): the worker hooks `open` (and `io.open`),
+  `os.stat`/`lstat`, `os.listdir`, `os.scandir`, and the local mutators
+  (`mkdir`, `remove`, `unlink`, `rmdir`, `rename`, `replace`) for paths under
+  `/lakehouse/` (a Windows drive prefix is ignored) and registered mount points
+  only; every other path goes straight to the original function. `open` of a
+  file fetches it into the mirror on first use and re-fetches when OneLake has a
+  newer copy; `os.stat` and the `os.path` / `pathlib` predicates answer from
+  OneLake metadata for files not yet fetched; listings merge the OneLake
+  directory with local-only files; writes land in the mirror and are pushed on
+  close only in writethrough. `/lakehouse/default` means the **active
+  context's** default lakehouse. A path that exists nowhere raises a
+  `FileNotFoundError` naming the `sync_files(paths=[...], lakehouse=...)` call
+  that would pull its folder. Native readers (DuckDB, Arrow `OSFile`, …) open
+  files from C and bypass the hooks: they need the file in the mirror first
+  (`sync_files`), and their own error is the OS's. `mirror_status` reports, per
+  lakehouse, the pulled subtrees, lazily fetched files and bytes, and the local
+  size; `clear_mirror(lakehouse?, paths?)` deletes mirror contents (unpushed local
+  writes included; the next open fetches again). `info.files_hooks` says whether
+  the hooks are installed.
 
 ## Tokens
 

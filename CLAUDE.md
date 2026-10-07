@@ -368,6 +368,24 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **Lazy Files, phase B (0.6.1)**: `lazy_files.LazyFilesHooks` patches
+  `builtins.open`/`io.open` (IPython's `_modified_open` calls `io.open`),
+  `os.stat`/`lstat`, `os.listdir`, `os.scandir` (a `_DirEntry` stand-in), and
+  the local mutators, only for `/lakehouse/` paths and mount points
+  (`FilesMirror.locate`), resolving `default` to the ACTIVE context's
+  lakehouse. `FilesMirror` gained `remote_stat` (`hdi_isfolder` metadata marks
+  directories), `remote_list`, `fetch_file`, `push_file`, `status`, `clear`,
+  plus `pulled`/`fetched` bookkeeping. `os.path.*` and pathlib predicates all
+  route through `os.stat`; pathlib's `iterdir` is `listdir` on 3.11 and
+  `scandir` on 3.12+, so both are hooked. Installed in `__init__` when
+  `files_mode == "lazy"`, removed in `stop()`. Native readers bypass Python IO:
+  honest limit, documented. Worker/MCP: `mirror_status`, `clear_mirror`.
+  `tests/test_lazy_files_hooks.py` runs the hooks against a FakeMirror with an
+  in-memory OneLake, no Spark. Two captured references bypass module-level
+  patching and are hooked explicitly: IPython's `interactiveshell.io_open`
+  (what a cell's `open` calls) and Python 3.13's `glob._StringGlobber.scandir`
+  / `lstat` staticmethods (pathlib `glob`). Import IPython BEFORE patching
+  `io.open`, or its captured value is already the hook.
 - **Lazy Files, phase A (0.6.0)**: `ch.fs.LakehouseFileSystem` (jar) =
   `lakehouse://<ws>@<lh>.onelake...` → inner `abfss://<ws>@host/<lh>/...`
   (statuses translated back so Spark keeps reading through it; writes refused

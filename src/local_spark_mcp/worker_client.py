@@ -285,6 +285,12 @@ class WorkerProcess:
     def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:
         return self._call("sync_files", {"paths": paths, "direction": direction, "lakehouse": lakehouse})
 
+    def mirror_status(self) -> dict:
+        return self._call("mirror_status")
+
+    def clear_mirror(self, lakehouse: str | None = None, paths=None) -> dict:
+        return self._call("clear_mirror", {"lakehouse": lakehouse, "paths": paths})
+
     def list_tables(self, lakehouse: str) -> list:
         return self._call("list_tables", {"lakehouse": lakehouse})
 

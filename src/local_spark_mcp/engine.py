@@ -253,6 +253,12 @@ class SparkEngine:
         self._active: Context = default_ctx
         if self.default_lakehouse:
             self._set_default_fs(self.spark, self.default_lakehouse)
+        self._lazy_hooks = None
+        if self.files_mode == "lazy" and self.files is not None:
+            from .lazy_files import LazyFilesHooks
+
+            self._lazy_hooks = LazyFilesHooks(self)
+            self._lazy_hooks.install()
         if self.files is not None and self.default_lakehouse:
             self._activate_files(self.default_lakehouse)
         if preload and getattr(self, "lakehouses", None):
@@ -307,6 +313,21 @@ class SparkEngine:
         except Exception as exc:  # pragma: no cover - best effort
             self.spark_working_dir = None
             print(f"local-spark: could not set the Spark working directory: {exc}", file=sys.stderr)
+
+    def mirror_status(self) -> dict:
+        """The Files mirror per lakehouse: pulled subtrees, lazily fetched files, local size."""
+        if self.files is None:
+            raise RuntimeError("no Fabric workspace configured (set [workspace] in local-spark.toml)")
+        out = self.files.status()
+        out["files_mode"] = self.files_mode
+        return out
+
+    def clear_mirror(self, lakehouse: str | None = None, paths: list[str] | None = None) -> dict:
+        """Delete mirror contents (subtrees of one lakehouse, one lakehouse, or all).
+        Unpushed local writes go with them; the next open fetches again."""
+        if self.files is None:
+            raise RuntimeError("no Fabric workspace configured (set [workspace] in local-spark.toml)")
+        return self.files.clear(lakehouse, paths)
 
     def sync_files(self, paths: list[str] | None = None, direction: str = "pull", lakehouse: str | None = None) -> dict:
         if self.files is None:
@@ -1699,6 +1720,7 @@ class SparkEngine:
             "default_sql_limit": self.default_sql_limit,
             "features": list(FEATURES),
             "files_mode": self.files_mode,
+            "files_hooks": bool(getattr(self, "_lazy_hooks", None) and self._lazy_hooks.installed),
             "contexts": [self._context_info(c) for c in self.contexts.values()],
             "active_context": self._active.id,
         }
@@ -1854,6 +1876,8 @@ class SparkEngine:
         return {"discarded": len(tables), "tables": tables}
 
     def stop(self):
+        if getattr(self, "_lazy_hooks", None) is not None:
+            self._lazy_hooks.uninstall()
         try:
             self.spark.stop()
         except Exception:  # pragma: no cover - best effort on shutdown

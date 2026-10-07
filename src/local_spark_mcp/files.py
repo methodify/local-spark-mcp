@@ -91,6 +91,8 @@ class FilesMirror:
         self.lock_path = Path(lock_path) if lock_path else self.root / ".lakehouse-link.json"
         self._fs = filesystem
         self.mounts: dict[str, str] = {}  # mount point -> lakehouse name
+        self.pulled: dict[str, set] = {}  # lakehouse -> Files/ subtrees pulled by pull()
+        self.fetched: dict[str, dict[str, int]] = {}  # lakehouse -> {rel: bytes} fetched one file at a time (lazy hooks)
 
     # ---------- names / paths ----------
 
@@ -108,17 +110,20 @@ class FilesMirror:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def resolve(self, path: str, default_lakehouse: str | None) -> Path | None:
-        """Map a Fabric-style path to the mirror. Handles ``/lakehouse/default/...``,
-        ``/lakehouse/<name>/...`` (with or without the ``Files/`` segment), and
-        registered mount points. Returns None for anything else."""
-        p = path.replace("\\", "/")
+    def locate(self, path: str, default_lakehouse: str | None) -> tuple[str, str] | None:
+        """(lakehouse name, path relative to its Files/) for a Fabric-style path:
+        ``/lakehouse/default/...``, ``/lakehouse/<name>/...`` (with or without the
+        ``Files/`` segment; a Windows drive prefix is ignored), and registered mount
+        points. None for anything else, including ``Tables/`` (never mirrored)."""
+        p = str(path).replace("\\", "/")
+        if len(p) > 2 and p[1] == ":" and p[2] == "/":
+            p = p[2:]
         for mount, lakehouse in sorted(self.mounts.items(), key=lambda kv: -len(kv[0])):
             m = mount.replace("\\", "/").rstrip("/")
             if p == m or p.startswith(m + "/"):
                 rel = _norm_rel(p[len(m):])
                 rel = rel[len("Files/"):] if rel.startswith("Files/") else ("" if rel == "Files" else rel)
-                return self.mirror_dir(lakehouse) / rel if rel else self.mirror_dir(lakehouse)
+                return lakehouse, rel
         parts = [s for s in p.split("/") if s]
         if len(parts) < 2 or parts[0].lower() != "lakehouse":
             return None
@@ -130,8 +135,20 @@ class FilesMirror:
             rest = rest[1:]
         elif rest and rest[0] == "Tables":
             return None  # never mirrored
-        base = self.mirror_dir(name)
-        return base.joinpath(*rest) if rest else base
+        try:
+            name = self._lh(name).name
+        except LookupError:
+            return None
+        return name, "/".join(rest)
+
+    def resolve(self, path: str, default_lakehouse: str | None) -> Path | None:
+        """Map a Fabric-style path to the mirror (see locate). None for anything else."""
+        hit = self.locate(path, default_lakehouse)
+        if hit is None:
+            return None
+        lakehouse, rel = hit
+        base = self.mirror_dir(lakehouse)
+        return base / rel if rel else base
 
     # ---------- OneLake data plane ----------
 
@@ -160,6 +177,7 @@ class FilesMirror:
         fs = self._filesystem()
         local_root = self.mirror_dir(lakehouse)
         result = SyncResult("pull", lakehouse, paths=[_norm_rel(p) for p in (paths or [""])])
+        self.pulled.setdefault(self._lh(lakehouse).name, set()).update(result.paths)
         for rel in result.paths:
             remote = self._remote(lakehouse, rel)
             try:
@@ -238,6 +256,113 @@ class FilesMirror:
         return result
 
     # ---------- the literal path ----------
+
+    # ---------- single files and remote metadata (lazy Files hooks) ----------
+
+    def remote_stat(self, lakehouse: str, rel: str) -> dict | None:
+        """{"is_dir", "size", "mtime"} for a Files/ path on OneLake, or None when absent."""
+        from azure.core.exceptions import ResourceNotFoundError
+
+        remote = self._remote(lakehouse, rel)
+        try:
+            props = self._filesystem().get_file_client(remote).get_file_properties()
+        except ResourceNotFoundError:
+            return None
+        is_dir = str((props.metadata or {}).get("hdi_isfolder", "")).lower() == "true"
+        return {"is_dir": is_dir, "size": 0 if is_dir else int(props.size or 0), "mtime": self._epoch(props.last_modified)}
+
+    def remote_list(self, lakehouse: str, rel: str) -> list[dict] | None:
+        """Direct children of a Files/ directory on OneLake as
+        [{"name", "is_dir", "size", "mtime"}], or None when the directory is absent."""
+        from azure.core.exceptions import ResourceNotFoundError
+
+        remote = self._remote(lakehouse, rel)
+        try:
+            entries = list(self._filesystem().get_paths(path=remote, recursive=False))
+        except ResourceNotFoundError:
+            return None
+        out = []
+        for e in entries:
+            name = e.name.rsplit("/", 1)[-1]
+            out.append({"name": name, "is_dir": bool(getattr(e, "is_directory", False)),
+                        "size": int(getattr(e, "content_length", 0) or 0), "mtime": self._epoch(getattr(e, "last_modified", None))})
+        return out
+
+    def fetch_file(self, lakehouse: str, rel: str) -> Path:
+        """Make one Files/ file present in the mirror (downloaded unless the local copy
+        already matches size and mtime) and return its local path."""
+        lakehouse = self._lh(lakehouse).name
+        local = self.mirror_dir(lakehouse) / rel
+        st = self.remote_stat(lakehouse, rel)
+        if st is None:
+            raise FileNotFoundError(rel)
+        if st["is_dir"]:
+            raise IsADirectoryError(rel)
+        if local.is_file() and local.stat().st_size == st["size"] and local.stat().st_mtime >= st["mtime"]:
+            return local
+        local.parent.mkdir(parents=True, exist_ok=True)
+        data = self._filesystem().get_file_client(self._remote(lakehouse, rel)).download_file().readall()
+        local.write_bytes(data)
+        if st["mtime"]:
+            os.utime(local, (st["mtime"], st["mtime"]))
+        self.fetched.setdefault(lakehouse, {})[rel] = len(data)
+        return local
+
+    def push_file(self, lakehouse: str, rel: str) -> int:
+        """Upload one mirror file to OneLake (writethrough only). Returns the bytes sent."""
+        if self.write_mode != "writethrough":
+            raise PermissionError(f"write_mode is '{self.write_mode}': refusing to push Files to OneLake")
+        local = self.mirror_dir(lakehouse) / rel
+        data = local.read_bytes()
+        client = self._filesystem().get_file_client(self._remote(lakehouse, rel))
+        client.upload_data(data, overwrite=True)
+        return len(data)
+
+    def status(self) -> dict:
+        """Per lakehouse: pulled subtrees, lazily fetched files, local size of the mirror."""
+        out = {}
+        for name in sorted(self.lakehouses):
+            d = self.root / self.workspace_id / self._lh(name).id / "Files"
+            files = bytes_ = 0
+            if d.is_dir():
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        files += 1
+                        bytes_ += p.stat().st_size
+            fetched = self.fetched.get(name, {})
+            out[name] = {"mirror_dir": d.as_posix(), "pulled": sorted(self.pulled.get(name, ())),
+                         "fetched_files": len(fetched), "fetched_bytes": sum(fetched.values()),
+                         "fetched": sorted(fetched)[:200], "local_files": files, "local_bytes": bytes_}
+        return {"root": self.root.as_posix(), "write_mode": self.write_mode, "lakehouses": out}
+
+    def clear(self, lakehouse: str | None = None, paths: list[str] | None = None) -> dict:
+        """Delete mirror contents: the given Files/ subtrees (or files) of one
+        lakehouse, a whole lakehouse's mirror, or every lakehouse's. Local writes that
+        were never pushed are gone with it; the next open fetches again."""
+        import shutil
+
+        names = [self._lh(lakehouse).name] if lakehouse else sorted(self.lakehouses)
+        removed = []
+        for name in names:
+            base = self.mirror_dir(name)
+            targets = [base / _norm_rel(p) for p in paths] if paths else [base]
+            for t in targets:
+                if t.is_dir():
+                    shutil.rmtree(t, ignore_errors=True)
+                    removed.append(t.as_posix())
+                elif t.is_file():
+                    t.unlink()
+                    removed.append(t.as_posix())
+            base.mkdir(parents=True, exist_ok=True)
+            if paths:
+                rels = {_norm_rel(p) for p in paths}
+                self.fetched[name] = {r: b for r, b in self.fetched.get(name, {}).items()
+                                      if not any(r == x or r.startswith(x + "/") for x in rels)}
+                self.pulled[name] = {x for x in self.pulled.get(name, set()) if not any(x == r or x.startswith(r + "/") for r in rels)}
+            else:
+                self.fetched.pop(name, None)
+                self.pulled.pop(name, None)
+        return {"removed": removed, "lakehouses": names}
 
     def _read_lock(self) -> dict | None:
         try:

@@ -126,6 +126,10 @@ def _handle(engine, method: str, params: dict):
             parameters=params.get("parameters"),
             context=params.get("context"),
         ), engine
+    if method == "mirror_status":
+        return engine.mirror_status(), engine
+    if method == "clear_mirror":
+        return engine.clear_mirror(params.get("lakehouse"), params.get("paths")), engine
     if method == "sync_files":
         return engine.sync_files(params.get("paths"), params.get("direction", "pull"), params.get("lakehouse")), engine
     if method == "restore_shadow":

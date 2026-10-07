@@ -764,6 +764,33 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         return state.with_notices(format_notebook_result(res))
 
     @mcp.tool()
+    async def mirror_status(ctx: Context) -> str:
+        """The local Files mirror per lakehouse: which Files/ subtrees were pulled, which files were fetched lazily (files_mode = lazy), and the local size."""
+        if note := _local_only_note():
+            return note
+        try:
+            res = await state.call("mirror_status", on_wait=_pinger(ctx, "reading the mirror"))
+        except WorkerError as exc:
+            return f"mirror_status failed: {exc}"
+        lines = [f"mirror root: {res['root']} (write mode {res['write_mode']}, files mode {res.get('files_mode')})"]
+        for name, st in res["lakehouses"].items():
+            lines.append(f"  {name}: {st['local_files']} files, {st['local_bytes']} bytes; pulled {st['pulled'] or '-'}; "
+                         f"fetched lazily {st['fetched_files']} ({st['fetched_bytes']} bytes)")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def clear_mirror(ctx: Context, lakehouse: str | None = None, paths: str | None = None) -> str:
+        """Delete local Files mirror contents: `paths` (comma-separated Files/ subtrees or files) of a lakehouse, a whole lakehouse's mirror, or every lakehouse's when both are omitted. Local writes never pushed are lost; the next open fetches again."""
+        if note := _local_only_note():
+            return note
+        path_list = [p.strip() for p in paths.split(",") if p.strip()] if paths else None
+        try:
+            res = await state.call("clear_mirror", lakehouse, path_list, on_wait=_pinger(ctx, "clearing the mirror"))
+        except WorkerError as exc:
+            return f"clear_mirror failed: {exc}"
+        return f"removed {len(res['removed'])} path(s) for {', '.join(res['lakehouses'])}:\n" + "\n".join(f"  {p}" for p in res["removed"]) if res["removed"] else "nothing to remove"
+
+    @mcp.tool()
     async def sync_files(
         ctx: Context,
         paths: str | None = None,
