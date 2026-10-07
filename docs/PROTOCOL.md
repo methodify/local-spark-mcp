@@ -68,7 +68,7 @@ one. The MCP server does exactly that and reports it on the next result.
 | `run_sql` | `sql`, `limit?`, `arrow?`, `job_description?`, `context?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
 | `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?`, `context?` | per-cell results (see `engine.run_notebook`) |
 | `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
-| `mount_table` | `lakehouse`, `table` | materialize one table now |
+| `mount_table` | `lakehouse`, `table` (`t` or `schema/t`, as `list_tables` and `preload` spell them) | materialize one table now; returns the session `database` it landed in |
 | `mount_tables` | `lakehouse`, `tables` | materialize many in parallel; `mounted`, `failed`, `seconds` per table |
 | `preload` | `lakehouses?` (names, `["all"]`, or `{"lakehouse": ["t1", "dbo/t2"]}` for explicit tables with no listing), `workers?` | start background eager population; returns status at once. Failures appear in `preload_status` and on the worker's stderr, never as a cell notice |
 | `create_context` | `id`, `default_lakehouse?`, `default_schema?`, `name?` | a new isolated REPL in the same JVM (see **Contexts**); `name` is the display name (the notebook's title), used as the Spark job group description; returns `{id, name, default_lakehouse, default_schema, current_database, current_catalog, created_at, cells, last_activity, idle_s}` |

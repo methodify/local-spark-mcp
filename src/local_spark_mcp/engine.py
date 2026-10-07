@@ -46,6 +46,16 @@ class ExecResult:
         return asdict(self)
 
 
+def _hadoop_file_uri(path: Path) -> str:
+    """`file:/…` for a local path, spelled the way Hadoop's Path expects: scheme plus the
+    raw absolute path, no percent-encoding. `Path.as_uri()` encodes a space as `%20`,
+    and Hadoop takes that string as already-raw, so the clone of a table under
+    `C:/Users/x/App Data/...` landed in a sibling directory literally named `App%20Data`
+    that the shadow lister never saw (Cobalt, 0.6.2)."""
+    p = Path(path).resolve().as_posix()
+    return "file:" + (p if p.startswith("/") else "/" + p)
+
+
 def _safe(fn, default=None):
     try:
         return fn()
@@ -226,7 +236,7 @@ class SparkEngine:
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
                 # a file: URI, so shadows resolve whatever a session's default filesystem is (files_mode = lazy)
-                "shadow_root": self.shadow_root.resolve().as_uri(),
+                "shadow_root": _hadoop_file_uri(self.shadow_root),
             }
         self.spark = build_spark(
             extra_jars=self.extra_jars,
@@ -755,12 +765,16 @@ class SparkEngine:
             raise ValueError(
                 f"unknown lakehouse {lakehouse!r}; known: {sorted(self.lakehouses)}"
             )
-        self.spark.table(self._fq(info.name, table))
+        # `table` or `schema/table` (the entry form list_tables and preload use), so a
+        # schema-enabled lakehouse's table has a spelling mount_table accepts too.
+        db, tb = self._qualified(info.name, table)
+        self.spark.table(self._fq(db, tb))
         with self._notice_lock:
             self._mounted.setdefault(info.name, set()).add(table)
         return {
             "lakehouse": info.name,
             "table": table,
+            "database": db,
             "path": info.table_path(table),
             "write_mode": self.write_mode,
         }

@@ -31,7 +31,7 @@ def test_lazy_files(tmp_path):
     entries = [{"name": lh.name, "id": lh.id, "workspace_id": lh.workspace_id, "detect_schemas": False} for lh in all_lh]
     srv = TokenServer(); srv.start()
     eng = SparkEngine(driver_memory="4g", onelake={"endpoint": srv.url, "secret": srv.secret, "jar_path": default_jar_path()},
-                      lakehouses=entries, write_mode="sandbox", state_root=str(tmp_path / "state"),
+                      lakehouses=entries, write_mode="sandbox", state_root=str(tmp_path / "state dir"),  # a space, like an app-data folder
                       default_lakehouse=LH, files_mode="lazy")
     try:
         info = eng.info()
@@ -46,6 +46,10 @@ def test_lazy_files(tmp_path):
         # shadows (file: URIs) and new tables still work with the lakehouse filesystem current
         assert eng.run_sql(f"SELECT COUNT(*) AS n FROM {LH}.{TABLE}").rows[0][0] > 0
         assert eng.run_code(f"spark.range(3).write.mode('overwrite').saveAsTable('{LH}.lazy_probe_tmp'); print(spark.table('{LH}.lazy_probe_tmp').count())").stdout.strip() == "3"
+        # the clones are where the lister looks, with a space in the state path (0.6.2 regression)
+        states = {(t["lakehouse"], t["table"]): t["state"] for t in eng.shadow_status()["tables"]}
+        assert states.get((LH, TABLE)) == "read" and states.get((LH, "lazy_probe_tmp")) == "written", states
+        assert eng.mount_table(LH, TABLE)["database"] == LH
         # sandbox: a Spark write under Files/ is refused before anything reaches OneLake
         r = eng.run_code("spark.range(1).write.mode('overwrite').csv('Files/_localspark_probe_out')")
         assert not r.ok and "write_mode=sandbox" in (r.error or "") + (r.traceback or ""), (r.error, (r.traceback or "")[-500:])

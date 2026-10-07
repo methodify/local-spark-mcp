@@ -368,6 +368,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **Shadow root URI (0.6.3)**: never hand Hadoop a `Path.as_uri()` string —
+  it percent-encodes, Hadoop's `Path(String)` treats the string as raw, and a
+  state path with a space put every clone in a sibling `App%20Data` directory
+  the lister never scanned (Cobalt's `shadow_status` was empty on 0.6.2).
+  `_hadoop_file_uri` = `"file:" + resolved posix path`. Live tests now use a
+  state root with a space. `mount_table` accepts `schema/table`.
 - **Lazy Files, phase B (0.6.1)**: `lazy_files.LazyFilesHooks` patches
   `builtins.open`/`io.open` (IPython's `_modified_open` calls `io.open`),
   `os.stat`/`lstat`, `os.listdir`, `os.scandir` (a `_DirEntry` stand-in), and
