@@ -226,14 +226,24 @@ class WorkerProcess:
         return result
 
     # --- proxied engine operations ---
-    def run_code(self, code: str, stream: bool = False, on_event=None, capture_result: bool = False) -> dict:
+    def run_code(self, code: str, stream: bool = False, on_event=None, capture_result: bool = False,
+                 job_description: str | None = None) -> dict:
         """``stream=True`` delivers stdout/stderr frames to ``on_event`` as the cell
-        writes them; ``capture_result=True`` attaches a bare trailing DataFrame as a display."""
-        return self._call("run_code", {"code": code, "stream": stream, "capture_result": capture_result}, on_event=on_event)
+        writes them; ``capture_result=True`` attaches a bare trailing DataFrame as a
+        display; ``job_description`` names the cell's Spark jobs (status, Spark UI)."""
+        return self._call("run_code", {"code": code, "stream": stream, "capture_result": capture_result,
+                                       "job_description": job_description}, on_event=on_event)
 
-    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False) -> dict:
+    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False, job_description: str | None = None) -> dict:
         """``arrow=True``: rows come back as one Arrow IPC stream in ``result["blobs"][0]``."""
-        return self._call("run_sql", {"sql": sql, "limit": limit, "arrow": arrow})
+        return self._call("run_sql", {"sql": sql, "limit": limit, "arrow": arrow, "job_description": job_description})
+
+    def register_lakehouse(self, lakehouse: dict) -> dict:
+        """Attach a lakehouse after start: ``{name, id, workspace_id, schemas?, default_schema?, detect_schemas?}``."""
+        return self._call("register_lakehouse", {"lakehouse": lakehouse})
+
+    def unregister_lakehouse(self, name: str) -> dict:
+        return self._call("unregister_lakehouse", {"name": name})
 
     def mount_table(self, lakehouse: str, table: str) -> dict:
         return self._call("mount_table", {"lakehouse": lakehouse, "table": table})

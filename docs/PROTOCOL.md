@@ -31,11 +31,13 @@ data socket until it finishes. Version 2 adds three things on top:
   connects to that port second. The control connection carries the same framing
   and is served by its own thread, so it answers while a cell runs:
   `interrupt`, `ping`, `status`, and `preload_status`. `status` returns
-  `{initialized, cell_running, preload, cell}` where `cell` is `null` when idle,
+  `{initialized, cell_running, preload, idle_s, last_activity, cell}` where
+  `idle_s` is the time since the last cell, query, or preload ended (`null`
+  while one runs) and `cell` is `null` when idle,
   else `{method, elapsed_s, active_jobs, jobs, interrupt_requested}` (`active_jobs`
   is Spark's active job count and `jobs` up to five `{id, name, description,
   group}` entries, `name` being the call site such as `collect at <stdin>:1` and
-  `description` what `spark.sparkContext.setJobDescription` set; both read over
+  `description` what `job_description` on the call (or `setJobDescription` in the cell) set; both read over
   the control thread's own JVM connection, absent if the JVM did not answer). Replies never carry blobs or events.
 
 Request:
@@ -62,19 +64,21 @@ one. The MCP server does exactly that and reports it on the next result.
 | `healthcheck` | `profile?` | Works before `init`: versions, `protocol_version`, profile verdict, JDK and winutils resolution, jar validity (`healthcheck.healthcheck()` shape). |
 | `init` | `SparkEngine` keyword arguments (below) plus `profile?` | The `info` dict plus `profile_warnings`. Runs `check_profile` first and fails with its message when the installed stack cannot serve the declared profile or would crash its Python workers on this platform. |
 | `ping` | | `{}` |
-| `run_code` | `code`, `stream?`, `capture_result?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", source, columns, row_count, truncated, limit, arrow_bytes}` per `display(df)` (`source: "display"`) and, with `capture_result: true`, for a Spark or pandas DataFrame that is the cell's last expression (`source: "result"`, same row cap; stdout still carries the repr); blobs in the same order) |
-| `run_sql` | `sql`, `limit?`, `arrow?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
+| `run_code` | `code`, `stream?`, `capture_result?`, `job_description?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", source, columns, row_count, truncated, limit, arrow_bytes}` per `display(df)` (`source: "display"`) and, with `capture_result: true`, for a Spark or pandas DataFrame that is the cell's last expression (`source: "result"`, same row cap; stdout still carries the repr); blobs in the same order) |
+| `run_sql` | `sql`, `limit?`, `arrow?`, `job_description?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
 | `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?` | per-cell results (see `engine.run_notebook`) |
 | `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
 | `mount_table` | `lakehouse`, `table` | materialize one table now |
 | `mount_tables` | `lakehouse`, `tables` | materialize many in parallel; `mounted`, `failed`, `seconds` per table |
 | `preload` | `lakehouses?` (names, `["all"]`, or `{"lakehouse": ["t1", "dbo/t2"]}` for explicit tables with no listing), `workers?` | start background eager population; returns status at once. Failures appear in `preload_status` and on the worker's stderr, never as a cell notice |
+| `register_lakehouse` | `lakehouse` (`{name, id, workspace_id, schemas?, default_schema?, detect_schemas?}`, as in `init`) | attach a lakehouse after start (its own workspace is fine): session database, schema catalog, first-touch resolution, shadows under the shared root |
+| `unregister_lakehouse` | `name` | detach it: databases dropped from the session catalog (shadow files stay and re-link on re-registration), confs removed |
 | `list_tables` | `lakehouse` | table entries from OneLake storage (`t` for `Tables/t`, `schema/t` for `Tables/schema/t`), not the Fabric REST endpoint, so schema-enabled lakehouses work |
 | `preload_status` | | `state` (`idle` / `running` / `done` / `failed`), per-lakehouse progress, counts, `elapsed_s` |
 | `wait_preload` | `timeout?` | block until done (or timeout); returns status |
 | `table_features` | `lakehouse`, `tables` | Delta protocol features per table |
 | `sync_files` | `paths?`, `direction?`, `lakehouse?` | Files mirror pull/push |
-| `shadow_status` | | write mode and shadowed tables with `state` and `version` |
+| `shadow_status` | | write mode and shadowed tables with `state`, `version`, `cloned_at` (first commit, ISO-8601 UTC) and `registered` (known to this session's catalog yet; a persisted clone from an earlier session is listed before any touch) |
 | `discard_shadow` | `only?` (`read` / `written`), `table?` | drop shadows |
 | `restore_shadow` | `table`, `version?` | rewind one shadow's local log |
 | `shutdown` | | reply `{}` then exit |

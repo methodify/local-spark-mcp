@@ -368,6 +368,19 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **0.4.3 (Cobalt sessions request, small items)**: `job_description` on
+  `run_code`/`run_sql` (`_running` sets/clears `setJobDescription`),
+  `status.idle_s`/`last_activity` (`_last_activity` set at cell/query/preload
+  end), shadow entries gain `cloned_at` (first commit timestamp; `_shadow_state`
+  now returns a 3-tuple) and `registered`, `register_lakehouse` /
+  `unregister_lakehouse` (`_register_one(lh, runtime=True)` sets
+  `spark.localspark.lakehouse.<name>` and, for another workspace,
+  `spark.localspark.lakehouse_ws.<name>`, which the jar's `workspaceFor(id)`
+  reads; unregister drops the databases CASCADE and unsets confs; a loaded
+  V2 catalog plugin stays loaded). Contexts (one JVM, one namespace per
+  notebook via `newSession()` + swapping the singleton shell's
+  `user_ns`/`user_module`) and lazy Files are proposed for 0.5.0 / 0.6.0 in
+  the response doc, pending Bryon's go-ahead.
 - **Current catalog (0.4.2, Cobalt's 0.4.1 reply)**: with a V2 catalog current
   (`USE test` on a schema-enabled lakehouse) a two-part `delta.\`path\`` resolves
   as `test.delta.<path>` → `UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY`, and

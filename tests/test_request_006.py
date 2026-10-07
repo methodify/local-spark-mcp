@@ -32,10 +32,10 @@ def _table(tmp_path, commits):
 
 def test_truncate_to_clone_commit_removes_later_commits_and_their_files(tmp_path):
     t = _table(tmp_path, [("CLONE", []), ("WRITE", ["part-1.parquet"]), ("MERGE", ["p/part-2.parquet"])])
-    assert _shadow_state(t) == ("written", 2)
+    assert _shadow_state(t)[:2] == ("written", 2)
     removed = _truncate_delta_log(t, 0)
     assert removed == {"commits": 2, "files": 2}
-    assert _shadow_state(t) == ("read", 0)
+    assert _shadow_state(t)[:2] == ("read", 0)
     assert not (t / "part-1.parquet").exists() and not (t / "p" / "part-2.parquet").exists()
     assert not (t / "_delta_log" / "_last_checkpoint").exists()
     assert not list((t / "_delta_log").glob("*.checkpoint*.parquet"))

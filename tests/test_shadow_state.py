@@ -20,17 +20,17 @@ def _log(table_dir: Path, commits: list[str]):
 
 def test_clone_only_is_read(tmp_path):
     _log(tmp_path / "t", ["CLONE"])
-    assert _shadow_state(tmp_path / "t") == ("read", 0)
+    assert _shadow_state(tmp_path / "t")[:2] == ("read", 0)
 
 
 def test_clone_then_write_is_written(tmp_path):
     _log(tmp_path / "t", ["CLONE", "WRITE"])
-    assert _shadow_state(tmp_path / "t") == ("written", 1)
+    assert _shadow_state(tmp_path / "t")[:2] == ("written", 1)
 
 
 def test_new_table_is_written_at_version_zero(tmp_path):
     _log(tmp_path / "t", ["CREATE TABLE AS SELECT"])
-    assert _shadow_state(tmp_path / "t") == ("written", 0)
+    assert _shadow_state(tmp_path / "t")[:2] == ("written", 0)
 
 
 def test_clone_commit_with_non_ascii_metadata_is_read(tmp_path):
@@ -41,12 +41,12 @@ def test_clone_commit_with_non_ascii_metadata_is_read(tmp_path):
         json.dumps({"commitInfo": {"operation": "CLONE", "userName": "Bryon \u00e9\u2014\u00e5"}}, ensure_ascii=False),
         encoding="utf-8",
     )
-    assert _shadow_state(tmp_path / "t") == ("read", 0)
+    assert _shadow_state(tmp_path / "t")[:2] == ("read", 0)
 
 
 def test_empty_log_is_unknown(tmp_path):
     (tmp_path / "t" / "_delta_log").mkdir(parents=True)
-    assert _shadow_state(tmp_path / "t") == ("unknown", -1)
+    assert _shadow_state(tmp_path / "t")[:2] == ("unknown", -1)
 
 
 def test_format_shadow_shows_state():

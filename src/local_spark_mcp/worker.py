@@ -84,6 +84,10 @@ def _handle(engine, method: str, params: dict):
         info["profile_warnings"] = warnings
         info["control"] = True  # a control socket is served when --control-port was given
         return info, engine
+    if method == "register_lakehouse":
+        return engine.register_lakehouse(params["lakehouse"]), engine
+    if method == "unregister_lakehouse":
+        return engine.unregister_lakehouse(params["name"]), engine
     if method == "list_tables":
         return engine.list_tables(params["lakehouse"]), engine
     if method == "preload":
@@ -97,9 +101,11 @@ def _handle(engine, method: str, params: dict):
     if engine is None:
         raise RuntimeError("engine not initialized; send 'init' first")
     if method == "run_code":
-        return engine.run_code(params["code"], on_output=params.get("_on_output"), capture_result=bool(params.get("capture_result"))).to_dict(), engine
+        return engine.run_code(params["code"], on_output=params.get("_on_output"), capture_result=bool(params.get("capture_result")),
+                               job_description=params.get("job_description")).to_dict(), engine
     if method == "run_sql":
-        return engine.run_sql(params["sql"], params.get("limit"), bool(params.get("arrow"))).to_dict(), engine
+        return engine.run_sql(params["sql"], params.get("limit"), bool(params.get("arrow")),
+                              job_description=params.get("job_description")).to_dict(), engine
     if method == "mount_table":
         return engine.mount_table(params["lakehouse"], params["table"]), engine
     if method == "table_features":

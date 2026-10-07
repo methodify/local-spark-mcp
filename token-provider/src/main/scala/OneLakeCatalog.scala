@@ -74,9 +74,20 @@ class OneLakeCatalog extends DeltaCatalog {
       else lakehouseId(namespace.substring(0, sep)).map(id => (id, namespace.substring(sep + SchemaSep.length)))
     }
 
+  /** The workspace a lakehouse lives in: `spark.localspark.lakehouse_ws.<name>` when
+    * set (a lakehouse registered from another workspace after init), else the
+    * session's workspace. */
+  private def workspaceFor(lakehouseId: String): String = {
+    val all = spark.conf.getAll
+    all.collectFirst {
+      case (k, v) if k.startsWith(LakehousePrefix) && v == lakehouseId =>
+        all.get(WorkspacePrefix + k.substring(LakehousePrefix.length))
+    }.flatten.getOrElse(workspaceId.get)
+  }
+
   private def oneLakePath(lakehouseId: String, table: String, schema: String = ""): String =
-    if (schema.isEmpty) s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$table"
-    else s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$schema/$table"
+    if (schema.isEmpty) s"abfss://${workspaceFor(lakehouseId)}@$host/$lakehouseId/Tables/$table"
+    else s"abfss://${workspaceFor(lakehouseId)}@$host/$lakehouseId/Tables/$schema/$table"
 
   private def isDeltaDir(path: String): Boolean = {
     // Only OneLake paths are cached: each check is a network round trip, and
@@ -103,8 +114,8 @@ class OneLakeCatalog extends DeltaCatalog {
       case Some((at, m)) if now - at < TableListTtlMs => m
       case _ =>
         try {
-          val dir = if (schema.isEmpty) s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables"
-                    else s"abfss://${workspaceId.get}@$host/$lakehouseId/Tables/$schema"
+          val dir = if (schema.isEmpty) s"abfss://${workspaceFor(lakehouseId)}@$host/$lakehouseId/Tables"
+                    else s"abfss://${workspaceFor(lakehouseId)}@$host/$lakehouseId/Tables/$schema"
           val tables = new Path(dir)
           val m = tables.getFileSystem(spark.sessionState.newHadoopConf()).listStatus(tables)
             .filter(_.isDirectory).map(st => st.getPath.getName.toLowerCase -> st.getPath.getName).toMap
@@ -362,6 +373,7 @@ object OneLakeCatalog {
   val DvViewTag = "localspark:deletion-vectors"
   val WorkspaceKey = "spark.localspark.workspace_id"
   val LakehousePrefix = "spark.localspark.lakehouse."
+  val WorkspacePrefix = "spark.localspark.lakehouse_ws."  // optional per-lakehouse workspace (registered after init)
   val WriteModeKey = "spark.localspark.write_mode"
   val ShadowRootKey = "spark.localspark.shadow_root"
   val HostKey = "spark.localspark.onelake_host"

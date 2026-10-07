@@ -133,6 +133,7 @@ class SparkEngine:
         self._preload_thread: threading.Thread | None = None
         self._cell_running = False
         self._cell_started: float | None = None  # for control-socket `status`
+        self._last_activity: float = time.time()  # last cell / query / preload end, for `status.idle_s`
         self._cell_method: str | None = None
         self._cell_gen = 0  # bumps per cell; an interrupt watchdog only acts on the cell it was started for
         self._interrupt_requested = False
@@ -166,14 +167,14 @@ class SparkEngine:
         self.shadow_root.mkdir(parents=True, exist_ok=True)
 
         env = dict(env or {})
-        if onelake and lakehouses:
+        if onelake:  # Fabric mode, even with no lakehouse yet: register_lakehouse can add them later
             from .discovery import LakehouseInfo as _LI
             from .files import FilesMirror
 
             registry = {lh["name"]: _LI(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"]) for lh in lakehouses}
             self.files = FilesMirror(
                 root=Path(mirror_root).expanduser() if mirror_root else self._state_root / "lakehouses",
-                workspace_id=workspace_id, lakehouses=registry, write_mode=write_mode,
+                workspace_id=workspace_id or "", lakehouses=registry, write_mode=write_mode,
                 credential_factory=self.credential,
             )
             if default_lakehouse:
@@ -187,10 +188,10 @@ class SparkEngine:
         self._lakehouse_schemas: dict[str, list[str]] = {}
         self._default_schemas: dict[str, str] = {}
         catalog = None
-        if onelake and lakehouses:
+        if onelake:
             catalog = {
                 "dv_strategy": self.dv_strategy,
-                "workspace_id": workspace_id,
+                "workspace_id": workspace_id or "",  # set by the first register_lakehouse when empty
                 "lakehouses": {lh["name"]: lh["id"] for lh in lakehouses},
                 "write_mode": write_mode,
                 "shadow_root": self.shadow_root.as_posix(),
@@ -408,18 +409,7 @@ class SparkEngine:
         self.lakehouses: dict[str, LakehouseInfo] = {}
         self._mounted: dict[str, set] = {}  # lakehouse name -> mounted table names
         for lh in lakehouses:
-            info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
-            self.lakehouses[info.name] = info
-            self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._fq(info.name)}")
-            # Schema-enabled lakehouse (Tables/<schema>/<table>): the host may say so
-            # ("schemas": [...]); otherwise detected from the OneLake listing. Each
-            # schema becomes a session database `<lakehouse>__<schema>`, and the
-            # lakehouse gets a V2 catalog so `lakehouse.schema.table` works as on Fabric.
-            schemas = lh.get("schemas")
-            if schemas is None and lh.get("detect_schemas", True):
-                schemas = self._detect_schemas(info)
-            if schemas:
-                self._register_schemas(info, list(schemas), lh.get("default_schema") or "dbo")
+            self._register_one(lh)
         if default_lakehouse and self.lakehouses:
             info = self._resolve_lakehouse(default_lakehouse)
             if info is None:
@@ -430,6 +420,84 @@ class SparkEngine:
             # Unqualified names now resolve here, like a Fabric notebook's default lakehouse.
             self.spark.sql(f"USE {self._default_db(info.name)}")
             self.default_lakehouse = info.name
+
+    def _register_one(self, lh: dict, runtime: bool = False):
+        """Register one lakehouse: a session database, schema databases and the
+        schema catalog when it has schemas, and (after init) the catalog confs the
+        session was not started with. The OneLake catalog jar reads
+        `spark.localspark.lakehouse.<name>` from the session conf on every
+        resolution, so a lakehouse added here resolves on first touch like the rest."""
+        from .discovery import LakehouseInfo
+
+        info = LakehouseInfo(name=lh["name"], id=lh["id"], workspace_id=lh["workspace_id"])
+        self.lakehouses[info.name] = info
+        if self.files is not None:
+            self.files.lakehouses[info.name] = info  # the Files mirror resolves /lakehouse/<name> by this registry
+        if runtime and self._onelake:
+            self.spark.conf.set(f"spark.localspark.lakehouse.{info.name}", info.id)
+            session_ws = self.spark.conf.get("spark.localspark.workspace_id", "")
+            if not session_ws:  # a session started with no lakehouses has no workspace yet; the resolver needs one
+                self.spark.conf.set("spark.localspark.workspace_id", info.workspace_id)
+            elif info.workspace_id != session_ws:
+                self.spark.conf.set(f"spark.localspark.lakehouse_ws.{info.name}", info.workspace_id)
+        self.spark.sql(f"CREATE DATABASE IF NOT EXISTS {self._fq(info.name)}")
+        # Schema-enabled lakehouse (Tables/<schema>/<table>): the host may say so
+        # ("schemas": [...]); otherwise detected from the OneLake listing. Each
+        # schema becomes a session database `<lakehouse>__<schema>`, and the
+        # lakehouse gets a V2 catalog so `lakehouse.schema.table` works as on Fabric.
+        schemas = lh.get("schemas")
+        if schemas is None and lh.get("detect_schemas", True) and self._onelake:
+            schemas = self._detect_schemas(info)
+        if schemas:
+            self._register_schemas(info, list(schemas), lh.get("default_schema") or "dbo")
+        return info
+
+    def register_lakehouse(self, entry: dict) -> dict:
+        """Attach a lakehouse after init (same entry shape as `init`'s
+        `lakehouses`): its tables resolve by name from now on, its shadows live
+        under the shared shadow root keyed by lakehouse id."""
+        for key in ("name", "id", "workspace_id"):
+            if not entry.get(key):
+                raise ValueError(f"register_lakehouse: {key!r} is required")
+        existing = self._resolve_lakehouse(entry["name"])
+        if existing is not None and existing.id != entry["id"]:
+            raise ValueError(f"lakehouse {entry['name']!r} is already registered with id {existing.id}; unregister it first")
+        info = self._register_one(entry, runtime=True)
+        return {"name": info.name, "id": info.id, "workspace_id": info.workspace_id,
+                "schemas": self._lakehouse_schemas.get(info.name, []), "lakehouses": sorted(self.lakehouses)}
+
+    def unregister_lakehouse(self, name: str) -> dict:
+        """Detach a lakehouse: names stop resolving to OneLake, and its database is
+        dropped from the session catalog when it holds nothing but shadows (the
+        shadow files stay; re-registering re-links them). A schema catalog plugin
+        already loaded by Spark stays loaded until the runtime restarts, but
+        resolves nothing once the lakehouse conf is gone."""
+        info = self._resolve_lakehouse(name)
+        if info is None:
+            raise ValueError(f"unknown lakehouse {name!r}; known: {sorted(self.lakehouses)}")
+        dropped = []
+        for db in [info.name] + [f"{info.name}__{sc}" for sc in self._lakehouse_schemas.get(info.name, [])]:
+            try:
+                self.spark.sql(f"DROP DATABASE IF EXISTS {self._fq(db)} CASCADE")
+                dropped.append(db)
+            except Exception as exc:
+                print(f"local-spark: could not drop database {db}: {exc}", file=sys.stderr)
+        for key in (f"spark.localspark.lakehouse.{info.name}", f"spark.localspark.lakehouse_ws.{info.name}",
+                    f"spark.sql.catalog.{info.name}", f"spark.sql.catalog.{info.name}.lakehouse",
+                    f"spark.sql.catalog.{info.name}.default_schema"):
+            try:
+                self.spark.conf.unset(key)
+            except Exception:
+                pass
+        self.lakehouses.pop(info.name, None)
+        if self.files is not None:
+            self.files.lakehouses.pop(info.name, None)
+        self._lakehouse_schemas.pop(info.name, None)
+        self._default_schemas.pop(info.name, None)
+        self._mounted.pop(info.name, None)
+        if self.default_lakehouse == info.name:
+            self.default_lakehouse = None
+        return {"name": info.name, "dropped_databases": dropped, "lakehouses": sorted(self.lakehouses)}
 
     def _detect_schemas(self, info) -> list[str]:
         """Schema folders under Tables/ (directories that are not Delta tables but
@@ -641,6 +709,7 @@ class SparkEngine:
             st["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             st["finished_at"] = time.time()
+            self._last_activity = st["finished_at"]
             secs = st["finished_at"] - (st["started_at"] or st["finished_at"])
             done = st["tables_done"] - st["tables_failed"]
             if done:  # failures are reported by preload_status and stderr, never as a notice on an unrelated cell
@@ -694,10 +763,12 @@ class SparkEngine:
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(tables) or 1))) as pool:
             return {"tables": dict(pool.map(one, tables)), "dv_strategy": self.dv_strategy}
 
-    def _running(self, method: str):
+    def _running(self, method: str, job_description: str | None = None):
         """Context for one interruptible unit of work (a cell, a query): marks the
         engine busy for `interrupt` / `status`, bumps the cell generation the
-        interrupt watchdog is bound to, and consumes a leftover interrupt at the end."""
+        interrupt watchdog is bound to, names the Spark jobs it starts
+        (`job_description`, shown in `status.cell.jobs` and the Spark UI), and
+        consumes a leftover interrupt at the end."""
         engine = self
 
         class _Running:
@@ -707,19 +778,31 @@ class SparkEngine:
                 engine._cell_method = method
                 engine._cell_started = time.time()
                 engine._cell_running = True
+                if job_description:
+                    try:
+                        engine.spark.sparkContext.setJobDescription(job_description[:200])
+                    except Exception:
+                        pass
 
             def __exit__(self_, *exc):
                 engine._cell_running = False
                 engine._cell_started = None
                 engine._cell_method = None
+                engine._last_activity = time.time()
                 if engine._interrupt_requested:
                     engine._drain_pending_interrupt()
                     engine.jvm_alive(retries=12, delay=0.25)  # re-establish this thread's JVM connection (see jvm_alive)
+                if job_description:
+                    try:
+                        engine.spark.sparkContext.setJobDescription(None)
+                    except Exception:
+                        pass
                 return False
 
         return _Running()
 
-    def _exec(self, code: str, on_output=None, capture_result: bool = False) -> tuple[ExecResult, BaseException | None]:
+    def _exec(self, code: str, on_output=None, capture_result: bool = False,
+              job_description: str | None = None) -> tuple[ExecResult, BaseException | None]:
         """Run a cell; also return the raised exception (the runner needs to
         recognize NotebookExit, which IPython otherwise reports as an error).
         ``capture_result``: a Spark or pandas DataFrame that is the cell's last
@@ -727,7 +810,7 @@ class SparkEngine:
         from IPython.utils.capture import capture_output
 
         self._displays, self._blobs = [], []
-        with self._running("run_code"):
+        with self._running("run_code", job_description):
             if on_output is None:
                 with capture_output() as cap:
                     result = self.shell.run_cell(code, store_history=True)
@@ -813,11 +896,13 @@ class SparkEngine:
                 return text.rstrip("\n") + "\n\nlocal-spark: " + self.dv_refusal(t)
         return text
 
-    def run_code(self, code: str, on_output=None, capture_result: bool = False) -> ExecResult:
+    def run_code(self, code: str, on_output=None, capture_result: bool = False,
+                 job_description: str | None = None) -> ExecResult:
         """Run a cell of Python against the persistent namespace. ``on_output``
         (stream, text) receives stdout/stderr as the cell writes them;
-        ``capture_result`` attaches a bare trailing DataFrame as a display."""
-        res = self._exec(code, on_output=on_output, capture_result=capture_result)[0]
+        ``capture_result`` attaches a bare trailing DataFrame as a display;
+        ``job_description`` names the cell's Spark jobs."""
+        res = self._exec(code, on_output=on_output, capture_result=capture_result, job_description=job_description)[0]
         res.notices.extend(self.drain_mount_notices())
         self.blobs_out = list(self._blobs)
         return res
@@ -863,8 +948,11 @@ class SparkEngine:
         """For the control socket: what is running and for how long. Spark's active
         job count comes from this thread's own JVM connection, so it works while
         the cell's thread is blocked in a Spark call."""
+        preload_running = self.preload_state.get("state") == "running"
         out: dict = {"initialized": True, "cell_running": self._cell_running, "cell": None,
-                     "preload": self.preload_state.get("state", "idle")}
+                     "preload": self.preload_state.get("state", "idle"),
+                     "idle_s": None if (self._cell_running or preload_running) else round(time.time() - self._last_activity, 1),
+                     "last_activity": self._last_activity}
         if self._cell_running:
             cell: dict = {"method": self._cell_method, "elapsed_s": round(time.time() - (self._cell_started or time.time()), 1),
                           "interrupt_requested": self._interrupt_requested, "active_jobs": None}
@@ -1333,7 +1421,8 @@ class SparkEngine:
                 if not self._automount_missing(exc):
                     raise
 
-    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False) -> SqlResult:
+    def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False,
+                job_description: str | None = None) -> SqlResult:
         """Run a SQL statement and return up to ``limit`` rows (as JSON rows, or
         as an Arrow IPC stream in ``blobs_out`` when ``arrow`` is set)."""
         if limit is None:
@@ -1342,7 +1431,7 @@ class SparkEngine:
         if self.write_mode != "writethrough" and (target := _sql_write_target(sql)):
             if dv := self.is_dv_table(target):
                 raise RuntimeError(self.dv_refusal(dv))
-        with self._running("run_sql"):
+        with self._running("run_sql", job_description):
             try:
                 try:
                     df = self._sql_with_automount(sql)
@@ -1428,12 +1517,20 @@ class SparkEngine:
         found: list[dict] = []
         if not self.shadow_root.is_dir():
             return found
+        listed: dict[str, set[str]] = {}
+
+        def registered(db: str, table: str) -> bool:
+            # tables this session's catalog holds now; OneLakeCatalog.tableExists would
+            # say yes to anything resolvable in OneLake, which is not the question
+            if db not in listed:
+                listed[db] = set(_safe(lambda: [t.name.lower() for t in self.spark.catalog.listTables(f"spark_catalog.{self._q(db)}")], []))
+            return table.lower() in listed[db]
         for lh_dir in sorted(self.shadow_root.iterdir()):
             if not lh_dir.is_dir():
                 continue
             for table_dir in sorted(lh_dir.iterdir()):
                 if (table_dir / "_delta_log").is_dir():
-                    state, version = _shadow_state(table_dir)
+                    state, version, cloned_at = _shadow_state(table_dir)
                     lh_name = id_to_name.get(lh_dir.name, lh_dir.name)
                     # a schema table's shadow dir is "<schema>.<table>" -> lakehouse "<lh>__<schema>"
                     if "." in table_dir.name:
@@ -1447,6 +1544,10 @@ class SparkEngine:
                         "path": table_dir.as_posix(),
                         "state": state,
                         "version": version,
+                        "cloned_at": cloned_at,
+                        # a persisted clone from an earlier session is listed before it is touched;
+                        # `registered` says whether this session's catalog knows it yet
+                        "registered": registered(lh_name, table_name),
                     })
         return found
 
@@ -1523,7 +1624,7 @@ class SparkEngine:
             self.spark.catalog.refreshTable(self._fq(shadow["lakehouse"], shadow["table"]))
         except Exception:
             pass
-        state, latest = _shadow_state(Path(shadow["path"]))
+        state, latest, _cloned = _shadow_state(Path(shadow["path"]))
         return {"lakehouse": shadow["lakehouse"], "table": shadow["table"], "restored_to": version,
                 "removed_commits": removed["commits"], "removed_files": removed["files"], "state": state, "version": latest}
 
@@ -1739,26 +1840,35 @@ def _truncate_delta_log(table_dir: Path, version: int) -> dict:
     return {"commits": removed_commits, "files": removed_files}
 
 
-def _shadow_state(table_dir: Path) -> tuple[str, int]:
-    """("read" | "written", latest version). A shadow that is still the initial
-    shallow-clone commit (operation CLONE at its first version) was only read;
-    any later commit, or a first commit that is not a clone, means local writes."""
+def _shadow_state(table_dir: Path) -> tuple[str, int, str | None]:
+    """("read" | "written", latest version, first commit time as ISO-8601 UTC). A
+    shadow that is still the initial shallow-clone commit (operation CLONE at its
+    first version) was only read; any later commit, or a first commit that is not
+    a clone, means local writes. The time is the clone's commitInfo timestamp
+    (the file's mtime when absent), so a host can show "cloned at <time>"."""
     log = table_dir / "_delta_log"
     versions = sorted(int(p.stem) for p in log.glob("*.json") if p.stem.isdigit())
     if not versions:
-        return "unknown", -1
-    op = None
+        return "unknown", -1, None
+    op, ts = None, None
+    first = log / f"{versions[0]:020d}.json"
     try:
         # explicit UTF-8: Windows' default codec (cp1252) fails on Delta's non-ASCII commit metadata
-        for line in (log / f"{versions[0]:020d}.json").read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in first.read_text(encoding="utf-8", errors="replace").splitlines():
             if '"commitInfo"' in line:
-                op = json.loads(line).get("commitInfo", {}).get("operation")
+                ci = json.loads(line).get("commitInfo", {})
+                op, ts = ci.get("operation"), ci.get("timestamp")
                 break
     except (OSError, ValueError):
         pass
+    try:
+        seconds = ts / 1000 if isinstance(ts, (int, float)) else first.stat().st_mtime
+        cloned_at = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat(timespec="seconds")
+    except (OSError, ValueError, OverflowError):
+        cloned_at = None
     if op == "CLONE" and len(versions) == 1:
-        return "read", versions[0]
-    return "written", versions[-1]
+        return "read", versions[0], cloned_at
+    return "written", versions[-1], cloned_at
 
 
 def _sql_preview(res: "SqlResult", max_rows: int = 20) -> str:
