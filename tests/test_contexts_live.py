@@ -34,8 +34,10 @@ def test_contexts_against_onelake(tmp_path):
     eng = SparkEngine(driver_memory="4g", onelake={"endpoint": srv.url, "secret": srv.secret, "jar_path": default_jar_path()},
                       lakehouses=entries, write_mode="sandbox", state_root=str(tmp_path / "state"))
     try:
-        a = eng.create_context("nb-a", default_lakehouse=LH)            # current db: customer__dbo (default schema)
-        assert a["current_database"] == f"{LH}__dbo" and a["default_schema"] == "dbo"
+        a = eng.create_context("nb-a", default_lakehouse=LH)            # current catalog: customer, namespace dbo (default schema)
+        assert a["current_catalog"] == LH and a["current_database"] == "dbo" and a["default_schema"] == "dbo"
+        # with the lakehouse catalog current, the two-part lakehouse spelling still reaches the plain tables
+        assert eng.run_sql(f"SELECT COUNT(*) AS n FROM {LH}.{TABLE}", context="nb-a").rows[0][0] > 0
         b = eng.create_context("nb-b")                                  # no default lakehouse
         assert b["current_database"] == "default"
         # the schema catalog conf reached the new sessions
@@ -54,7 +56,7 @@ def test_contexts_against_onelake(tmp_path):
         assert eng.run_code(f"print(spark.conf.get('spark.localspark.lakehouse.{other.name}'))", context="nb-a").stdout.strip() == other.id
         # a run_notebook-style USE in one context does not move the other
         eng.run_sql(f"USE spark_catalog.{other.name}", context="nb-b")
-        assert eng.run_sql("SELECT current_database()", context="nb-a").rows == [[f"{LH}__dbo"]]
+        assert eng.run_sql("SELECT current_catalog(), current_database()", context="nb-a").rows == [[LH, "dbo"]]
         assert eng.info()["active_context"] == "nb-a"
         eng.drop_context("nb-b")
         assert [c["id"] for c in eng.info()["contexts"]] == ["default", "nb-a"]

@@ -1,3 +1,14 @@
+A schema-enabled default lakehouse is the session's **current catalog** (`USE
+<lakehouse>`, at its default schema), as on Fabric, so `t`, `dbo.t`, and
+`<lakehouse>.dbo.t` all resolve. The catalog passes two kinds of name through to
+the session catalog untranslated: Delta path identifiers (`delta.\`/abs/path\``)
+and a one-part namespace that is not one of its schemas but is a session
+database (another lakehouse, so `customer.sources_name` keeps working while
+`test` is current). Everything the worker runs on its own behalf
+(materialization in the catalog jar, mounts, shadow management, the notebook
+runner's `USE`) is `spark_catalog.`-qualified, so it works whatever is current.
+A plain default lakehouse is `USE spark_catalog.<lakehouse>` as before.
+
 # Worker protocol
 
 The MCP server runs a worker subprocess that holds the SparkSession and the

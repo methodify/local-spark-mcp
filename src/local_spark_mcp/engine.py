@@ -419,7 +419,7 @@ class SparkEngine:
                 if default_schema not in self._lakehouse_schemas.get(info.name, []):
                     raise ValueError(f"lakehouse {info.name!r} has no schema {default_schema!r}; "
                                      f"known: {self._lakehouse_schemas.get(info.name, [])}")
-                db = self._fq(f"{info.name}__{default_schema}")
+                db = self._default_db(info.name, default_schema)
             else:
                 db = self._default_db(info.name)
             sess.sql(f"USE {db}")
@@ -699,17 +699,19 @@ class SparkEngine:
             return []
         return sorted({e.split("/", 1)[0] for e in entries if "/" in e})
 
-    def _default_db(self, lakehouse: str) -> str:
-        """The session database unqualified names should resolve against for this
-        lakehouse: its default schema's database when it has schemas (Fabric
-        resolves `t` to `<lakehouse>.dbo.t`), else the lakehouse database. Always
-        `spark_catalog.`-qualified: `USE <lakehouse>` would make the V2 catalog
-        current, and then two-part names and `delta.\`path\`` stop resolving."""
+    def _default_db(self, lakehouse: str, schema: str | None = None) -> str:
+        """What to `USE` for this default lakehouse. A schema-enabled lakehouse: its
+        catalog (`USE <lakehouse>`, or `<lakehouse>.<schema>`), so the session's
+        current catalog is the lakehouse as on Fabric and `t`, `dbo.t`, and
+        `<lh>.dbo.t` all resolve; the catalog passes `delta.\`path\`` and other
+        lakehouses' two-part names through to the session catalog, and engine
+        internals are `spark_catalog.`-qualified, so nothing else moves. A plain
+        lakehouse: its session database, `spark_catalog.`-qualified."""
         schemas = self._lakehouse_schemas.get(lakehouse)
         if schemas:
-            default = self._default_schemas.get(lakehouse, "dbo")
-            if default in schemas:
-                return self._fq(f"{lakehouse}__{default}")
+            if schema:
+                return f"{self._q(lakehouse)}.{self._q(schema)}"
+            return self._q(lakehouse)
         return self._fq(lakehouse)
 
     def _register_schemas(self, info, schemas: list[str], default_schema: str) -> None:

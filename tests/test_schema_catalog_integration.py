@@ -60,9 +60,20 @@ def test_schema_catalog_delegates_to_session_databases():
         # target and the source with spark_catalog, which resolves whatever is current.
         src = spark.sql("DESCRIBE DETAIL spark_catalog.lh__dbo.holidays").first()["location"]
         assert spark.sql("SELECT current_catalog()").first()[0] == "lh"
-        with pytest.raises(Exception, match="UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY|TABLE_OR_VIEW_NOT_FOUND"):
-            spark.sql(f"SELECT COUNT(*) FROM delta.`{src}`").collect()
+        # 0.6.6: the catalog passes a Delta path identifier through, so the plain form works while lh is current
+        assert spark.sql(f"SELECT COUNT(*) FROM delta.`{src}`").first()[0] == 3
+        assert spark.read.format("delta").load(src).count() == 3
         assert spark.sql(f"SELECT COUNT(*) FROM spark_catalog.delta.`{src}`").first()[0] == 3
+        # Fabric's spelling with the lakehouse current: schema.table, and the bare name
+        assert spark.table("dbo.holidays").count() == 3 and spark.sql("SELECT COUNT(*) FROM dbo.holidays").first()[0] == 3
+        assert [r.tableName for r in spark.sql("SHOW TABLES IN dbo").collect()] == ["holidays"]
+        # another session database (another lakehouse) keeps its two-part spelling while lh is current
+        spark.sql("CREATE DATABASE spark_catalog.other_lh")
+        spark.range(9).write.saveAsTable("spark_catalog.other_lh.t9")
+        assert spark.table("other_lh.t9").count() == 9 and spark.sql("SELECT COUNT(*) FROM other_lh.t9").first()[0] == 9
+        assert spark.catalog.tableExists("other_lh.t9")
+        with pytest.raises(Exception, match="TABLE_OR_VIEW_NOT_FOUND|cannot be found"):
+            spark.table("nowhere.t").count()
         clone = (eng._session_dir / "clone_holidays").as_posix()
         spark.sql(f"CREATE TABLE spark_catalog.`lh__dbo`.`holidays_clone` SHALLOW CLONE spark_catalog.delta.`{src}` LOCATION '{clone}'")
         assert spark.table("lh.dbo.holidays_clone").count() == 3

@@ -371,6 +371,16 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **`dbo.table` against a schema-enabled default (0.6.6, Cobalt)**: a
+  schema-enabled default lakehouse is the session's current catalog again
+  (`_default_db` → `USE <lh>` / `<lh>.<schema>`; the 0.4.2 retreat to
+  `spark_catalog.<lh>__dbo` is reversed now that internals are qualified).
+  `OneLakeSchemaCatalog.db([s])` → `lh__s` if that database exists, else `s`
+  if it is a session database (another lakehouse passes through), else
+  `lh__s`; `translate` leaves `delta.\`/abs/path\`` (any one-part namespace
+  with an absolute-path name) untouched so the session catalog loads the path
+  table. Tests: `test_schema_catalog_integration` (delta path, `dbo.t`,
+  `other_lh.t` with `lh` current), `test_contexts_live`, `test_schema_catalog_live`.
 - **`run_notebook(isolated=True)` (0.6.5, plugin team)**: creates a
   throwaway context (`nb-isolated-<hex>`), recurses with `context=`, drops it
   in `finally`; MCP tool param `isolated`. The default stays the shared

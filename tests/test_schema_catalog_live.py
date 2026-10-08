@@ -40,8 +40,8 @@ def test_materialization_with_a_v2_catalog_current(tmp_path):
         spark = eng.spark
         info = eng.info()
         assert info["lakehouse_schemas"] == {LH: ["dbo"]}
-        # the default lakehouse selects its default schema's database, in spark_catalog
-        assert info["current_catalog"] == "spark_catalog" and info["current_database"] == f"{LH}__dbo"
+        # the default lakehouse's catalog is current, at its default schema (as on Fabric)
+        assert info["current_catalog"] == LH and info["current_database"] == "dbo"
         assert spark.conf.get(f"spark.sql.catalog.{LH}") == "ch.fs.OneLakeSchemaCatalog"
         top = [t for t in eng.list_tables(LH) if "/" not in t and t != TABLE]
         assert len(top) >= 3, top

@@ -40,13 +40,28 @@ class OneLakeSchemaCatalog extends TableCatalog with StagingTableCatalog with Su
   private def session: TableCatalog with StagingTableCatalog with SupportsNamespaces =
     spark.sessionState.catalogManager.catalog("spark_catalog").asInstanceOf[TableCatalog with StagingTableCatalog with SupportsNamespaces]
 
-  /** [dbo] -> test__dbo ; [] -> test */
+  /** [dbo] -> test__dbo ; [] -> test. A one-part namespace that is not one of this
+    * lakehouse's schemas but is a session database (another lakehouse, or any
+    * database) passes through unchanged, so `customer.sources_name` keeps working
+    * while this catalog is current (Fabric resolves `x.y` against the current
+    * lakehouse first; here the fallback keeps two-part lakehouse names alive). */
   private def db(ns: Array[String]): String = ns match {
     case Array() => lakehouse
-    case Array(schema) => s"$lakehouse${OneLakeCatalog.SchemaSep}$schema"
+    case Array(schema) =>
+      val schemaDb = s"$lakehouse${OneLakeCatalog.SchemaSep}$schema"
+      if (session.namespaceExists(Array(schemaDb))) schemaDb
+      else if (session.namespaceExists(Array(schema))) schema
+      else schemaDb
     case other => throw new NoSuchNamespaceException(other)
   }
-  private def translate(ident: Identifier): Identifier = Identifier.of(Array(db(ident.namespace())), ident.name())
+  /** delta.`/abs/path` (and any `<source>.`<absolute path>``): a path table the
+    * session catalog knows how to load; hand it over untranslated so the form keeps
+    * working while this catalog is current. */
+  private def isPathIdent(ident: Identifier): Boolean =
+    ident.namespace().length == 1 && ident.name().contains("/") &&
+      scala.util.Try(new org.apache.hadoop.fs.Path(ident.name()).isAbsolute).getOrElse(false)
+  private def translate(ident: Identifier): Identifier =
+    if (isPathIdent(ident)) ident else Identifier.of(Array(db(ident.namespace())), ident.name())
   private def back(ident: Identifier): Identifier = {
     val d = ident.namespace().headOption.getOrElse("")
     val prefix = lakehouse + OneLakeCatalog.SchemaSep
