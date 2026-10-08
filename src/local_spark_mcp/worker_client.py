@@ -276,10 +276,12 @@ class WorkerProcess:
 
     def run_notebook(self, path: str, cells=None, stop_on_error: bool = True,
                      default_lakehouse: str | None = None, parameters: dict | None = None,
-                     context: str | None = None) -> dict:
+                     context: str | None = None, isolated: bool = False) -> dict:
+        """``isolated=True`` runs in a throwaway context (own namespace + session), dropped after."""
         return self._call("run_notebook", {
             "path": path, "cells": cells, "stop_on_error": stop_on_error,
             "default_lakehouse": default_lakehouse, "parameters": parameters, "context": context,
+            "isolated": isolated,
         })
 
     def sync_files(self, paths=None, direction: str = "pull", lakehouse: str | None = None) -> dict:

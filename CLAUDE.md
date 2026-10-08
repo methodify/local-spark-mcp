@@ -371,6 +371,10 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **`run_notebook(isolated=True)` (0.6.5, plugin team)**: creates a
+  throwaway context (`nb-isolated-<hex>`), recurses with `context=`, drops it
+  in `finally`; MCP tool param `isolated`. The default stays the shared
+  namespace so the agent can inspect a notebook's variables afterwards.
 - **Shadow root URI (0.6.3)**: never hand Hadoop a `Path.as_uri()` string —
   it percent-encodes, Hadoop's `Path(String)` treats the string as raw, and a
   state path with a space put every clone in a sibling `App%20Data` directory

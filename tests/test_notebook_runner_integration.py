@@ -111,3 +111,27 @@ def test_unknown_member_and_missing_notebook(env):
     assert not r.ok and "not available locally" in r.error
     with pytest.raises(FileNotFoundError):
         eng.run_notebook("No Such Notebook")
+
+
+def test_isolated_run_leaves_the_session_untouched(env):
+    eng, main = env
+    root = main.parent.parent
+    write_nb(root, "iso-folder", "Isolated", (
+        cell("zz = 5\nspark.range(2).createOrReplaceTempView('tv_iso')\nspark.conf.set('spark.sql.shuffle.partitions', '3')\n"
+             "spark.sql('CREATE DATABASE IF NOT EXISTS iso_db')\nspark.sql('USE iso_db')\nprint('inside', zz, spark.catalog.currentDatabase())")
+    ))
+    before = eng.spark.catalog.currentDatabase()
+    res = eng.run_notebook("Isolated", isolated=True)
+    assert res["status"] == "ok" and res["isolated"] is True and res["context"].startswith("nb-isolated-"), res
+    assert "inside 5 iso_db" in res["cells"][0]["stdout"]
+    # nothing leaked into the default context
+    assert not eng.run_code("print(zz)").ok
+    assert not eng.spark.catalog.tableExists("tv_iso")
+    assert eng.spark.catalog.currentDatabase() == before
+    assert eng.spark.conf.get("spark.sql.shuffle.partitions") != "3"
+    assert [c["id"] for c in eng.info()["contexts"]] == ["default"]  # the throwaway context is gone
+    # the shared database it created is visible (databases are session-wide), and a shared run still works
+    assert eng.spark.catalog.databaseExists("iso_db")
+    assert eng.run_notebook("Isolated")["status"] == "ok" and eng.run_code("print(zz)").stdout.strip() == "5"
+    eng.spark.sql(f"USE {before}")
+

@@ -559,6 +559,8 @@ def format_sync(res: dict) -> str:
 
 def format_notebook_result(res: dict, *, max_stdout: int = 1500) -> str:
     lines = [f"notebook: {res.get('path')}", f"status: {res.get('status')}"]
+    if res.get("isolated"):
+        lines.append("isolated: ran in its own namespace and Spark session (dropped after); the session's state is untouched")
     if res.get("default_lakehouse"):
         lines.append(f"default lakehouse: {res['default_lakehouse']}")
     if res.get("exit_value") is not None:
@@ -755,10 +757,11 @@ def build_server(state: ServerState | None = None) -> FastMCP:
         stop_on_error: bool = True,
         default_lakehouse: str | None = None,
         parameters: dict | None = None,
+        isolated: bool = False,
     ) -> str:
-        """Run a Fabric notebook from its Git .py source (notebook-content.py) cell by cell in this session's persistent namespace. `path` is a file, a `<name>.Notebook/` folder, a path under the configured notebooks root, or a Fabric display name. Markdown is skipped; `%%sql` cells run as Spark SQL; `%pip`/`!pip`/`%run` lines are reported, not run (install libraries via `uvx --with`). `cells` selects by index or range ("3", "0-4,7") for partial reruns. `parameters` override the PARAMETERS CELL like a pipeline run. The notebook's own default lakehouse (from its metadata) is used unless `default_lakehouse` overrides it. `notebookutils` / `mssparkutils` are available to cells."""
+        """Run a Fabric notebook from its Git .py source (notebook-content.py) cell by cell in this session's persistent namespace. `path` is a file, a `<name>.Notebook/` folder, a path under the configured notebooks root, or a Fabric display name. Markdown is skipped; `%%sql` cells run as Spark SQL; `%pip`/`!pip`/`%run` lines are reported, not run (install libraries via `uvx --with`). `cells` selects by index or range ("3", "0-4,7") for partial reruns. `parameters` override the PARAMETERS CELL like a pipeline run. The notebook's own default lakehouse (from its metadata) is used unless `default_lakehouse` overrides it. `notebookutils` / `mssparkutils` are available to cells. `isolated=True` runs the notebook in a throwaway namespace and Spark session, dropped afterwards: nothing it defines (variables, temp views, SQL conf, current database) touches this session, and its variables are not inspectable after; use it for smoke runs and for comparing two notebooks in one session."""
         res = await state.call(
-            "run_notebook", path, cells, stop_on_error, default_lakehouse, parameters,
+            "run_notebook", path, cells, stop_on_error, default_lakehouse, parameters, None, isolated,
             on_wait=_pinger(ctx, "running notebook"),
         )
         return state.with_notices(format_notebook_result(res))

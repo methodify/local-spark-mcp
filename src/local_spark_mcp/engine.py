@@ -1412,10 +1412,29 @@ class SparkEngine:
         default_lakehouse: str | None = None,
         parameters: dict | None = None,
         context: str | None = None,
+        isolated: bool = False,
     ) -> dict:
-        """Run a Fabric notebook (Git .py format) cell by cell in a context's namespace."""
+        """Run a Fabric notebook (Git .py format) cell by cell in a context's namespace.
+        ``isolated`` runs it in a throwaway context (own namespace and Spark session,
+        dropped afterwards), so the run cannot disturb the caller's variables, temp
+        views, SQL conf, or current database; its variables are not visible after."""
         from .notebook import load_notebook, select_cells, strip_line_magics
         from .notebookutils_shim import NotebookExit
+
+        if isolated:
+            import uuid
+
+            if context is not None:
+                raise ValueError("run_notebook: an isolated run creates its own context; do not pass `context`")
+            cid = f"nb-isolated-{uuid.uuid4().hex[:8]}"
+            self.create_context(cid, name=f"isolated run: {path}")
+            try:
+                res = self.run_notebook(path, cells, stop_on_error, default_lakehouse, parameters, context=cid)
+            finally:
+                _safe(lambda: self.drop_context(cid))
+            res["isolated"] = True
+            res["context"] = cid
+            return res
 
         nb_path = self._resolve_notebook_path(path)
         nb = load_notebook(nb_path)

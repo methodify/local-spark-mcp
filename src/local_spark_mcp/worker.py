@@ -125,6 +125,7 @@ def _handle(engine, method: str, params: dict):
             default_lakehouse=params.get("default_lakehouse"),
             parameters=params.get("parameters"),
             context=params.get("context"),
+            isolated=bool(params.get("isolated")),
         ), engine
     if method == "mirror_status":
         return engine.mirror_status(), engine

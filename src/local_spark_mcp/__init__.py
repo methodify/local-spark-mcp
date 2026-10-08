@@ -1,3 +1,3 @@
 """local-spark-mcp: a stateful local Spark session exposed as an MCP server."""
 
-__version__ = "0.6.4"  # keep in step with pyproject.toml (tests check)
+__version__ = "0.6.5"  # keep in step with pyproject.toml (tests check)
