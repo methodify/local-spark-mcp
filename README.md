@@ -287,11 +287,13 @@ origin of `java_home` / `token_jar_path` / `hadoop_home`; a value that fails
 validation is reported with its origin, and the jar is checked for the classes
 this version needs before Spark starts.
 
-Java discovery, when `java_home` is not set: a vfox-managed JDK 17/11, then
-`JAVA_HOME`, then `java` on `PATH`. Every candidate is resolved through
-symlinks and junctions, a path to `bin/java` is normalized to its home, and a
-JDK whose `release` file says anything other than 8, 11, or 17 is skipped. The
-error lists each candidate and why it was rejected.
+Java discovery, when `java_home` is not set: a vfox-managed JDK in the
+profile's preferred order (17, then 11, then 8 for `fabric-1.3`; 21, then 17 for
+`fabric-2.0`), then `JAVA_HOME`, then `java` on `PATH`. Every candidate is
+resolved through symlinks and junctions, a path to `bin/java` is normalized to
+its home, and a JDK whose `release` file names a major the profile does not
+accept (8, 11, or 17 for `fabric-1.3`; 17 or 21 for `fabric-2.0`) is skipped.
+The error lists each candidate and why it was rejected.
 
 ## License
 
