@@ -475,11 +475,22 @@ def format_sql_result(res: dict) -> str:
     return prefix + _format_sql_body(res)
 
 
+def _metrics_line(res: dict) -> str:
+    m = res.get("metrics") or {}
+    if not m or "affected_rows" not in m:
+        return ""
+    parts = [f"{m['affected_rows']:,} row(s) affected"]
+    detail = ", ".join(f"{m[k]:,} {k}" for k in ("inserted", "updated", "deleted") if k in m and m[k])
+    if detail and len([k for k in ("inserted", "updated", "deleted") if k in m]) > 1:
+        parts.append(f"({detail})")
+    return " ".join(parts)
+
+
 def _format_sql_body(res: dict) -> str:
     columns = res.get("columns") or []
     rows = res.get("rows") or []
     if not columns:
-        return "(statement executed — no result set)"
+        return _metrics_line(res) or "(statement executed — no result set)"
 
     str_rows = [[_cell(v) for v in row] for row in rows]
     widths = [len(c) for c in columns]

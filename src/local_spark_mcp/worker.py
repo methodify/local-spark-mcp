@@ -110,7 +110,8 @@ def _handle(engine, method: str, params: dict):
                                job_description=params.get("job_description"), context=params.get("context")).to_dict(), engine
     if method == "run_sql":
         return engine.run_sql(params["sql"], params.get("limit"), bool(params.get("arrow")),
-                              job_description=params.get("job_description"), context=params.get("context")).to_dict(), engine
+                              job_description=params.get("job_description"), context=params.get("context"),
+                              batch_rows=params.get("batch_rows"), on_batch=params.get("_on_batch")).to_dict(), engine
     if method == "mount_table":
         return engine.mount_table(params["lakehouse"], params["table"]), engine
     if method == "table_features":
@@ -209,10 +210,15 @@ def run_worker(port: int, control_port: int | None = None) -> int:
                 send_msg(sock, {"id": rid, "ok": True, "result": {}})
                 break
 
-            if params.pop("stream", False) and method == "run_code":
+            stream = params.pop("stream", False)
+            if stream and method == "run_code":
                 def _on_output(stream, text, _rid=rid):
                     send_msg(sock, {"id": _rid, "event": stream, "text": text})
                 params["_on_output"] = _on_output
+            if method == "run_sql" and (stream or params.get("batch_rows")):
+                def _on_batch(meta, blob, _rid=rid):  # one Arrow IPC stream per event frame
+                    send_reply(sock, {"id": _rid, "event": "batch", **meta}, [blob])
+                params["_on_batch"] = _on_batch
             try:
                 result, engine = _handle(engine, method, params)
                 shared.engine = engine

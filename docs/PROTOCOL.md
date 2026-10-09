@@ -76,7 +76,7 @@ one. The MCP server does exactly that and reports it on the next result.
 | `init` | `SparkEngine` keyword arguments (below) plus `profile?` | The `info` dict plus `profile_warnings`. Runs `check_profile` first and fails with its message when the installed stack cannot serve the declared profile or would crash its Python workers on this platform. |
 | `ping` | | `{}` |
 | `run_code` | `code`, `stream?`, `capture_result?`, `job_description?`, `context?` | `ExecResult`: `ok`, `stdout`, `stderr`, `error`, `traceback`, `execution_count`, `notices`, `interrupted`, `displays` (one `{kind: "arrow", source, columns, row_count, truncated, limit, arrow_bytes}` per `display(df)` (`source: "display"`) and, with `capture_result: true`, for a Spark or pandas DataFrame that is the cell's last expression (`source: "result"`, same row cap; stdout still carries the repr); blobs in the same order) |
-| `run_sql` | `sql`, `limit?`, `arrow?`, `job_description?`, `context?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`; with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following |
+| `run_sql` | `sql`, `limit?`, `arrow?`, `job_description?`, `context?`, `stream?` / `batch_rows?` | `SqlResult`: `columns`, `rows`, `row_count`, `truncated`, `limit`, `notices`, `elapsed_s`, `metrics` (DML, see **Commit metrics**); with `arrow: true`, `rows` is empty and `arrow` = `{arrow_bytes, row_count, truncated, limit, columns}` with one blob following; with `stream: true` (or `batch_rows`), the result streams as `{"id", "event": "batch", "rows", "batch", "partition", "arrow_bytes", "binary": [n]}` frames each followed by one self-contained Arrow IPC stream (schema + one batch of about `batch_rows` rows), partition by partition in query order, and the reply carries `row_count`, `batches`, `elapsed_s`, `arrow.streamed: true` and no rows; no `limit` applies unless one is passed; interruptible on the control socket |
 | `run_notebook` | `path`, `cells?`, `stop_on_error?`, `default_lakehouse?`, `parameters?`, `context?`, `isolated?` (a throwaway context for this run, dropped after; result carries `isolated: true` and the context id) | per-cell results (see `engine.run_notebook`) |
 | `info` | | session snapshot: versions, databases, lakehouses, write mode, shadows, profile, `java_home`, `python`, `hadoop_home`, `ivy_dir`, `preload`, `started_at`, `protocol_version`, … |
 | `mount_table` | `lakehouse`, `table` (`t` or `schema/t`, as `list_tables` and `preload` spell them) | materialize one table now; returns the session `database` it landed in |
@@ -140,7 +140,7 @@ context's default lakehouse (see **Files**).
 
 `init` and `info` carry `features`, the additive capabilities of this worker:
 `arrow`, `streaming`, `interrupt`, `capture_result`, `job_description`,
-`register_lakehouse`, `contexts`, `files_lazy`, `files_lazy_python`.
+`register_lakehouse`, `contexts`, `files_lazy`, `files_lazy_python`, `sql_stream`, `commit_metrics`, `catalog_listing`.
 
 ## Files
 
@@ -269,6 +269,31 @@ or `display(df, limit=N)`); anything else is printed. `run_sql(arrow=true)`
 returns the result set the same way. Spark 4 uses `DataFrame.toArrow`; Spark 3.5
 uses `_collect_as_arrow`. Types survive (decimals, timestamps, nested types)
 where the JSON rows flatten them.
+
+## Commit metrics
+
+A `run_sql` statement whose first keyword is `INSERT`, `UPDATE`, `DELETE`,
+`MERGE`, or `CREATE [OR REPLACE] TABLE … AS` carries `metrics`:
+`{affected_rows, inserted?, updated?, deleted?, source, operation?, table?}`.
+Delta returns the counts for UPDATE, DELETE, and MERGE as the statement's result
+frame (`num_affected_rows`, …; `source: "result"`); INSERT and CTAS return an
+empty frame, so those come from the target's latest commit (`DESCRIBE HISTORY …
+LIMIT 1`, `operationMetrics.numOutputRows`; `source: "history"`). A failure to
+read them yields `metrics.error` and never fails the statement. The MCP
+`run_sql` tool prints `N row(s) affected`.
+
+## Catalog listing
+
+`SHOW TABLES [IN <lakehouse>]` and `SHOW TABLES IN <lakehouse>.<schema>` list
+what the lakehouse has on OneLake (every `Tables/<t>`, or `Tables/<schema>/<t>`),
+OneLake-cased, merged with what the session catalog already holds (clones, new
+local tables, views), without mounting anything; resolution still happens on
+first touch. The listing is cached for 60 s per lakehouse (new tables appear
+after that). `spark.catalog.listTables(...)` sees the same names, but Spark's
+`CatalogImpl` loads every table it lists to fill in its type and description,
+and loading is first touch here, so that call materializes every table of the
+lakehouse (one clone each). Use `SHOW TABLES`, or the `list_tables` method, to
+list without touching.
 
 ## Versions and profiles
 

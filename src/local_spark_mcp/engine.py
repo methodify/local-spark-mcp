@@ -102,6 +102,9 @@ class SqlResult:
     limit: int = 0
     notices: list[str] = field(default_factory=list)
     arrow: dict | None = None  # when requested: {"arrow_bytes", "row_count", "truncated"}; the IPC stream rides alongside
+    metrics: dict | None = None  # DML commit metrics: affected_rows, inserted/updated/deleted, operation, source
+    batches: int | None = None  # streamed run_sql: number of batch events sent before this reply
+    elapsed_s: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -444,9 +447,12 @@ class SparkEngine:
             self.interrupt(context=id)
             return {"id": id, "dropped": False, "scheduled": True, "contexts": sorted(self.contexts)}
         try:  # temp views belong to the session; drop them so the JVM can release the plans
-            for t in ctx.spark.catalog.listTables():
-                if t.isTemporary:
-                    ctx.spark.catalog.dropTempView(t.name)
+            it = ctx.spark._jsparkSession.sessionState().catalog().listLocalTempViews("*").iterator()
+            names = []
+            while it.hasNext():
+                names.append(str(it.next().table()))
+            for n in names:
+                ctx.spark.catalog.dropTempView(n)
         except Exception:
             pass
         del self.contexts[id]
@@ -1749,15 +1755,98 @@ class SparkEngine:
                 if not self._automount_missing(exc):
                     raise
 
+    def _dml_metrics(self, sql: str, df, spark) -> dict | None:
+        """Affected-row counts for a DML statement. Delta's UPDATE / DELETE / MERGE
+        return them as the result frame (`num_affected_rows`, …); INSERT and CTAS
+        return an empty frame, so those come from the table's latest commit
+        (`DESCRIBE HISTORY … LIMIT 1`, `operationMetrics.numOutputRows`)."""
+        target = _sql_write_target(sql)
+        if not target:
+            return None
+        try:
+            cols = set(df.columns)
+            if "num_affected_rows" in cols:
+                row = df.first().asDict()
+                out = {"affected_rows": int(row.get("num_affected_rows") or 0), "source": "result"}
+                for k, name in (("num_inserted_rows", "inserted"), ("num_updated_rows", "updated"), ("num_deleted_rows", "deleted")):
+                    if k in row:
+                        out[name] = int(row[k] or 0)
+                return out
+            if cols:
+                return None  # a SELECT-like result with a write keyword? leave it alone
+            hist = spark.sql(f"DESCRIBE HISTORY {target} LIMIT 1").select("operation", "operationMetrics").first()
+            if hist is None:
+                return None
+            m = dict(hist["operationMetrics"] or {})
+            op = hist["operation"]
+            out = {"operation": op, "source": "history", "table": target}
+            if op in ("WRITE", "CREATE TABLE AS SELECT", "REPLACE TABLE AS SELECT", "CREATE OR REPLACE TABLE AS SELECT"):
+                out["affected_rows"] = int(m.get("numOutputRows", 0) or 0)
+                out["inserted"] = out["affected_rows"]
+            elif op == "MERGE":
+                ins, upd, dele = (int(m.get(k, 0) or 0) for k in ("numTargetRowsInserted", "numTargetRowsUpdated", "numTargetRowsDeleted"))
+                out.update(inserted=ins, updated=upd, deleted=dele, affected_rows=ins + upd + dele)
+            elif op == "UPDATE":
+                out["updated"] = out["affected_rows"] = int(m.get("numUpdatedRows", 0) or 0)
+            elif op == "DELETE":
+                out["deleted"] = out["affected_rows"] = int(m.get("numDeletedRows", 0) or 0)
+            else:
+                out["affected_rows"] = int(m.get("numOutputRows", 0) or 0)
+            return out
+        except Exception as exc:  # metrics are a courtesy; never fail the statement over them
+            return {"error": f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"}
+
+    def _stream_arrow_batches(self, df, spark, batch_rows: int | None, on_batch) -> tuple[int, int]:
+        """Hand the result to ``on_batch(meta, ipc_bytes)`` one Arrow batch at a time,
+        partition by partition in order, so the driver holds one partition at
+        most: `Dataset.toArrowBatchRdd` wrapped as a JavaRDD and collected per
+        partition. Each blob is a self-contained Arrow IPC stream (schema + one
+        batch). Returns (rows, batches)."""
+        import pyarrow as pa
+        from pyspark.sql.pandas.types import to_arrow_schema
+
+        schema = to_arrow_schema(df.schema)
+        gw = spark.sparkContext._gateway
+        key = "spark.sql.execution.arrow.maxRecordsPerBatch"
+        prev = _safe(lambda: spark.conf.get(key))
+        if batch_rows:
+            spark.conf.set(key, str(int(batch_rows)))
+        total = count = 0
+        try:
+            rdd = df._jdf.toArrowBatchRdd()
+            tag = gw.jvm.scala.reflect.ClassTag.apply(gw.jvm.Class.forName("[B"))
+            jrdd = gw.jvm.org.apache.spark.api.java.JavaRDD.fromRDD(rdd, tag)
+            for part in range(jrdd.getNumPartitions()):
+                ids = gw.new_array(gw.jvm.int, 1)
+                ids[0] = part
+                for raw in jrdd.collectPartitions(ids)[0]:
+                    batch = pa.ipc.read_record_batch(pa.py_buffer(bytes(raw)), schema)
+                    sink = pa.BufferOutputStream()
+                    with pa.ipc.new_stream(sink, schema) as w:
+                        w.write_batch(batch)
+                    data = sink.getvalue().to_pybytes()
+                    on_batch({"rows": batch.num_rows, "batch": count, "partition": part, "arrow_bytes": len(data)}, data)
+                    total += batch.num_rows
+                    count += 1
+        finally:
+            if batch_rows and prev is not None:
+                _safe(lambda: spark.conf.set(key, prev))
+        return total, count
+
     def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False,
-                job_description: str | None = None, context: str | None = None) -> SqlResult:
+                job_description: str | None = None, context: str | None = None,
+                batch_rows: int | None = None, on_batch=None) -> SqlResult:
         """Run a SQL statement in a context's session and return up to ``limit``
         rows (as JSON rows, or as an Arrow IPC stream in ``blobs_out`` when
-        ``arrow`` is set)."""
-        if limit is None:
+        ``arrow`` is set). With ``on_batch`` the whole result streams out as Arrow
+        batches of about ``batch_rows`` rows (no limit unless one is given) and the
+        reply carries only the counts. DML statements carry ``metrics``."""
+        streaming = on_batch is not None
+        if limit is None and not streaming:
             limit = self.default_sql_limit
         self.blobs_out = []
         self._activate(self._resolve_context(context))
+        t0 = time.time()
         if self.write_mode != "writethrough" and (target := _sql_write_target(sql)):
             if dv := self.is_dv_table(target):
                 raise RuntimeError(self.dv_refusal(dv))
@@ -1771,11 +1860,21 @@ class SparkEngine:
                         raise RuntimeError(annotated) from exc
                     raise
                 columns = list(df.columns)
+                metrics = self._dml_metrics(sql, df, self._active.spark)
+                if streaming:
+                    if limit:
+                        df = df.limit(limit)
+                    total, nb = (self._stream_arrow_batches(df, self._active.spark, batch_rows, on_batch) if columns else (0, 0))
+                    return SqlResult(columns=columns, rows=[], row_count=total, truncated=False, limit=limit or 0,
+                                     notices=self.drain_mount_notices(), metrics=metrics, batches=nb,
+                                     elapsed_s=round(time.time() - t0, 3),
+                                     arrow={"columns": columns, "row_count": total, "streamed": True, "batches": nb})
                 if arrow and columns:
                     data, meta = self._arrow_from_df(df, limit)
                     self.blobs_out = [data]
                     return SqlResult(columns=meta["columns"], rows=[], row_count=meta["row_count"], truncated=meta["truncated"],
-                                     limit=limit, notices=self.drain_mount_notices(), arrow=meta)
+                                     limit=limit, notices=self.drain_mount_notices(), arrow=meta, metrics=metrics,
+                                     elapsed_s=round(time.time() - t0, 3))
                 # Pull one extra row to detect truncation without a full count.
                 collected = df.limit(limit + 1).collect()
             except KeyboardInterrupt:
@@ -1794,6 +1893,8 @@ class SparkEngine:
             truncated=truncated,
             limit=limit,
             notices=self.drain_mount_notices(),
+            metrics=metrics,
+            elapsed_s=round(time.time() - t0, 3),
         )
 
     def info(self) -> dict:
@@ -1858,7 +1959,7 @@ class SparkEngine:
             # tables this session's catalog holds now; OneLakeCatalog.tableExists would
             # say yes to anything resolvable in OneLake, which is not the question
             if db not in listed:
-                listed[db] = set(_safe(lambda: [t.name.lower() for t in self.spark.catalog.listTables(f"spark_catalog.{self._q(db)}")], []))
+                listed[db] = {t["name"].lower() for t in self._registered_tables(db) if not t["temporary"]}
             return table.lower() in listed[db]
         for lh_dir in sorted(self.shadow_root.iterdir()):
             if not lh_dir.is_dir():
@@ -1888,21 +1989,44 @@ class SparkEngine:
 
     DV_VIEW_TAG = "localspark:deletion-vectors"
 
+    def _registered_tables(self, db: str) -> list[dict]:
+        """The tables and views the session catalog holds for `db`, with type and
+        comment, read from the V1 SessionCatalog so nothing is loaded. Never use
+        `spark.catalog.listTables` for this: Spark's CatalogImpl calls loadTable
+        for every name it lists, and since 0.7.0 the listing names every table the
+        lakehouse has on OneLake, so that call would clone them all (it did: a
+        shadow_status cloned 136 tables)."""
+        out: list[dict] = []
+        try:
+            cat = self.spark._jsparkSession.sessionState().catalog()
+            it = cat.listTables(db).iterator()
+        except Exception:
+            return out
+        while it.hasNext():
+            ident = it.next()
+            ttype, comment = "", ""
+            try:
+                meta = cat.getTempViewOrPermanentTableMetadata(ident)
+                ttype = str(meta.tableType().name())
+                c = meta.comment()
+                comment = str(c.get()) if c.isDefined() else ""
+            except Exception:
+                pass
+            out.append({"name": str(ident.table()), "type": ttype, "comment": comment,
+                        "temporary": ident.database().isEmpty()})
+        return out
+
     def _dv_tables(self) -> list[dict]:
         """Lakehouse tables materialized as live views because their Delta
         protocol declares deletionVectors (Delta 3.2 cannot shallow-clone them).
         Read-only in sandbox/readonly; OneLakeCatalog tags the view's comment."""
         found: list[dict] = []
         for name in sorted(getattr(self, "lakehouses", {}) or {}):
-            try:
-                tables = self.spark.catalog.listTables(f"spark_catalog.{self._q(name)}")
-            except Exception:
-                continue
-            for t in tables:
-                desc = t.description or ""
-                if t.tableType == "VIEW" and desc.startswith(self.DV_VIEW_TAG):
+            for t in self._registered_tables(name):
+                if t["type"] == "VIEW" and t["comment"].startswith(self.DV_VIEW_TAG):
+                    desc = t["comment"]
                     src = desc.split("source=", 1)[1] if "source=" in desc else ""
-                    found.append({"lakehouse": name, "table": t.name, "source": src})
+                    found.append({"lakehouse": name, "table": t["name"], "source": src})
         return found
 
     def is_dv_table(self, table_name: str) -> dict | None:
@@ -2075,7 +2199,8 @@ class _ShimEngine:
 
 
 _WRITE_TARGET = re.compile(
-    r"^\s*(?:INSERT\s+(?:INTO|OVERWRITE)(?:\s+TABLE)?|MERGE\s+INTO|UPDATE|DELETE\s+FROM)\s+([`\w.]+)",
+    r"^\s*(?:INSERT\s+(?:INTO|OVERWRITE)(?:\s+TABLE)?|MERGE\s+INTO|UPDATE|DELETE\s+FROM"
+    r"|CREATE\s+(?:OR\s+REPLACE\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+([`\w.]+)",
     re.IGNORECASE,
 )
 

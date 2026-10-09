@@ -211,6 +211,8 @@ class WorkerProcess:
                 resp, blobs = recv_reply(self._conn)
                 if resp is None or "event" not in resp:
                     break
+                if blobs:
+                    resp["blobs"] = blobs  # a streamed batch: the Arrow IPC stream rides on the event
                 if on_event is not None:
                     on_event(resp)
         except socket.timeout as exc:
@@ -250,10 +252,17 @@ class WorkerProcess:
                                        "job_description": job_description, "context": context}, on_event=on_event)
 
     def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False, job_description: str | None = None,
-                context: str | None = None) -> dict:
-        """``arrow=True``: rows come back as one Arrow IPC stream in ``result["blobs"][0]``."""
-        return self._call("run_sql", {"sql": sql, "limit": limit, "arrow": arrow, "job_description": job_description,
-                                      "context": context})
+                context: str | None = None, batch_rows: int | None = None, on_batch=None) -> dict:
+        """``arrow=True``: rows come back as one Arrow IPC stream in ``result["blobs"][0]``.
+        ``on_batch``: the whole result streams as Arrow batches (about ``batch_rows``
+        rows each); each event frame is ``{"event": "batch", "rows", "batch",
+        "partition", "arrow_bytes", "blobs": [ipc_stream]}`` and the final reply
+        carries ``row_count``, ``batches``, ``elapsed_s`` and no rows."""
+        params = {"sql": sql, "limit": limit, "arrow": arrow, "job_description": job_description, "context": context}
+        if on_batch is not None or batch_rows:
+            params["stream"] = True
+            params["batch_rows"] = batch_rows
+        return self._call("run_sql", params, on_event=on_batch)
 
     def register_lakehouse(self, lakehouse: dict) -> dict:
         """Attach a lakehouse after start: ``{name, id, workspace_id, schemas?, default_schema?, detect_schemas?}``."""

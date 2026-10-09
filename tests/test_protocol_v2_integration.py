@@ -147,3 +147,45 @@ def test_capture_result_bare_dataframe(worker):
     # a non-frame result or a statement adds nothing
     res = worker.run_code("x = 1\nx + 1", capture_result=True)
     assert res["ok"] and res["displays"] == [] and "2" in res["stdout"]
+
+
+def test_run_sql_streams_arrow_batches(worker):
+    import pyarrow as pa
+
+    events = []
+    res = worker.run_sql("SELECT id, CAST(id * 2 AS DOUBLE) AS d FROM range(25000) ORDER BY id", batch_rows=5000, on_batch=events.append)
+    assert res["rows"] == [] and res["row_count"] == 25000 and res["batches"] == len(events) >= 5, (res, len(events))
+    assert res["arrow"]["streamed"] is True and res["elapsed_s"] is not None and res["truncated"] is False
+    tables = [pa.ipc.open_stream(e["blobs"][0]).read_all() for e in events]
+    assert all(e["event"] == "batch" and e["rows"] == t.num_rows and e["arrow_bytes"] == len(e["blobs"][0]) for e, t in zip(events, tables))
+    ids = [i for t in tables for i in t.column("id").to_pylist()]
+    assert ids == list(range(25000))  # ordered, nothing lost, nothing twice
+    assert [e["batch"] for e in events] == list(range(len(events)))
+    # an explicit limit still applies; an empty statement streams nothing
+    events.clear()
+    res = worker.run_sql("SELECT id FROM range(100)", limit=7, batch_rows=3, on_batch=events.append)
+    assert res["row_count"] == 7 and sum(e["rows"] for e in events) == 7
+    # the plain path is unchanged
+    assert worker.run_sql("SELECT 1 AS one")["rows"] == [[1]]
+
+
+def test_dml_metrics(worker, tmp_path):
+    loc = (tmp_path / "dml").as_posix()
+    worker.run_sql(f"CREATE TABLE dml_t (id BIGINT, v STRING) USING delta LOCATION '{loc}'")
+    r = worker.run_sql("INSERT INTO dml_t SELECT id, 'a' FROM range(10)")
+    assert r["metrics"]["affected_rows"] == 10 and r["metrics"]["source"] == "history" and r["metrics"]["operation"] == "WRITE", r["metrics"]
+    r = worker.run_sql("UPDATE dml_t SET v = 'b' WHERE id < 3")
+    assert r["metrics"]["affected_rows"] == 3 and r["metrics"]["source"] == "result"
+    r = worker.run_sql("DELETE FROM dml_t WHERE id >= 8")
+    assert r["metrics"]["affected_rows"] == 2
+    worker.run_code("spark.range(5, 12).selectExpr('id', \"'m' v\").createOrReplaceTempView('dml_src')")
+    r = worker.run_sql("MERGE INTO dml_t t USING dml_src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT *")
+    assert r["metrics"]["inserted"] == 4 and r["metrics"]["updated"] == 3 and r["metrics"]["affected_rows"] == 7
+    r = worker.run_sql(f"CREATE TABLE dml_ctas USING delta LOCATION '{(tmp_path / 'ctas').as_posix()}' AS SELECT * FROM dml_t")
+    assert r["metrics"]["affected_rows"] == 12 and r["metrics"]["source"] == "history", r["metrics"]
+    assert worker.run_sql("SELECT COUNT(*) FROM dml_t")["metrics"] is None
+    # streamed DML carries the same metrics
+    events = []
+    r = worker.run_sql("DELETE FROM dml_t WHERE id = 0", batch_rows=10, on_batch=events.append)
+    assert r["metrics"]["affected_rows"] == 1 and r["row_count"] == 1  # Delta's num_affected_rows frame, streamed as one batch
+

@@ -107,10 +107,15 @@ class OneLakeCatalog extends DeltaCatalog {
     * Fabric's catalog is case-insensitive but OneLake paths are not, so
     * `dataverse.chtmotiftable` must reach `Tables/chtMotifTable`. One listing of
     * `Tables/` per lakehouse, cached briefly (new tables appear after the TTL). */
-  private def realTableName(lakehouseId: String, schema: String, name: String): Option[String] = {
+  private def realTableName(lakehouseId: String, schema: String, name: String): Option[String] =
+    oneLakeListing(lakehouseId, schema).get(name.toLowerCase)
+
+  /** lowercase name -> OneLake-cased name of the directories under `Tables/` (or
+    * `Tables/<schema>/`), cached briefly. Empty on failure (not cached). */
+  private def oneLakeListing(lakehouseId: String, schema: String): Map[String, String] = {
     val now = System.currentTimeMillis()
     val key = if (schema.isEmpty) lakehouseId else s"$lakehouseId/$schema"
-    val listing = tableListCache.get(key) match {
+    tableListCache.get(key) match {
       case Some((at, m)) if now - at < TableListTtlMs => m
       case _ =>
         try {
@@ -127,7 +132,31 @@ class OneLakeCatalog extends DeltaCatalog {
             Map.empty[String, String]
         }
     }
-    listing.get(name.toLowerCase)
+  }
+
+  /** SHOW TABLES / listTables for a lakehouse namespace answers with what the
+    * lakehouse HAS on OneLake (every `Tables/<t>`, or `Tables/<schema>/<t>`),
+    * merged with what the session catalog already holds (clones, new tables,
+    * views): the Fabric view of the catalog, not just what was touched. Names come
+    * back OneLake-cased; a top-level directory that is one of the lakehouse's
+    * registered schemas is left out. Resolution still happens on first touch. */
+  override def listTables(namespace: Array[String]): Array[Identifier] = {
+    val local = super.listTables(namespace)
+    if (Reentrant.get() || workspaceId.isEmpty) return local
+    namespace match {
+      case Array(ns) =>
+        lakehouseAndSchema(ns) match {
+          case Some((id, schema)) =>
+            val have = local.map(_.name().toLowerCase).toSet
+            val remote = oneLakeListing(id, schema).values.toSeq.sorted
+              .filterNot(n => n.startsWith("_") || n.startsWith("."))
+              .filterNot(n => have.contains(n.toLowerCase))
+              .filterNot(n => schema.isEmpty && spark.sessionState.catalog.databaseExists(s"$ns$SchemaSep$n"))
+            local ++ remote.map(n => Identifier.of(namespace, n))
+          case None => local
+        }
+      case _ => local
+    }
   }
 
   /** (namespace, lakehouse id, OneLake path) when `ident` names an unregistered lakehouse table. */

@@ -27,7 +27,7 @@ import struct
 
 PROTOCOL_VERSION = 2  # worker socket protocol (docs/PROTOCOL.md); bumped on incompatible change
 # Additive capabilities a version-2 host can test for (init / info `features`).
-FEATURES = ["arrow", "streaming", "interrupt", "capture_result", "job_description", "register_lakehouse", "contexts", "files_lazy", "files_lazy_python"]
+FEATURES = ["arrow", "streaming", "interrupt", "capture_result", "job_description", "register_lakehouse", "contexts", "files_lazy", "files_lazy_python", "sql_stream", "commit_metrics", "catalog_listing"]
 
 _HEADER = struct.Struct(">I")
 

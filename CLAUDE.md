@@ -371,6 +371,29 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **0.7.0 (Cobalt query tabs)**: `OneLakeCatalog.listTables` merges
+  `super.listTables` with the cached OneLake `Tables/` listing
+  (`oneLakeListing`, shared with the case-insensitive resolver; top-level
+  dirs that are registered schema databases are skipped) — Spark 3.5/4.x run
+  `SHOW TABLES` through the V2 path (`useV1Command` is off), so this covers
+  `SHOW TABLES IN <lh>` and the schema catalog. `spark.catalog.listTables`
+  sees the names too but `CatalogImpl` calls `loadTable` per table → clones
+  every table (a live test that did this ran 40 min and cloned 500+); never
+  assert on it in a live test, and never use it inside the engine:
+  `_registered_tables(db)` (V1 `SessionCatalog.listTables` + metadata) is
+  what `_dv_tables`, the shadow lister's `registered`, and `drop_context`
+  use now — the first 0.7.0 cut used `spark.catalog.listTables` there and
+  `shadow_status` cloned 136 tables.
+  Streaming `run_sql` (`stream`/`batch_rows`): `_stream_arrow_batches` wraps
+  `Dataset.toArrowBatchRdd` in a `JavaRDD` (`ClassTag[Array[Byte]]`) and
+  `collectPartitions` one partition at a time — ordered, driver holds one
+  partition; each event frame carries one self-contained IPC stream
+  (`send_reply` with a blob on an event; the client attaches `blobs` to event
+  frames). `toLocalIterator` on that RDD fails on 3.5 outside the engine's
+  session (Arrow `Unsafe` access) — use the per-partition path. DML
+  `metrics`: Delta's `num_affected_rows` frame for UPDATE/DELETE/MERGE,
+  `DESCRIBE HISTORY … LIMIT 1` for INSERT/CTAS (`_dml_metrics`;
+  `_WRITE_TARGET` now also matches CTAS).
 - **`dbo.table` against a schema-enabled default (0.6.6, Cobalt)**: a
   schema-enabled default lakehouse is the session's current catalog again
   (`_default_db` → `USE <lh>` / `<lh>.<schema>`; the 0.4.2 retreat to
