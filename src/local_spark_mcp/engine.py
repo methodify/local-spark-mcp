@@ -1796,15 +1796,20 @@ class SparkEngine:
         except Exception as exc:  # metrics are a courtesy; never fail the statement over them
             return {"error": f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"}
 
-    def _stream_arrow_batches(self, df, spark, batch_rows: int | None, on_batch) -> tuple[int, int]:
+    def _stream_arrow_batches(self, df, spark, batch_rows: int | None, on_batch,
+                              limit: int | None = None) -> tuple[int, int, bool]:
         """Hand the result to ``on_batch(meta, ipc_bytes)`` one Arrow batch at a time,
         partition by partition in order, so the driver holds one partition at
         most: `Dataset.toArrowBatchRdd` wrapped as a JavaRDD and collected per
         partition. Each blob is a self-contained Arrow IPC stream (schema + one
-        batch). Returns (rows, batches)."""
+        batch). With ``limit``, the plan is cut at limit + 1 rows and the extra
+        row, if it arrives, is never sent but flags ``truncated``. Returns
+        (rows, batches, truncated)."""
         import pyarrow as pa
         from pyspark.sql.pandas.types import to_arrow_schema
 
+        if limit:
+            df = df.limit(limit + 1)
         schema = to_arrow_schema(df.schema)
         gw = spark.sparkContext._gateway
         key = "spark.sql.execution.arrow.maxRecordsPerBatch"
@@ -1812,6 +1817,7 @@ class SparkEngine:
         if batch_rows:
             spark.conf.set(key, str(int(batch_rows)))
         total = count = 0
+        truncated = False
         try:
             rdd = df._jdf.toArrowBatchRdd()
             tag = gw.jvm.scala.reflect.ClassTag.apply(gw.jvm.Class.forName("[B"))
@@ -1821,6 +1827,11 @@ class SparkEngine:
                 ids[0] = part
                 for raw in jrdd.collectPartitions(ids)[0]:
                     batch = pa.ipc.read_record_batch(pa.py_buffer(bytes(raw)), schema)
+                    if limit and total + batch.num_rows > limit:
+                        truncated = True
+                        batch = batch.slice(0, limit - total)
+                        if batch.num_rows == 0:
+                            break
                     sink = pa.BufferOutputStream()
                     with pa.ipc.new_stream(sink, schema) as w:
                         w.write_batch(batch)
@@ -1828,10 +1839,12 @@ class SparkEngine:
                     on_batch({"rows": batch.num_rows, "batch": count, "partition": part, "arrow_bytes": len(data)}, data)
                     total += batch.num_rows
                     count += 1
+                if truncated:
+                    break
         finally:
             if batch_rows and prev is not None:
                 _safe(lambda: spark.conf.set(key, prev))
-        return total, count
+        return total, count, truncated
 
     def run_sql(self, sql: str, limit: int | None = None, arrow: bool = False,
                 job_description: str | None = None, context: str | None = None,
@@ -1862,13 +1875,13 @@ class SparkEngine:
                 columns = list(df.columns)
                 metrics = self._dml_metrics(sql, df, self._active.spark)
                 if streaming:
-                    if limit:
-                        df = df.limit(limit)
-                    total, nb = (self._stream_arrow_batches(df, self._active.spark, batch_rows, on_batch) if columns else (0, 0))
-                    return SqlResult(columns=columns, rows=[], row_count=total, truncated=False, limit=limit or 0,
+                    total, nb, truncated = (self._stream_arrow_batches(df, self._active.spark, batch_rows, on_batch, limit)
+                                            if columns else (0, 0, False))
+                    return SqlResult(columns=columns, rows=[], row_count=total, truncated=truncated, limit=limit or 0,
                                      notices=self.drain_mount_notices(), metrics=metrics, batches=nb,
                                      elapsed_s=round(time.time() - t0, 3),
-                                     arrow={"columns": columns, "row_count": total, "streamed": True, "batches": nb})
+                                     arrow={"columns": columns, "row_count": total, "streamed": True, "batches": nb,
+                                            "truncated": truncated})
                 if arrow and columns:
                     data, meta = self._arrow_from_df(df, limit)
                     self.blobs_out = [data]

@@ -161,10 +161,16 @@ def test_run_sql_streams_arrow_batches(worker):
     ids = [i for t in tables for i in t.column("id").to_pylist()]
     assert ids == list(range(25000))  # ordered, nothing lost, nothing twice
     assert [e["batch"] for e in events] == list(range(len(events)))
-    # an explicit limit still applies; an empty statement streams nothing
+    # an explicit limit still applies and reports the cut; a limit that is not reached does not
     events.clear()
     res = worker.run_sql("SELECT id FROM range(100)", limit=7, batch_rows=3, on_batch=events.append)
-    assert res["row_count"] == 7 and sum(e["rows"] for e in events) == 7
+    assert res["row_count"] == 7 and sum(e["rows"] for e in events) == 7 and res["truncated"] is True and res["arrow"]["truncated"] is True
+    events.clear()
+    res = worker.run_sql("SELECT id FROM range(100)", limit=200, batch_rows=50, on_batch=events.append)
+    assert res["row_count"] == 100 and res["truncated"] is False and sum(e["rows"] for e in events) == 100
+    events.clear()
+    res = worker.run_sql("SELECT id FROM range(10)", limit=10, batch_rows=4, on_batch=events.append)
+    assert res["row_count"] == 10 and res["truncated"] is False  # exactly limit rows: not cut
     # the plain path is unchanged
     assert worker.run_sql("SELECT 1 AS one")["rows"] == [[1]]
 
