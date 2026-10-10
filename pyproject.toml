@@ -1,6 +1,6 @@
 [project]
 name = "local-spark-mcp"
-version = "0.8.0"
+version = "0.8.1"
 description = "MCP server giving an agent a stateful local Spark session for prototyping PySpark notebooks targeting Microsoft Fabric"
 readme = "README.md"
 license = "Apache-2.0"
@@ -47,7 +47,7 @@ local-spark-mcp = "local_spark_mcp.server:main"
     "pandas==2.3.3",
     "numpy==2.4.1",
     "pyarrow==24.0.0",
-    "scipy==1.18.0; python_version >= '3.12'",  # 1.18 ships no wheels for 3.11 (the Windows fabric-2.0 Python); the installer reports the gap
+    "scipy==1.18.0; python_version >= '3.12'",  # scipy 1.18.0 ships no wheels for Python 3.11 (the Windows fabric-2.0 Python)
     "scipy>=1.15,<1.18; python_version < '3.12'",
     "scikit-learn==1.6.1",
     "statsmodels==0.14.6",

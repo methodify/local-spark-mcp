@@ -303,8 +303,12 @@ Python per platform, Java majors and preference, Scala line, hadoop-azure,
 session confs, and since 0.8.0 `python_packages` (Fabric's notebook-facing
 Python packages at the runtime's versions, name → version) with
 `python_packages_source` (the `synapse-spark-runtime` file, commit, and URL
-they were taken from); the top level carries `python_packages_excluded` (name
-→ reason). `healthcheck` reports `fabric_packages` (`installed`, `mismatched`,
+they were taken from) and `python_packages_fallbacks` (name → `{marker,
+requirement, reason}`: where Fabric's exact pin cannot be installed on some
+Python, the requirement to use there instead; markers are
+`python_version <op> 'X.Y'` only, so a host can evaluate them without a
+resolver, and a version that satisfies the fallback counts as installed, not
+mismatched); the top level carries `python_packages_excluded` (name → reason). `healthcheck` reports `fabric_packages` (`installed`, `mismatched`,
 `missing`, `complete`) for the detected profile. The installer is
 `python -m local_spark_mcp.fabric_packages install [--profile] [--python] [--json]`:
 one resolution of the roster, then per package for whatever failed, with

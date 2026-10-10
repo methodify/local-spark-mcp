@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "package": "local-spark-mcp",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "python_packages_excluded": {
     "pyspark": "the profile's own pin (Fabric ships a Microsoft build)",
     "delta-spark": "the profile's own pin",
@@ -130,6 +130,7 @@
         "imageio": "2.33.1",
         "setuptools": "68.2.2"
       },
+      "python_packages_fallbacks": {},
       "python_packages_source": {
         "repo": "https://github.com/microsoft/synapse-spark-runtime",
         "commit": "36097f9fa6be2437643262992c3b4a2990d0e0c8",
@@ -232,6 +233,13 @@
         "holidays": "0.100",
         "optuna": "3.6.1",
         "setuptools": "83.0.0"
+      },
+      "python_packages_fallbacks": {
+        "scipy": {
+          "marker": "python_version < '3.12'",
+          "requirement": "scipy>=1.15,<1.18",
+          "reason": "scipy 1.18.0 ships no wheels for Python 3.11 (the Windows fabric-2.0 Python)"
+        }
       },
       "python_packages_source": {
         "repo": "https://github.com/microsoft/synapse-spark-runtime",

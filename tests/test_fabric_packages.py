@@ -55,6 +55,32 @@ def test_pyproject_extras_match_the_rosters():
         assert got == pins, profile
     scipy_lines = [r for r in extras["fabric-2.0-packages"] if r.startswith("scipy")]
     assert len(scipy_lines) == 2 and any("python_version < '3.12'" in r for r in scipy_lines)
+    fb = fp.fallbacks("fabric-2.0")["scipy"]
+    assert any(r.startswith(fb["requirement"]) and fb["marker"] in r for r in scipy_lines)  # defined once, in FALLBACKS
+
+
+def test_fallbacks_are_data_and_drive_requirements_and_status(monkeypatch):
+    assert fp.marker_applies("python_version < '3.12'", (3, 11)) and not fp.marker_applies("python_version < '3.12'", (3, 13))
+    assert fp.marker_applies("python_version >= '3.12'", (3, 12))
+    with pytest.raises(ValueError):
+        fp.marker_applies("sys_platform == 'win32'")
+    reqs_311 = fp.requirements("fabric-2.0", (3, 11))
+    reqs_313 = fp.requirements("fabric-2.0", (3, 13))
+    assert "scipy>=1.15,<1.18" in reqs_311 and "scipy==1.18.0" not in reqs_311
+    assert "scipy==1.18.0" in reqs_313 and len(reqs_311) == len(reqs_313) == len(fp.ROSTERS["fabric-2.0"])
+    assert fp._spec_satisfied("1.17.1", "scipy>=1.15,<1.18") and not fp._spec_satisfied("1.18.0", "scipy>=1.15,<1.18")
+    assert fp._spec_satisfied("2.3.3", "pandas==2.3.3") and not fp._spec_satisfied("2.3.4", "pandas==2.3.3")
+    monkeypatch.setattr(fp, "_installed_version", lambda n: "1.17.1" if n == "scipy" else None)
+    monkeypatch.setattr(fp.sys, "version_info", (3, 11, 9, "final", 0))
+    st = fp.status("fabric-2.0")
+    assert "scipy" not in st["mismatched"] and st["variants"]["scipy"]["have"] == "1.17.1" and st["installed"] == 1
+    assert "platform fallback: scipy 1.17.1" in fp.summary_line(st)
+    monkeypatch.setattr(fp.sys, "version_info", (3, 13, 2, "final", 0))
+    st = fp.status("fabric-2.0")
+    assert st["mismatched"]["scipy"] == {"want": "1.18.0", "have": "1.17.1"} and not st["variants"]
+    m = manifest()
+    assert m["profiles"]["fabric-2.0"]["python_packages_fallbacks"]["scipy"]["marker"] == "python_version < '3.12'"
+    assert m["profiles"]["fabric-1.3"]["python_packages_fallbacks"] == {}
 
 
 def test_status_and_plan_shapes():

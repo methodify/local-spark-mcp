@@ -381,9 +381,12 @@ server's **stderr**; stdout is reserved for the MCP transport.
   PyPI version). Exposed in `manifest()` (`python_packages`,
   `python_packages_source`, top-level `python_packages_excluded`), in
   `healthcheck.fabric_packages`, as pyproject extras `<profile>-packages`
-  (kept in step by `test_fabric_packages`; fabric-2.0's scipy carries a
-  `python_version` marker because 1.18 has no 3.11 wheels, the Windows
-  fabric-2.0 Python), and via the installer CLI (batch, then per package,
+  (generated from ROSTERS + FALLBACKS and kept in step by
+  `test_fabric_packages`; fabric-2.0's scipy fallback `>=1.15,<1.18` under
+  `python_version < '3.12'` is data in `FALLBACKS`, exposed as
+  `python_packages_fallbacks` so hosts installing from the manifest get the
+  same answer as the extra, and `status` counts a version satisfying the
+  fallback as installed), and via the installer CLI (batch, then per package,
   never fatal, JSON result). To refresh after a Fabric runtime update:
   re-download the two yml files, re-run the version table, update ROSTERS and
   SOURCE.commit, regenerate pyproject extras from ROSTERS.

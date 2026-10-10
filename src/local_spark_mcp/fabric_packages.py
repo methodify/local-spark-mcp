@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -95,6 +96,55 @@ ROSTERS: dict[str, dict[str, str]] = {
 }
 
 
+# Where Fabric's exact pin cannot be installed on some Python, the requirement a host
+# should use there instead. Markers are limited to python_version comparisons so a host
+# can evaluate them without a resolver; the pyproject extras are generated from this too.
+FALLBACKS: dict[str, dict[str, dict]] = {
+    "fabric-2.0": {
+        "scipy": {"marker": "python_version < '3.12'", "requirement": "scipy>=1.15,<1.18",
+                  "reason": "scipy 1.18.0 ships no wheels for Python 3.11 (the Windows fabric-2.0 Python)"},
+    },
+    "fabric-1.3": {},
+}
+
+_MARKER = re.compile(r"^python_version\s*(<=|>=|==|!=|<|>)\s*'([0-9]+(?:\.[0-9]+)*)'$")
+
+
+def marker_applies(marker: str, python_version: tuple[int, int] | None = None) -> bool:
+    """Evaluate the one marker shape used here (`python_version <op> 'X.Y'`)."""
+    m = _MARKER.match(marker.strip())
+    if not m:
+        raise ValueError(f"unsupported marker {marker!r}")
+    op, ver = m.group(1), tuple(int(x) for x in m.group(2).split("."))
+    cur = python_version or sys.version_info[:2]
+    cur = tuple(cur)[: len(ver)]
+    return {"<": cur < ver, "<=": cur <= ver, ">": cur > ver, ">=": cur >= ver, "==": cur == ver, "!=": cur != ver}[op]
+
+
+def fallbacks(profile: str) -> dict[str, dict]:
+    return {k: dict(v) for k, v in FALLBACKS.get(profile, {}).items()}
+
+
+def _spec_satisfied(version: str, requirement: str) -> bool:
+    """`version` satisfies a `name<op>ver[,<op>ver]` requirement (PEP 440 subset: numeric releases)."""
+    def key(v: str):
+        return tuple(int(x) for x in re.findall(r"\d+", v.split("+")[0].split("rc")[0].split("post")[0])[:3])
+
+    spec = requirement.split(";")[0]
+    spec = re.sub(r"^[A-Za-z0-9_.\-]+", "", spec)
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        m = re.match(r"(<=|>=|==|!=|<|>|~=)\s*(.+)", part)
+        if not m:
+            return False
+        op, want = m.group(1), key(m.group(2))
+        have = key(version)[: len(want)] if op in ("==", "!=") else key(version)
+        ok = {"<": have < want, "<=": have <= want, ">": have > want, ">=": have >= want, "==": have == want,
+              "!=": have != want, "~=": have >= want and have[: len(want) - 1] == want[: len(want) - 1]}[op]
+        if not ok:
+            return False
+    return True
+
+
 def roster(profile: str) -> dict[str, str]:
     try:
         return dict(ROSTERS[profile])
@@ -102,8 +152,15 @@ def roster(profile: str) -> dict[str, str]:
         raise ValueError(f"unknown profile {profile!r}; known: {sorted(ROSTERS)}") from None
 
 
-def requirements(profile: str) -> list[str]:
-    return [f"{n}=={v}" for n, v in roster(profile).items()]
+def requirements(profile: str, python_version: tuple[int, int] | None = None) -> list[str]:
+    """`name==version` per roster entry, with a fallback requirement substituted where
+    its marker applies to ``python_version`` (default: this interpreter's)."""
+    fb = fallbacks(profile)
+    out = []
+    for n, v in roster(profile).items():
+        alt = fb.get(n)
+        out.append(alt["requirement"] if alt and marker_applies(alt["marker"], python_version) else f"{n}=={v}")
+    return out
 
 
 def source(profile: str) -> dict:
@@ -123,17 +180,21 @@ def _installed_version(name: str) -> str | None:
 def status(profile: str) -> dict:
     """What this interpreter has, against the roster: installed / mismatched / missing."""
     want = roster(profile)
-    installed, mismatched, missing = {}, {}, []
+    fb = fallbacks(profile)
+    installed, mismatched, missing, variants = {}, {}, [], {}
     for name, ver in want.items():
         have = _installed_version(name)
         if have is None:
             missing.append(name)
         elif have == ver:
             installed[name] = have
+        elif name in fb and marker_applies(fb[name]["marker"]) and _spec_satisfied(have, fb[name]["requirement"]):
+            installed[name] = have  # the platform fallback, at a version it allows: not a mismatch
+            variants[name] = {"have": have, "fabric": ver, "requirement": fb[name]["requirement"], "reason": fb[name]["reason"]}
         else:
             mismatched[name] = {"want": ver, "have": have}
     return {"profile": profile, "total": len(want), "installed": len(installed), "mismatched": mismatched, "missing": missing,
-            "complete": not missing and not mismatched, "python": sys.executable}
+            "variants": variants, "complete": not missing and not mismatched, "python": sys.executable}
 
 
 def _installer(python: str) -> list[str]:
@@ -149,7 +210,15 @@ def install(profile: str, python: str | None = None, dry_run: bool = False, prog
     what does not resolve on this machine. Never raises for a package that
     cannot be installed; the result says which and why."""
     python = python or sys.executable
-    reqs = requirements(profile)
+    pyver = None
+    if python != sys.executable:
+        try:
+            pv = subprocess.run([python, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                                capture_output=True, text=True, check=True).stdout.split()
+            pyver = (int(pv[0]), int(pv[1]))
+        except Exception:
+            pyver = None
+    reqs = requirements(profile, pyver)
     base = _installer(python)
     result = {"profile": profile, "python": python, "requested": len(reqs), "installed": [], "skipped": [], "mode": "batch",
               "dry_run": dry_run}
@@ -195,6 +264,8 @@ def _reason(out: str) -> str:
 
 def summary_line(st: dict) -> str:
     extra = []
+    if st.get("variants"):
+        extra.append("platform fallback: " + ", ".join(f"{n} {v['have']} (Fabric {v['fabric']}; {v['reason']})" for n, v in sorted(st["variants"].items())))
     if st["mismatched"]:
         extra.append("other version: " + ", ".join(f"{n} {v['have']} (Fabric {v['want']})" for n, v in sorted(st["mismatched"].items())))
     if st["missing"]:
@@ -217,7 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         p = detect_profile()
         profile = p.name if p is not None else "fabric-2.0"
     if a.command == "plan":
-        out = {"profile": profile, "source": source(profile), "packages": roster(profile), "excluded": EXCLUDED}
+        out = {"profile": profile, "source": source(profile), "packages": roster(profile), "fallbacks": fallbacks(profile),
+               "requirements_here": requirements(profile), "excluded": EXCLUDED}
         print(json.dumps(out, indent=2) if a.json else "\n".join(requirements(profile)))
         return 0
     if a.command == "status":

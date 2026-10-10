@@ -224,6 +224,7 @@ def manifest() -> dict:
             # Fabric's notebook-facing Python packages at the runtime's versions (fabric_packages.py);
             # opt-in: `python -m local_spark_mcp.fabric_packages install`, or the <profile>-packages extra
             "python_packages": _fp.roster(name),
+            "python_packages_fallbacks": _fp.fallbacks(name),  # {name: {marker, requirement, reason}}: use instead of the pin where the marker applies
             "python_packages_source": _fp.source(name),
         }
     from .engine import PROTOCOL_VERSION
