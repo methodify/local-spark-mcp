@@ -371,6 +371,22 @@ server's **stderr**; stdout is reserved for the MCP transport.
   before setting the catalog conf; tests qualify with `spark_catalog.`.
   `tests/test_schema_catalog_integration.py` covers it without OneLake; no
   schema-enabled lakehouse exists in the live workspace yet.
+- **Fabric's Python packages (0.8.0, Cobalt advisory + Bryon)**:
+  `fabric_packages.py` holds a curated roster per profile at Fabric's exact
+  versions (from `microsoft/synapse-spark-runtime` `Fabric-Python3xx-CPU.yml`
+  at a recorded commit; parse both the conda `name=ver=build` lines and the
+  `pip:` section). Curation: notebook-facing PyPI packages with wheels on all
+  three OSes; out: pyspark/delta-spark (profile pins), Fabric-only wheels,
+  torch, and 1.3's conda meta-versions (`azure-identity=2023.12.01` is not a
+  PyPI version). Exposed in `manifest()` (`python_packages`,
+  `python_packages_source`, top-level `python_packages_excluded`), in
+  `healthcheck.fabric_packages`, as pyproject extras `<profile>-packages`
+  (kept in step by `test_fabric_packages`; fabric-2.0's scipy carries a
+  `python_version` marker because 1.18 has no 3.11 wheels, the Windows
+  fabric-2.0 Python), and via the installer CLI (batch, then per package,
+  never fatal, JSON result). To refresh after a Fabric runtime update:
+  re-download the two yml files, re-run the version table, update ROSTERS and
+  SOURCE.commit, regenerate pyproject extras from ROSTERS.
 - **0.7.0 (Cobalt query tabs)**: `OneLakeCatalog.listTables` merges
   `super.listTables` with the cached OneLake `Tables/` listing
   (`oneLakeListing`, shared with the case-insensitive resolver; top-level

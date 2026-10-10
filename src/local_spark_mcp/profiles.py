@@ -200,6 +200,7 @@ def manifest() -> dict:
     """Machine-readable form of PROFILES for hosts that embed the worker (the
     same document is committed as profiles.json at the repo root)."""
     from . import __version__
+    from . import fabric_packages as _fp
 
     profiles = {}
     for name, p in PROFILES.items():
@@ -220,6 +221,10 @@ def manifest() -> dict:
             "hadoop_azure": p.hadoop_azure,
             "spark_major": p.spark_major,
             "session_confs": dict(p.session_confs or {}),
+            # Fabric's notebook-facing Python packages at the runtime's versions (fabric_packages.py);
+            # opt-in: `python -m local_spark_mcp.fabric_packages install`, or the <profile>-packages extra
+            "python_packages": _fp.roster(name),
+            "python_packages_source": _fp.source(name),
         }
     from .engine import PROTOCOL_VERSION
 
@@ -227,6 +232,7 @@ def manifest() -> dict:
         "schema": MANIFEST_SCHEMA,
         "package": "local-spark-mcp",
         "version": __version__,
+        "python_packages_excluded": dict(_fp.EXCLUDED),
         "protocol_version": PROTOCOL_VERSION,
         "default_profile": DEFAULT_PROFILE,
         "profiles": profiles,

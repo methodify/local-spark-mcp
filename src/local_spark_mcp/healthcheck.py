@@ -36,6 +36,12 @@ def healthcheck(declared_profile: str | None = None) -> dict:
     prof, warnings, errors = check_profile(declared_profile)
     out["profile"] = prof.name
     out["profile_declared"] = declared_profile
+    try:
+        from .fabric_packages import status as _pkg_status
+
+        out["fabric_packages"] = _pkg_status(prof.name)
+    except Exception as exc:  # pragma: no cover
+        out["fabric_packages"] = {"error": f"{type(exc).__name__}: {exc}"}
     out["warnings"] += warnings
     out["problems"] += errors
     try:

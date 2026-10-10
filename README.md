@@ -235,6 +235,34 @@ The worker takes every Azure token from the token endpoint it is started with
 it needs no `az login` inside the worker, and preload failures appear in
 `preload_status`, never in a cell's output.
 
+## Fabric's Python packages (0.8.0)
+
+A Fabric notebook assumes the runtime's environment: pandas, scikit-learn,
+plotly, the azure-* clients, and a long tail. Each runtime profile now carries a
+curated roster of those packages at Fabric's exact versions, taken from
+Microsoft's published environment files
+(`microsoft/synapse-spark-runtime`, `Fabric-Python3xx-CPU.yml`, with the commit
+recorded). It is opt-in and a few hundred MB:
+
+```bash
+# at install time, as an extra next to the profile
+uvx --python 3.13 --from "local-spark-mcp[fabric-2.0,fabric-2.0-packages] @ git+https://github.com/methodify/local-spark-mcp@vX" local-spark-mcp
+# or into an existing environment, with a per-package fallback and a report
+python -m local_spark_mcp.fabric_packages install            # the installed pyspark's profile
+python -m local_spark_mcp.fabric_packages status             # what this environment has, against Fabric
+python -m local_spark_mcp.fabric_packages plan --json        # the roster, its source file and commit, the exclusions
+```
+
+The installer resolves the whole roster in one go; if that fails it installs
+package by package and names what does not resolve on this machine (on Windows
+with Python 3.11, fabric-2.0's `scipy==1.18.0` has no wheel; a compatible scipy
+comes in as a dependency and the status says so). `profiles.json` and
+`python -m local_spark_mcp.profiles --json` carry the roster per profile, so a
+host can read it instead of keeping its own copy. `healthcheck` reports how many
+of the profile's packages the environment has at Fabric's version. Left out on
+purpose: `pyspark` and `delta-spark` (the profile's own pins), Fabric-only wheels
+(`notebookutils`, `synapseml*`, `semantic-link-sempy`), and the torch stack.
+
 ## Lazy Files (0.6.0)
 
 With `[files] mode = "lazy"` (env `LOCAL_SPARK_FILES_MODE`), Spark's relative

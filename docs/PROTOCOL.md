@@ -300,5 +300,14 @@ list without touching.
 `profiles.json` at the repo root (and `python -m local_spark_mcp.profiles
 --json` for the installed package) describes every runtime profile: pins,
 Python per platform, Java majors and preference, Scala line, hadoop-azure,
-session confs. `python -m local_spark_mcp.warm [--ivy DIR]` resolves a
+session confs, and since 0.8.0 `python_packages` (Fabric's notebook-facing
+Python packages at the runtime's versions, name → version) with
+`python_packages_source` (the `synapse-spark-runtime` file, commit, and URL
+they were taken from); the top level carries `python_packages_excluded` (name
+→ reason). `healthcheck` reports `fabric_packages` (`installed`, `mismatched`,
+`missing`, `complete`) for the detected profile. The installer is
+`python -m local_spark_mcp.fabric_packages install [--profile] [--python] [--json]`:
+one resolution of the roster, then per package for whatever failed, with
+`installed`, `skipped` (requirement + reason), `mode`, and `status` in the
+JSON result; exit code 2 when something was skipped. `python -m local_spark_mcp.warm [--ivy DIR]` resolves a
 profile's Spark packages ahead of the first session.
